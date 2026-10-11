@@ -4,7 +4,6 @@ graphviz
 matplotlib
 numpy
 pandas
-pybigwig
 pydot
 scikit-learn
 scipy

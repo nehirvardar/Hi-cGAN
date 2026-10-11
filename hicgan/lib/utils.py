@@ -1,7 +1,6 @@
 #!python3
 import os
 import cooler
-import pyBigWig
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -29,18 +28,6 @@ def getBigwigFileList(pDirectory):
         if file.endswith(".bigwig") or file.endswith("bigWig") or file.endswith(".bw"):
             retList.append(pDirectory + file)
     return retList
-
-def getChromSizesFromBigwig(pBigwigFileName):
-    #returns the chrom sizes from a bigwig file in form of a dict
-    chromSizeDict = dict()
-    try:
-        bigwigFile = pyBigWig.open(pBigwigFileName)
-        chromSizeDict = bigwigFile.chroms()
-        for entry in chromSizeDict:
-            chromSizeDict[entry] = int(chromSizeDict[entry])
-    except Exception as e:
-        print(e) 
-    return chromSizeDict
          
 def getMatrixFromCooler(pCoolerFilePath, pChromNameStr):
     #returns sparse csr matrix from cooler file for given chromosome name
@@ -67,44 +54,6 @@ def getChromSizesFromCooler(pCoolerFilePath):
         print(e)
     return chromSizes
 
-def binChromatinFactor(pBigwigFileName, pBinSizeInt, pChromStr, pChromSize=None):
-    #bin chromatin factor loaded from bigwig file pBigwigFileName with bin size pBinSizeInt for chromosome pChromStr
-    binArray = None
-    properFileType = False
-    try:
-        bigwigFile = pyBigWig.open(pBigwigFileName)
-        properFileType = bigwigFile.isBigWig()
-    except Exception as e:
-        print(e)
-    if properFileType:
-        chrom = pChromStr
-        if chrom not in bigwigFile.chroms():
-            msg = "Chromosome {:s} not present in bigwigfile {:s}"
-            msg = msg.format(chrom, pBigwigFileName)
-            raise SystemExit(msg)
-        #compute signal values (stats) over resolution-sized bins
-        if pChromSize is None:
-            chromsize = bigwigFile.chroms(chrom)
-        else:
-            chromsize = pChromSize
-        chromStartList = list(range(0,chromsize,pBinSizeInt))
-        chromEndList = list(range(pBinSizeInt,chromsize,pBinSizeInt))
-        chromEndList.append(chromsize)
-        mergeType = 'mean'
-        binArray = np.array(bigwigFile.stats(chrom, 0, chromsize, nBins=len(chromStartList), type=mergeType)).astype("float32")
-        nr_nan = np.count_nonzero(np.isnan(binArray))
-        nr_inf = np.count_nonzero(np.isinf(binArray))
-        if nr_inf != 0 or nr_nan != 0:
-            binArray = np.nan_to_num(binArray, nan=0.0, posinf=np.nanmax(binArray[binArray != np.inf]),neginf=0.0)
-        if nr_inf != 0:
-            msg_inf = "Warning: replaced {:d} infinity values in {:s} by 0/max. numeric value in data"
-            msg_inf = msg_inf.format(nr_inf, pBigwigFileName)
-            print(msg_inf)
-        if nr_nan != 0:
-            msg_nan = "Warning: replaced {:d} NANs in {:s} by 0."
-            msg_nan = msg_nan.format(nr_nan, pBigwigFileName)
-            print(msg_nan)
-    return binArray
 
 def scaleArray(pArray):
     '''
@@ -1363,28 +1312,6 @@ def getCorrelation(pData, pDistanceField, pTargetField, pPredictionField, pCorrM
 
     # Return the final indices and values
     return indices, values
-
-def getChromPrefixBigwig(pBigwigFileName):
-    '''
-    check if the chromosome names in the bigwig file 
-    start with 'chr' or not; e.g. 'chr10' vs. '10'
-    '''
-    try:
-        bigwigFile = pyBigWig.open(pBigwigFileName)
-        chromSizeDict = bigwigFile.chroms()
-        chromNameList = [entry for entry in chromSizeDict]
-    except Exception as e:
-        raise(e) 
-    prefix = None
-    if chromNameList is not None and len(chromNameList) > 0 and str(chromNameList[0]).startswith("chr"):
-        prefix = "chr"
-    elif chromNameList is not None and len(chromNameList) > 0:
-        prefix = ""
-    else:
-        msg = "No valid entries found in bigwig file {:s}"
-        msg = msg.format(pBigwigFileName)
-        raise ValueError(msg)
-    return prefix
 
 def getChromPrefixCooler(pCoolerFileName):
     '''

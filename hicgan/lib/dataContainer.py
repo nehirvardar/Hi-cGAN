@@ -1,7 +1,8 @@
 import os
 import numpy as np
+import scipy.sparse
+from scipy.sparse import save_npz, load_npz, csr_matrix
 from tensorflow import dtypes as tfdtypes
-from scipy.sparse import save_npz, csr_matrix
 from tqdm import tqdm
 import concurrent.futures
 
@@ -72,7 +73,7 @@ class DataContainer():
             # Try to load as sparse matrix
             log.debug(f"Attempting to load {npz_path} as sparse matrix...")
             mat = scipy.sparse.load_npz(npz_path)
-            self.FactorDataArray = mat.todense()
+            self.FactorDataArray = mat.toarray()
             log.debug(f"Successfully loaded sparse matrix from {npz_path}.")
         except Exception as e:
             # Fallback to normal numpy array
@@ -171,6 +172,15 @@ class DataContainer():
             maximumDistance = np.clip(maximumDistance, a_min=1, a_max=self.windowSize)
         self.__loadMatrixData(scaleMatrix=scaleTargets)
         self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
+        if self.FactorDataArray is not None and self.sparseHiCMatrix is not None:
+            min_bins = min(self.FactorDataArray.shape[0], self.sparseHiCMatrix.shape[0])
+            if self.FactorDataArray.shape[0] != self.sparseHiCMatrix.shape[0]:
+                log.info(
+                    f"Aligning bins to common length: FactorDataArray ({self.FactorDataArray.shape[0]}) "
+                    f"vs sparseHiCMatrix ({self.sparseHiCMatrix.shape[0]}). Using: {min_bins}"
+                )
+                self.FactorDataArray = self.FactorDataArray[:min_bins, :min_bins]
+                self.sparseHiCMatrix = self.sparseHiCMatrix[:min_bins, :min_bins]
         self.windowSize = windowSize
         self.flankingSize = flankingSize
         self.maximumDistance = maximumDistance

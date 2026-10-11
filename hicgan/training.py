@@ -584,7 +584,10 @@ def main(args=None):
         physical_gpus = tf.config.list_physical_devices('GPU')
 
         try:
-            if args.multiGPUTraining:
+            if len(physical_gpus) == 0:
+                log.info("No GPU found. Falling back to CPU training.")
+                strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
+            elif args.multiGPUTraining:
                 # --- MULTI GPU SETUP ---
                 # Ensure all physical GPUs are visible
                 tf.config.set_visible_devices(physical_gpus, 'GPU')
