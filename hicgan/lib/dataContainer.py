@@ -44,96 +44,66 @@ class DataContainer():
         self.data_loaded = False
 
     def __loadFactorData(self, ignoreChromLengths=False, scaleFeatures=False, clampFeatures=False):
-        #load chromatin factor data from bigwig files
+        #load chromatin factor data from npz files (2D matrix)
         if self.chromatinFolder is None:
             return
+        
         #ensure that binSizes for matrix (if given) and factors match
         if self.binSize is None:
-            msg = "No binSize given; use a Hi-C matrix or explicitly specify binSize for the container"   
+            msg = "No binSize given; use a Hi-C matrix or explicitly specify binSize for the container"
+            log.error(msg)
             raise TypeError(msg)
-        ###load data for a specific chromsome
-        #get the names of the bigwigfiles
-        bigwigFileList = utils.getBigwigFileList(self.chromatinFolder)
-        bigwigFileList = sorted(bigwigFileList)
-        if len(bigwigFileList) is None:
-            msg = "Warning: folder {:s} does not contain any bigwig files"
-            msg = msg.format(self.chromatinFolder)
-            print(msg)
-            return
-        #check the chromosome name prefixes (e.g. "" or "chr") and sizes
-        chromSizeList = []
-        prefixDict_factors = dict()
-        for bigwigFile in bigwigFileList:
-            try:
-                prefixDict_factors[bigwigFile] = utils.getChromPrefixBigwig(bigwigFile)
-                chromname = prefixDict_factors[bigwigFile] + self.chromosome
-                chromSizeList.append( utils.getChromSizesFromBigwig(bigwigFile)[chromname] )
-            except Exception as e:
-                msg = str(e) + "\n"
-                msg += "Could not load data from bigwigfile {}".format(bigwigFile) 
-                raise IOError(msg)
-        #the chromosome lengths should be equal in all bigwig files
-        if len(set(chromSizeList)) != 1 and not ignoreChromLengths:
-            msg = "Invalid data. Chromosome lengths differ in bigwig files:"
-            for i, filename in enumerate(bigwigFileList):
-                msg += "{:s}: {:d}\n".format(filename, chromSizeList[i])
-            raise IOError(msg)
-        elif len(set(chromSizeList)) != 1 and ignoreChromLengths:
-            chromSize_factors = min(chromSizeList)
+            
+        # Check if chromatinFolder is an npz file directly
+        if self.chromatinFolder.endswith(".npz"):
+            npz_path = self.chromatinFolder
         else:
-            chromSize_factors = chromSizeList[0]
-        #the chromosome lengths of matrices and bigwig files must be equal
-        if self.chromSize_matrix is not None \
-                and self.chromSize_matrix != chromSize_factors:
-            msg = "Chrom lengths not equal between matrix and bigwig files\n"
-            msg += "Matrix: {:d} -- Factors: {:d}".format(self.chromSize_matrix, chromSize_factors)
-            raise IOError(msg)
-        #load the data into memory now
-        self.factorNames = [os.path.splitext(os.path.basename(name))[0] for name in bigwigFileList]
-        self.nr_factors = len(self.factorNames)
-        self.prefixDict_factors = prefixDict_factors
-        self.chromSize_factors = chromSize_factors
-        nr_bins = int( np.ceil(self.chromSize_factors / self.binSize) )
-        self.FactorDataArray = np.empty(shape=(len(bigwigFileList),nr_bins))
-        msg = "Loaded {:d} chromatin features from folder {:s}\n"
-        msg = msg.format(self.nr_factors, self.chromatinFolder)
-        featLoadedMsgList = [] #pretty printing for features loaded
-
-        def process_bigwig_file(bigwigFile):
-            chromname = self.prefixDict_factors[bigwigFile] + self.chromosome
-            tmpArray = utils.binChromatinFactor(pBigwigFileName=bigwigFile,
-                                                pBinSizeInt=self.binSize,
-                                                pChromStr=chromname,
-                                                pChromSize=self.chromSize_factors)
-            if clampFeatures:
-                tmpArray = utils.clampArray(tmpArray)
-            if scaleFeatures:
-                tmpArray = utils.scaleArray(tmpArray)
-            return tmpArray
-
-        #The row a track is written to is its position in the sorted file list,
-        #not the order in which its thread happened to finish. as_completed()
-        #yields in completion order, so enumerating it and using that index put
-        #each track in whichever row it won the race for: with two or more
-        #bigwig files the channel order of FactorDataArray varied from run to
-        #run, and within a run from chromosome to chromosome, while
-        #self.factorNames stayed sorted. The log line named the wrong file for
-        #the same reason.
-        results = [None] * len(bigwigFileList)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futureToIndex = {executor.submit(process_bigwig_file, bigwigFile): i
-                             for i, bigwigFile in enumerate(bigwigFileList)}
-            for future in concurrent.futures.as_completed(futureToIndex):
-                results[futureToIndex[future]] = future.result()
-        for i, tmpArray in enumerate(results):
-            self.FactorDataArray[i] = tmpArray
-            nr_nonzero_abs = np.count_nonzero(tmpArray)
-            nr_nonzero_perc = nr_nonzero_abs / tmpArray.size * 100
-            msg2 = "{:s} - min. {:.3f} - max. {:.3f} - nnz. {:d} ({:.2f}%)"
-            msg2 = msg2.format(bigwigFileList[i], tmpArray.min(), tmpArray.max(), nr_nonzero_abs, nr_nonzero_perc)
-            featLoadedMsgList.append(msg2)
-        self.FactorDataArray = np.transpose(self.FactorDataArray)
-        print(msg + "\n".join(featLoadedMsgList))
+            # Assume it's a directory and find the npz file for this chromosome
+            npz_path = os.path.join(self.chromatinFolder, f"{self.chromosome}.npz")
+            if not os.path.exists(npz_path):
+                # Try with 'chr' prefix
+                npz_path = os.path.join(self.chromatinFolder, f"chr{self.chromosome}.npz")
+                
+        if not os.path.exists(npz_path):
+            log.warning(f"Could not find npz file for chromosome {self.chromosome} in {self.chromatinFolder}")
+            return
+            
+        try:
+            # Try to load as sparse matrix
+            log.debug(f"Attempting to load {npz_path} as sparse matrix...")
+            mat = scipy.sparse.load_npz(npz_path)
+            self.FactorDataArray = mat.todense()
+            log.debug(f"Successfully loaded sparse matrix from {npz_path}.")
+        except Exception as e:
+            # Fallback to normal numpy array
+            log.debug(f"Sparse load failed ({e}), attempting to load as numpy array...")
+            with np.load(npz_path) as data:
+                # Assume the first array is the matrix
+                key = list(data.keys())[0]
+                self.FactorDataArray = data[key]
+            log.debug(f"Successfully loaded numpy array from {npz_path}.")
+                
+        self.FactorDataArray = np.array(self.FactorDataArray)
+        
+        if np.isnan(self.FactorDataArray).any():
+            log.warning(f"NaN values detected in {npz_path}. Replacing with zeros.")
+            self.FactorDataArray = np.nan_to_num(self.FactorDataArray)
+            
+        if scaleFeatures:
+            log.debug("Scaling features...")
+            self.FactorDataArray = utils.scaleArray(self.FactorDataArray)
+        if clampFeatures:
+            log.debug("Clamping features...")
+            self.FactorDataArray = utils.clampArray(self.FactorDataArray)
+            
+        # The number of bins is the shape of the matrix
+        nr_bins = self.FactorDataArray.shape[0]
+        self.chromSize_factors = nr_bins * self.binSize
+        self.nr_factors = 1 # 1 channel for the matrix
+        self.factorNames = [os.path.basename(npz_path)]
+        self.prefixDict_factors = {npz_path: ""}
+        
+        log.info(f"Loaded npz matrix from {npz_path}, shape: {self.FactorDataArray.shape}")
             
     def __loadMatrixData(self, scaleMatrix=False):
         #load Hi-C matrix from cooler file
@@ -616,22 +586,24 @@ class DataContainer():
         return trainmatrix
     
     def __getFactorData(self, idx):
-        if self.chromatinFolder is None:
+        if self.chromatinFolder is None or self.FactorDataArray is None:
             return None
         if not self.data_loaded:
             msg = "Error: Load data first"
             raise RuntimeError(msg)
-        #the 0-th feature matrix starts at position 0
+        
         windowSize = self.windowSize
         flankingSize = self.flankingSize
         if flankingSize is None:
             flankingSize = windowSize
             self.flankingSize = windowSize
-        startIdx = idx
-        endIdx = startIdx + 2*flankingSize + windowSize
-        factorArray = self.FactorDataArray[startIdx:endIdx]
-        factorArray = np.expand_dims(factorArray, axis=-1)
-        return factorArray
+            
+        startInd = idx + flankingSize
+        stopInd = startInd + windowSize
+        
+        factorMatrix = self.FactorDataArray[startInd:stopInd, startInd:stopInd]
+        factorMatrix = np.expand_dims(factorMatrix, axis=-1)
+        return factorMatrix
 
     def getSampleData(self, idx):
         if not self.data_loaded:
