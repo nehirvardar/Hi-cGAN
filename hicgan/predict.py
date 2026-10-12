@@ -51,10 +51,22 @@ def parse_arguments(args=None):
                         type=int,
                         default=32, 
                         help="Batch size for predicting")
+    # [Orijinal Kod - Korundu & Genişletildi]:
+    # Orijinal projede minimum pencere boyutu 64 idi:
+    # parser.add_argument("--windowSize", "-ws", required=False,
+    #                     type=int,
+    #                     choices=[64, 128, 256, 512, 768, 1024],
+    #                     help="Window size for predicting; must be the same as in trained model. Supported values are 64, 128, and 256")
+    # 250 kb çözünürlük için 16 ve 32 pencere boyutları eklendi.
     parser.add_argument("--windowSize", "-ws", required=False,
                         type=int,
-                        choices=[64, 128, 256, 512, 768, 1024],
-                        help="Window size for predicting; must be the same as in trained model. Supported values are 64, 128, and 256")
+                        choices=[16, 32, 64, 128, 256, 512, 768, 1024],
+                        help="Window size for predicting; must be the same as in trained model.")
+    # [Yeni Argüman - Eklendi]:
+    # Eğitimde kullanılan flankingSize (varsayılan 0) ile tutarlı çalışması için eklendi.
+    parser.add_argument("--flankingSize", "-fls", required=False,
+                        type=int, default=0,
+                        help="Flanking size in bins (default: 0). Must match training flanking size.")
     parser.add_argument("--targetValueRange", "-tvr", required=False,
                         type=str,
                         help="Undo the [0, 1] mapping that training applied, so the "
@@ -187,7 +199,7 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         container.unloadData()
     return keptContainers, tfRecordFilenames, sampleSizeList, nr_factors, windowStartsList, matrixSizeList
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pFlankingSize=0):
     trainedmodel = pTrainedModel
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
@@ -218,7 +230,11 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
     scalematrix = True
     maxdist = None
     windowSize = int(windowSize)
-    flankingsize = windowSize
+    # [Orijinal Kod - Korundu & Güncellendi]:
+    # Orijinal projede flankingsize doğrudan windowSize olarak atanıyordu:
+    # flankingsize = windowSize
+    # 2D TSS NPZ matris girdilerinde eğitim parametresiyle tutarlı olmak ve veri kaybını önlemek için:
+    flankingsize = pFlankingSize if pFlankingSize is not None else 0
 
     paramDict = locals().copy()
     predictionChunksDir = os.path.join(outputFolder, "prediction_chunks")
@@ -335,11 +351,16 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             if useBand:
                 bandFile = os.path.join(predictionChunksDir, f"band_chr{chrom}.npy")
                 matrixSize = int(matrixSizeList[idx])
+                # [Orijinal Kod - Korundu & Güncellendi]:
+                # Orijinal projede flanking_size=windowSize olarak sabit verilmişti:
+                # flanking_size=windowSize,
+                # 2D TSS NPZ matris girdilerinde flanking=0 olduğunda bu durum boyut aşımına
+                # (window at ... exceeds ... bins) yol açıyordu. flankingsize parametresi bağlandı.
                 band, starts = trained_GAN.predict_band(
                     test_ds=testDs,
                     window_size=windowSize,
                     matrix_size=matrixSize,
-                    flanking_size=windowSize,
+                    flanking_size=flankingsize,
                     window_starts=windowStartsList[idx] if windowStartsList else None)
                 written = int(starts.size)
                 np.save(bandFile, band)
@@ -413,7 +434,10 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
 
             if rebuildPool is not None:
                 matrixFile = os.path.join(matrixChunksDir, f"matrix_chr{chrom}.npz")
-                job = (predFile, matrixFile, windowSize, windowSize, pSaveMemory,
+                # [Orijinal Kod - Korundu & Güncellendi]:
+                # job = (predFile, matrixFile, windowSize, windowSize, pSaveMemory, ...)
+                # 4. parametre olan flankingSize için flankingsize değişkeni verilir.
+                job = (predFile, matrixFile, windowSize, flankingsize, pSaveMemory,
                        windowStartsList[idx] if windowStartsList else None,
                        matrixSizeList[idx] if matrixSizeList else None,
                        tuple(targetValueRange) if targetValueRange is not None else None,
@@ -447,6 +471,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             "predictionFiles": predictionFiles,
             "chromNameList": chromNameList,
             "windowSize": windowSize,
+            "flankingSize": flankingsize,
             "windowStartsList": windowStartsList,
             "matrixSizeList": matrixSizeList,
             #"band" means the files hold the summed band and the window starts
@@ -483,6 +508,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         bandStarts = loaded_vars.get("bandStarts")
         if "windowSize" in loaded_vars:
             windowSize = int(loaded_vars["windowSize"])
+        if "flankingSize" in loaded_vars:
+            flankingsize = int(loaded_vars["flankingSize"])
 
         # Backward compatibility: older pickles stored all predictions in-memory.
         if predictionFiles is None and "predList" in loaded_vars:
@@ -565,7 +592,10 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                              tuple(targetValueRange) if targetValueRange is not None else None,
                              multiplier))
             else:
-                jobs.append((predFile, matrixFile, windowSize, windowSize, pSaveMemory,
+                # [Orijinal Kod - Korundu & Güncellendi]:
+                # jobs.append((predFile, matrixFile, windowSize, windowSize, pSaveMemory, ...))
+                # 4. parametre olan flankingSize için flankingsize değişkeni verilir.
+                jobs.append((predFile, matrixFile, windowSize, flankingsize, pSaveMemory,
                              windowStarts, matrixSize,
                              tuple(targetValueRange) if targetValueRange is not None else None,
                              multiplier))
@@ -655,4 +685,5 @@ def main(args=None):
         pMode=args.mode,
         pIncludeRegions=args.includeRegions,
         pTargetValueRange=args.targetValueRange,
-        pRebuildProcesses=args.rebuildProcesses)
+        pRebuildProcesses=args.rebuildProcesses,
+        pFlankingSize=args.flankingSize)

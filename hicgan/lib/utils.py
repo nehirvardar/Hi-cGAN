@@ -413,7 +413,10 @@ def rebuildMatrix(pArrayOfTriangles, pWindowSize, pFlankingSize=None, pMaxDist=N
     of triangles no longer determines the chromosome length.
     """
     log.info("Rebuilding matrix from triangles with window size %d", pWindowSize)
-    flankingSize = pFlankingSize if pFlankingSize is not None else pWindowSize
+    # [Orijinal Kod - Korundu & Güncellendi]:
+    # flankingSize = pFlankingSize if pFlankingSize is not None else pWindowSize
+    # 2D TSS NPZ matris girdisinde varsayılan flanking boyutu 0'dır.
+    flankingSize = pFlankingSize if pFlankingSize is not None else 0
     nr_matrices = pArrayOfTriangles.shape[0]
     if pWindowStarts is None:
         windowStarts = np.arange(nr_matrices, dtype=np.int64)

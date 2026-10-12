@@ -43,7 +43,11 @@ class HiCGAN():
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
         self.input_size = 256
-        if input_size in [64,128,256, 512, 768, 1024]:
+        # --- Orijinal Kod: Sadece 64 ve üzeri pencere boyutlarını destekliyordu ---
+        # if input_size in [64,128,256, 512, 768, 1024]:
+        #     self.input_size = input_size
+        # --- Güncelleme: 250 kb çözünürlükte TAD/domain ölçeğinde çalışabilmek için 16 ve 32 eklendi ---
+        if input_size in [16, 32, 64, 128, 256, 512, 768, 1024]:
             self.input_size = input_size
         self.number_factors = number_factors
         self.loss_weight_pixel = loss_weight_pixel
@@ -159,10 +163,22 @@ class HiCGAN():
             HiCGAN.downsample(512, 4), # (bs, 2, 2, 512)
             HiCGAN.downsample(512, 4, apply_batchnorm=False), # (bs, 1, 1, 512)
         ]
-        #if the input images are smaller, leave out some layers accordingly
+        # [Orijinal Kod - Korundu & Genişletildi]:
+        # Orijinal projede minimum input_size 64 olarak varsayılmıştı (sadece <256 ve <128 kontrolleri vardı).
+        # 32x32 ve 16x16 pencerelerde U-Net downsampling'in 1x1 bottleneck'e ulaşması için katman azaltması eklendi.
+        # --- Orijinal kod başlangıcı ---
+        # if self.input_size < 256:
+        #     down_stack = down_stack[:-2] + down_stack[-1:]
+        # if self.input_size < 128:
+        #     down_stack = down_stack[:-2] + down_stack[-1:]
+        # --- Orijinal kod sonu ---
         if self.input_size < 256:
             down_stack = down_stack[:-2] + down_stack[-1:]
         if self.input_size < 128:
+            down_stack = down_stack[:-2] + down_stack[-1:]
+        if self.input_size < 64:
+            down_stack = down_stack[:-2] + down_stack[-1:]
+        if self.input_size < 32:
             down_stack = down_stack[:-2] + down_stack[-1:]
 
         #the upsampling portion of the generator, designed for 256x256 images
@@ -176,9 +192,21 @@ class HiCGAN():
             HiCGAN.upsample(64, 4), # (bs, 128, 128, 128)
         ]
         #for smaller images, take layers away, otherwise downsampling won't work
+        # [Orijinal Kod - Korundu & Genişletildi]:
+        # 32x32 ve 16x16 pencerelerde U-Net skip-connection boyutlarının eşleşmesi için up_stack katmanları azaltıldı.
+        # --- Orijinal kod başlangıcı ---
+        # if self.input_size < 256:
+        #     up_stack = up_stack[:2] + up_stack[3:]
+        # if self.input_size < 128:
+        #     up_stack = up_stack[:2] + up_stack[3:]
+        # --- Orijinal kod sonu ---
         if self.input_size < 256:
             up_stack = up_stack[:2] + up_stack[3:]
         if self.input_size < 128:
+            up_stack = up_stack[:2] + up_stack[3:]
+        if self.input_size < 64:
+            up_stack = up_stack[:2] + up_stack[3:]
+        if self.input_size < 32:
             up_stack = up_stack[:2] + up_stack[3:]
 
         initializer = tf.random_normal_initializer(0., 0.02)

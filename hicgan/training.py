@@ -40,9 +40,21 @@ def parse_arguments(args=None):
     parser.add_argument("--validationChromatinFolders", "-vcp", required=True,
                         type=str, nargs='+',
                         help="Path where chromatin factors for validation reside (bigwig files).")
+    # [Orijinal Kod - Korundu & Genişletildi]:
+    # Orijinal projede minimum pencere boyutu 64 idi:
+    # parser.add_argument("--windowSize", "-ws", required=True,
+    #                     type=int, choices=[64, 128, 256, 512, 768, 1024],
+    #                     help="window size for submatrices.")
+    # 250 kb çözünürlükte TAD/domain ölçeğinde çalışabilmek için 16 ve 32 eklendi.
     parser.add_argument("--windowSize", "-ws", required=True,
-                        type=int, choices=[64, 128, 256, 512, 768, 1024],
+                        type=int, choices=[16, 32, 64, 128, 256, 512, 768, 1024],
                         help="window size for submatrices.")
+    # [Yeni Argüman - Eklendi]:
+    # Orijinal projede flankingSize bağımsız bir parametre değildi ve doğrudan windowSize'a eşitleniyordu.
+    # 2D TSS NPZ matris girdilerinde flanking bölgeleri modele verilmediği için varsayılan 0 olarak ayarlanabilir.
+    parser.add_argument("--flankingSize", "-fls", required=False,
+                        type=int, default=0,
+                        help="Flanking size in bins (default: 0 for 2D matrix input).")
     parser.add_argument("--outputFolder", "-o", required=True,
                         type=str,
                         help="Folder where trained model and diverse outputs will be stored.")
@@ -226,7 +238,8 @@ def create_data(pTrainingMatrices,
                 pThreads=4,
                 pMinTargetCoverage=0.0,
                 pExcludeRegions=None,
-                pScaleTargetToUnitRange=False):
+                pScaleTargetToUnitRange=False,
+                pFlankingSize=0):
     os.makedirs(pOutputFolder, exist_ok=True)
     #few constants
     # windowSize = int(windowSize)
@@ -299,7 +312,12 @@ def create_data(pTrainingMatrices,
                 #the dense window instead. Asking for both would crash.
                 "scaleTargets": False if pScaleTargetToUnitRange else noScaleNorm,
                 "windowSize": pWindowSize,
-                "flankingSize": pWindowSize,
+                # [Orijinal Kod - Korundu & Güncellendi]:
+                # Orijinal projede flankingSize doğrudan pWindowSize olarak atanıyordu:
+                # "flankingSize": pWindowSize,
+                # 2D TSS NPZ matris girişlerinde flanking pencereleri modele verilmediğinden
+                # ve telomerlerden 2xWindowSize kadar gereksiz veri kaybını önlemek için pFlankingSize (varsayılan 0) kullanılır.
+                "flankingSize": pFlankingSize,
                 "maximumDistance": None,
                 "minTargetCoverage": pMinTargetCoverage,
                 "excludedRegions": pExcludeRegions,
@@ -656,7 +674,8 @@ def main(args=None):
                         args.threads,
                         pMinTargetCoverage=args.minTargetCoverage,
                         pExcludeRegions=args.excludeRegions,
-                        pScaleTargetToUnitRange=args.scaleTargetToUnitRange)
+                        pScaleTargetToUnitRange=args.scaleTargetToUnitRange,
+                        pFlankingSize=args.flankingSize)
             if args.createDataOnly:
                 meta = {
                     "tfRecordFilenames": tfRecordFilenames,

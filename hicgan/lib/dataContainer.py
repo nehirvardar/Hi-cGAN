@@ -182,6 +182,13 @@ class DataContainer():
                 self.FactorDataArray = self.FactorDataArray[:min_bins, :min_bins]
                 self.sparseHiCMatrix = self.sparseHiCMatrix[:min_bins, :min_bins]
         self.windowSize = windowSize
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Orijinal projede flankingSize None olduğunda ileride windowSize'a eşitleniyordu.
+        # 2D TSS NPZ matris girişlerinde flanking pencereleri modele girdi olarak verilmediğinden
+        # ve telomerlerden gereksiz veri kaybını önlemek için varsayılan 0 olarak ayarlandı.
+        # self.flankingSize = flankingSize
+        if flankingSize is None:
+            flankingSize = 0
         self.flankingSize = flankingSize
         self.maximumDistance = maximumDistance
         self.minTargetCoverage = float(minTargetCoverage)
@@ -458,7 +465,11 @@ class DataContainer():
         nr_samples = self.__getNumberRawSamples()
         if not nr_samples:
             return
-        flankingSize = self.flankingSize if self.flankingSize is not None else self.windowSize
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Orijinal projede self.flankingSize None ise self.windowSize alınıyordu:
+        # flankingSize = self.flankingSize if self.flankingSize is not None else self.windowSize
+        # 2D TSS NPZ matris girdi desteğinde varsayılan 0 olarak ele alınır.
+        flankingSize = self.flankingSize if self.flankingSize is not None else 0
         nr_bins = self.__getNumberBins()
         startInd = np.arange(nr_samples) + flankingSize
         #windows running past the end of the matrix (the factor array can be
@@ -571,9 +582,16 @@ class DataContainer():
         #the 0-th matrix starts flankingSize away from the boundary
         windowSize = self.windowSize
         flankingSize = self.flankingSize
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Orijinal projede flankingSize belirtilmediğinde windowSize'a eşitleniyordu:
+        # if flankingSize is None:
+        #     flankingSize = windowSize
+        #     self.flankingSize = windowSize
+        # 2D TSS NPZ matris girişlerinde flanking pencereleri modele verilmediğinden
+        # ve telomerlerden gereksiz veri kaybını önlemek için varsayılan 0 olarak ayarlandı.
         if flankingSize is None:
-            flankingSize = windowSize
-            self.flankingSize = windowSize
+            flankingSize = 0
+            self.flankingSize = 0
         startInd = idx + flankingSize
         stopInd = startInd + windowSize
         trainmatrix = self.sparseHiCMatrix[startInd:stopInd,startInd:stopInd].todense()
@@ -604,9 +622,16 @@ class DataContainer():
         
         windowSize = self.windowSize
         flankingSize = self.flankingSize
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Orijinal projede flankingSize belirtilmediğinde windowSize'a eşitleniyordu:
+        # if flankingSize is None:
+        #     flankingSize = windowSize
+        #     self.flankingSize = windowSize
+        # 2D TSS NPZ matris girişlerinde flanking pencereleri modele verilmediğinden
+        # ve telomerlerden gereksiz veri kaybını önlemek için varsayılan 0 olarak ayarlandı.
         if flankingSize is None:
-            flankingSize = windowSize
-            self.flankingSize = windowSize
+            flankingSize = 0
+            self.flankingSize = 0
             
         startInd = idx + flankingSize
         stopInd = startInd + windowSize
@@ -676,9 +701,13 @@ class DataContainer():
             return
         sparseMatrix = None
         windowSize = self.windowSize
-        flankingSize = self.flankingSize
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Orijinal projede flankingSize int değilse windowSize yapılıyordu:
+        # if not isinstance(flankingSize, int):
+        #     flankingSize = windowSize
+        # 2D TSS NPZ matris girdi desteğinde varsayılan flankingSize 0'dır.
         if not isinstance(flankingSize, int):
-            flankingSize = windowSize
+            flankingSize = 0
         if isinstance(self.maximumDistance, int) and self.maximumDistance < windowSize and self.maximumDistance > 0:
             maximumDistance = self.maximumDistance
         else:
