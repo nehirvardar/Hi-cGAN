@@ -29,14 +29,35 @@ def getBigwigFileList(pDirectory):
             retList.append(pDirectory + file)
     return retList
          
-def getMatrixFromCooler(pCoolerFilePath, pChromNameStr):
+def getMatrixFromCooler(pCoolerFilePath, pChromNameStr, pBalance=False):
     #returns sparse csr matrix from cooler file for given chromosome name
     sparseMatrix = None
     binSizeInt = 0
     try:
         coolerMatrix = cooler.Cooler(pCoolerFilePath)
-        sparseMatrix = coolerMatrix.matrix(sparse=True,balance=False).fetch(pChromNameStr)
+        # [Orijinal Kod - Korundu & Genişletildi]:
+        # Orijinal projede balance=False sabitlenmişti ve ham sayımlar okunuyordu:
+        # sparseMatrix = coolerMatrix.matrix(sparse=True,balance=False).fetch(pChromNameStr)
+        # ICE/KR normalizasyonu (matrix balancing) desteği eklendi:
+        balance_col = False
+        if pBalance:
+            cols = coolerMatrix.bins().columns
+            if isinstance(pBalance, str) and pBalance in cols:
+                balance_col = pBalance
+            elif "weight" in cols:
+                balance_col = "weight"
+            elif "KR" in cols:
+                balance_col = "KR"
+            elif "VC_SQRT" in cols:
+                balance_col = "VC_SQRT"
+            else:
+                balance_col = True
+        sparseMatrix = coolerMatrix.matrix(sparse=True, balance=balance_col).fetch(pChromNameStr)
         sparseMatrix = sparseMatrix.tocsr() #so it can be sliced later
+        if pBalance and sparseMatrix is not None:
+            # Dengeleme sonrası haritalanamayan (unmappable) bölgelerdeki NaN değerlerini 0'a çevir
+            if np.isnan(sparseMatrix.data).any():
+                sparseMatrix.data = np.nan_to_num(sparseMatrix.data)
         binSizeInt = int(coolerMatrix.binsize)
     except Exception as e:
         traceback.print_exc()
@@ -89,7 +110,9 @@ def scaleArray(pArray):
         normArray = np.zeros_like(pArray)
     return normArray
 
-def observedValueRange(pMatrixFilePaths, pChromosomes=None):
+# [Orijinal Kod - Korundu & Genişletildi]:
+# def observedValueRange(pMatrixFilePaths, pChromosomes=None):
+def observedValueRange(pMatrixFilePaths, pChromosomes=None, pBalance=False, pLogTarget=False):
     """Smallest and largest value actually present in the target matrices.
 
     Measured, not assumed. The range is taken over the STORED entries only: an
@@ -112,7 +135,12 @@ def observedValueRange(pMatrixFilePaths, pChromosomes=None):
         for chrom in chroms:
             name = prefix + str(chrom).replace(prefix, "", 1)
             try:
-                M, _ = getMatrixFromCooler(path, name)
+                # [Orijinal Kod - Korundu & Güncellendi]:
+                # M, _ = getMatrixFromCooler(path, name)
+                # Dengeleme ve log1p dönüşümü uygulandığında değer aralığının tutarlı hesaplanması sağlandı:
+                M, _ = getMatrixFromCooler(path, name, pBalance=pBalance)
+                if pLogTarget and M is not None:
+                    M = M.log1p()
             except Exception:
                 continue
             if M is None:

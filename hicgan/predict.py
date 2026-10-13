@@ -62,11 +62,18 @@ def parse_arguments(args=None):
                         type=int,
                         choices=[16, 32, 64, 128, 256, 512, 768, 1024],
                         help="Window size for predicting; must be the same as in trained model.")
-    # [Yeni Argüman - Eklendi]:
-    # Eğitimde kullanılan flankingSize (varsayılan 0) ile tutarlı çalışması için eklendi.
+    # [Yeni Argümanlar - Eklendi]:
+    # Eğitimde kullanılan flankingSize (varsayılan 0) ile tutarlı çalışması için eklendi:
     parser.add_argument("--flankingSize", "-fls", required=False,
                         type=int, default=0,
                         help="Flanking size in bins (default: 0). Must match training flanking size.")
+    # Eğitim konfigürasyonuyla uyumluluk ve metrik değerlendirme parametreleri için:
+    parser.add_argument("--balanceMatrix", "-bm", required=False,
+                        action='store_true',
+                        help="Indicates model trained on balanced Hi-C matrix.")
+    parser.add_argument("--logTarget", "-lt", required=False,
+                        action='store_true',
+                        help="Indicates model trained on log1p transformed Hi-C matrix.")
     parser.add_argument("--targetValueRange", "-tvr", required=False,
                         type=str,
                         help="Undo the [0, 1] mapping that training applied, so the "
@@ -199,7 +206,9 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         container.unloadData()
     return keptContainers, tfRecordFilenames, sampleSizeList, nr_factors, windowStartsList, matrixSizeList
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pFlankingSize=0):
+# [Orijinal Kod - Korundu & Genişletildi]:
+# def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pFlankingSize=0):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pFlankingSize=0, pBalanceMatrix=False, pLogTarget=False):
     trainedmodel = pTrainedModel
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
@@ -686,4 +695,10 @@ def main(args=None):
         pIncludeRegions=args.includeRegions,
         pTargetValueRange=args.targetValueRange,
         pRebuildProcesses=args.rebuildProcesses,
-        pFlankingSize=args.flankingSize)
+        pFlankingSize=args.flankingSize,
+        # [Yeni Parametreler - Eklendi]:
+        pBalanceMatrix=args.balanceMatrix,
+        pLogTarget=args.logTarget)
+
+if __name__ == '__main__':
+    main()

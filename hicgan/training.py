@@ -102,6 +102,14 @@ def parse_arguments(args=None):
     parser.add_argument("--noScaleNorm", "-nsn", required=False,
                         action='store_false',
                         help="Do not scale normalization of chromatin features to 0-1 range.")
+    # [Yeni Argümanlar - Eklendi]:
+    # Hedef Hi-C matrisini dengelemek (ICE/KR) ve dinamik aralığı sıkıştırmak (log1p) için:
+    parser.add_argument("--balanceMatrix", "-bm", required=False,
+                        action='store_true',
+                        help="Balance the target Hi-C matrix using ICE/KR balancing weights from cooler.")
+    parser.add_argument("--logTarget", "-lt", required=False,
+                        action='store_true',
+                        help="Apply log1p transformation to target Hi-C matrix to compress dynamic range and prevent L1 collapse.")
     parser.add_argument("--scaleTargetToUnitRange", "-stur", required=False,
                         action="store_true",
                         help="Map the target matrices onto [0, 1] using the value range "
@@ -239,7 +247,11 @@ def create_data(pTrainingMatrices,
                 pMinTargetCoverage=0.0,
                 pExcludeRegions=None,
                 pScaleTargetToUnitRange=False,
-                pFlankingSize=0):
+                pFlankingSize=0,
+                # [Yeni Parametreler - Eklendi]:
+                # Hedef Hi-C matris dengelemesi ve log1p dönüşümü
+                pBalanceMatrix=False,
+                pLogTarget=False):
     os.makedirs(pOutputFolder, exist_ok=True)
     #few constants
     # windowSize = int(windowSize)
@@ -295,7 +307,11 @@ def create_data(pTrainingMatrices,
     #same physical value to a different target on each chromosome.
     targetValueRange = None
     if pScaleTargetToUnitRange:
-        targetValueRange = utils.observedValueRange(pTrainingMatrices, trainChromNameList)
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # targetValueRange = utils.observedValueRange(pTrainingMatrices, trainChromNameList)
+        # Dengeleme ve log dönüşümü uygulandığında aralığın doğru ölçülmesi sağlandı:
+        targetValueRange = utils.observedValueRange(pTrainingMatrices, trainChromNameList,
+                                                    pBalance=pBalanceMatrix, pLogTarget=pLogTarget)
         rangePath = os.path.join(pOutputFolder, "target_value_range.json")
         utils.saveValueRange(rangePath, *targetValueRange)
         print("target value range measured from the training targets: "
@@ -321,7 +337,11 @@ def create_data(pTrainingMatrices,
                 "maximumDistance": None,
                 "minTargetCoverage": pMinTargetCoverage,
                 "excludedRegions": pExcludeRegions,
-                "targetValueRange": targetValueRange}
+                "targetValueRange": targetValueRange,
+                # [Yeni Parametreler - Eklendi]:
+                # Hedef matris dengelemesi ve log1p dönüşümü
+                "balanceMatrix": pBalanceMatrix,
+                "logTarget": pLogTarget}
     if pExcludeRegions:
         missing = [f for f in pExcludeRegions if not os.path.isfile(f)]
         if missing:
@@ -675,7 +695,10 @@ def main(args=None):
                         pMinTargetCoverage=args.minTargetCoverage,
                         pExcludeRegions=args.excludeRegions,
                         pScaleTargetToUnitRange=args.scaleTargetToUnitRange,
-                        pFlankingSize=args.flankingSize)
+                        pFlankingSize=args.flankingSize,
+                        # [Yeni Parametreler - Eklendi]:
+                        pBalanceMatrix=args.balanceMatrix,
+                        pLogTarget=args.logTarget)
             if args.createDataOnly:
                 meta = {
                     "tfRecordFilenames": tfRecordFilenames,
@@ -732,3 +755,6 @@ def main(args=None):
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)
+
+if __name__ == '__main__':
+    main()

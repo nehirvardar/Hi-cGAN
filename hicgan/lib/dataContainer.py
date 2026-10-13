@@ -42,6 +42,10 @@ class DataContainer():
         self.includedRegions = None
         self.targetValueRange = None
         self.sampleIndices = None
+        # [Yeni Nitelikler - Eklendi]:
+        # Matris dengeleme ve log1p dönüşümü takibi için
+        self.balanceMatrix = False
+        self.logTarget = False
         self.data_loaded = False
 
     def __loadFactorData(self, ignoreChromLengths=False, scaleFeatures=False, clampFeatures=False):
@@ -106,7 +110,10 @@ class DataContainer():
         
         log.info(f"Loaded npz matrix from {npz_path}, shape: {self.FactorDataArray.shape}")
             
-    def __loadMatrixData(self, scaleMatrix=False):
+    # [Orijinal Kod - Korundu & Genişletildi]:
+    # Orijinal fonksiyonda matris dengeleme ve logaritmik dönüşüm desteği yoktu:
+    # def __loadMatrixData(self, scaleMatrix=False):
+    def __loadMatrixData(self, scaleMatrix=False, balanceMatrix=False, logTarget=False):
         #load Hi-C matrix from cooler file
         if self.matrixFilePath is None:
             return
@@ -114,11 +121,21 @@ class DataContainer():
             prefixDict_matrix = {self.matrixFilePath: utils.getChromPrefixCooler(self.matrixFilePath)}
             chromname = prefixDict_matrix[self.matrixFilePath] + self.chromosome
             chromsize_matrix = utils.getChromSizesFromCooler(self.matrixFilePath)[chromname]
-            sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname)
+            # [Orijinal Kod - Korundu & Güncellendi]:
+            # Ham sayımlar yerine dengelenmiş (ICE/KR) matris okunabilmesi için pBalance parametresi iletildi.
+            # sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname)
+            sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname, pBalance=balanceMatrix)
         except:
             msg = "Error: Could not load data from Hi-C matrix {:s}"
             msg = msg.format(self.matrixFilePath)
             raise IOError(msg)
+
+        # [Yeni Özellik - Eklendi]:
+        # Hi-C temas sayımları aşırı dinamik aralığa (0 - 230,000) sahip olduğundan L1 kaybı köşegen dışını sıfıra indirger.
+        # log1p dönüşümü dinamik aralığı sıkıştırarak TAD ve off-diagonal temasların dengeli öğrenilmesini sağlar.
+        if logTarget and sparseHiCMatrix is not None:
+            sparseHiCMatrix = sparseHiCMatrix.log1p()
+
         #scale to 0..1, if requested
         if scaleMatrix:
             sparseHiCMatrix = utils.scaleArray(sparseHiCMatrix)       
@@ -139,8 +156,12 @@ class DataContainer():
             msg = msg.format(binSize, self.binSize)
             raise IOError(msg)
         msg = "Loaded cooler matrix {:s}\n".format(self.matrixFilePath)
-        msg += "chr. {:s}, matshape {:d}*{:d} -- min. {:d} -- max. {:d} -- nnz. {:d}"
-        msg = msg.format(self.chromosome, self.sparseHiCMatrix.shape[0], self.sparseHiCMatrix.shape[1], int(self.sparseHiCMatrix.min()), int(self.sparseHiCMatrix.max()), self.sparseHiCMatrix.getnnz() )
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # Dengeleme veya log dönüşümü sonrası değerler float olabileceğinden %d formatı %.4f olarak güncellendi.
+        # msg += "chr. {:s}, matshape {:d}*{:d} -- min. {:d} -- max. {:d} -- nnz. {:d}"
+        # msg = msg.format(self.chromosome, self.sparseHiCMatrix.shape[0], self.sparseHiCMatrix.shape[1], int(self.sparseHiCMatrix.min()), int(self.sparseHiCMatrix.max()), self.sparseHiCMatrix.getnnz() )
+        msg += "chr. {:s}, matshape {:d}*{:d} -- min. {:.4f} -- max. {:.4f} -- nnz. {:d}"
+        msg = msg.format(self.chromosome, self.sparseHiCMatrix.shape[0], self.sparseHiCMatrix.shape[1], float(self.sparseHiCMatrix.min()), float(self.sparseHiCMatrix.max()), self.sparseHiCMatrix.getnnz() )
         print(msg)
     
     def __unloadFactorData(self):
@@ -162,15 +183,23 @@ class DataContainer():
         self.excludedRegions = None
         self.includedRegions = None
         self.targetValueRange = None
+        self.balanceMatrix = False
+        self.logTarget = False
         self.data_loaded = False
 
-    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None):
+    # [Orijinal Kod - Korundu & Genişletildi]:
+    # def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None):
+    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None, balanceMatrix=False, logTarget=False):
         if not isinstance(windowSize, int):
             msg = "windowSize must be integer"
             raise TypeError(msg)
         if isinstance(maximumDistance, int):
             maximumDistance = np.clip(maximumDistance, a_min=1, a_max=self.windowSize)
-        self.__loadMatrixData(scaleMatrix=scaleTargets)
+        self.balanceMatrix = balanceMatrix
+        self.logTarget = logTarget
+        # [Orijinal Kod - Korundu & Güncellendi]:
+        # self.__loadMatrixData(scaleMatrix=scaleTargets)
+        self.__loadMatrixData(scaleMatrix=scaleTargets, balanceMatrix=balanceMatrix, logTarget=logTarget)
         self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
         if self.FactorDataArray is not None and self.sparseHiCMatrix is not None:
             min_bins = min(self.FactorDataArray.shape[0], self.sparseHiCMatrix.shape[0])
