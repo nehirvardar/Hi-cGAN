@@ -61,7 +61,8 @@ def writeTFRecord(pFilename: str, pRecordDict: dict):
             writer.write(example.SerializeToString())
 
 def mirror_function(tensor1, tensor2):
-    t1 = tf.reverse(tensor1, axis=[0])
+    t1 = tf.transpose(tensor1, perm=(1, 0, 2))
+    t1 = tf.image.rot90(t1, 2)
     t2 = tf.transpose(tensor2, perm=(1,0,2))
     t2 = tf.image.rot90(t2, 2)
     return {"factorData": t1}, {"out_matrixData": t2}

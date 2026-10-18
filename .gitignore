@@ -134,3 +134,14 @@ dmypy.json
 # logfiles
 logs/
 
+# Large Hi-C, TFRecord, and checkpoint files
+.idea/
+*.cool
+*.tfrecord
+*.h5
+hicgan/output_model/
+hicgan/test_results/
+hicgan/data/gt/
+hicgan/data/random_input/
+output/
+01_core/

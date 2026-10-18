@@ -1,7 +1,7 @@
 #!python3
 import os
 import cooler
-import pyBigWig
+# import pyBigWig
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -156,6 +156,19 @@ def observedValueRange(pMatrixFilePaths, pChromosomes=None):
     vmin, vmax = np.inf, -np.inf
     for path in ([pMatrixFilePaths] if isinstance(pMatrixFilePaths, str)
                  else pMatrixFilePaths):
+        if path is None:
+            continue
+        if str(path).endswith(".npz"):
+            try:
+                M = sparse.load_npz(path)
+                data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
+                data = data[np.isfinite(data)]
+                if data.size > 0:
+                    vmin = min(vmin, float(data.min()))
+                    vmax = max(vmax, float(data.max()))
+            except Exception:
+                continue
+            continue
         prefix = getChromPrefixCooler(path)
         chroms = pChromosomes
         if chroms is None:
@@ -255,15 +268,15 @@ def plotMatrix(pMatrix, pFilename, pTitle):
     plt.close(fig1)
     del fig1, ax1
 
-def plotLoss(pGeneratorLossValueLists, pDiscLossValueLists, pGeneratorLossNameList, pDiscLossNameList, pFilename, useLogscaleList=[False, False]):
+def plotLoss(pdenoiserLossValueLists, pDiscLossValueLists, pdenoiserLossNameList, pDiscLossNameList, pFilename, useLogscaleList=[False, False]):
     #plot loss and validation loss over epoch numbers
     fig1, ax1 = plt.subplots(figsize=(6,4.5))
-    nr_epochs = len(pGeneratorLossValueLists[0])
+    nr_epochs = len(pdenoiserLossValueLists[0])
     x_vals = np.arange(nr_epochs) + 1
-    for generatorLossVals, _ in zip(pGeneratorLossValueLists, pGeneratorLossNameList):
-        ax1.plot(x_vals, generatorLossVals)
+    for denoiserLossVals, _ in zip(pdenoiserLossValueLists, pdenoiserLossNameList):
+        ax1.plot(x_vals, denoiserLossVals)
     ax1.set_title('model loss')
-    ax1.set_ylabel('generator loss')
+    ax1.set_ylabel('denoiser loss')
     ax1.set_xlabel('epoch')
     if useLogscaleList[0]:
         ax1.set_yscale('log')
@@ -292,8 +305,8 @@ def plotLoss(pGeneratorLossValueLists, pDiscLossValueLists, pGeneratorLossNameLi
         locVal = 1000
     ax1.xaxis.set_major_locator(MultipleLocator(locVal))
     ax1.grid(True, which="both")
-    if len(pGeneratorLossNameList) > 1:
-        ax1.legend(pGeneratorLossNameList, loc='upper right', title="Generator")
+    if len(pdenoiserLossNameList) > 1:
+        ax1.legend(pdenoiserLossNameList, loc='upper right', title="denoiser")
     if len(pDiscLossNameList) > 1:
         ax2.legend(pDiscLossNameList, loc="lower right", title="Discriminator")
     fig1.tight_layout()
@@ -785,7 +798,7 @@ def writeCooler(pMatrixList, pBinSizeInt, pOutfile, pChromosomeList, pChromSizeL
     #takes a matrix as numpy array or sparse matrix and writes a cooler matrix from it
     #modified from study project such that multiple chroms can be written to a single matrix
 
-    # def pixelGenerator(pMatrixList, pOffsetList):
+    # def pixeldenoiser(pMatrixList, pOffsetList):
     #     '''
     #     yields pixel dataframes per Matrix
     #     Parameters:
@@ -809,7 +822,7 @@ def writeCooler(pMatrixList, pBinSizeInt, pOutfile, pChromosomeList, pChromSizeL
     #         pixels_tmp.sort_values(by=['bin1_id','bin2_id'],inplace=True)
     #         yield pixels_tmp
 
-    # def pixelGenerator(pMatrixList, pOffsetList):
+    # def pixeldenoiser(pMatrixList, pOffsetList):
     #     '''
     #     Efficiently yields pixel dataframes per Matrix, only for nonzero entries.
     #     '''
@@ -848,9 +861,9 @@ def writeCooler(pMatrixList, pBinSizeInt, pOutfile, pChromosomeList, pChromSizeL
             raise ValueError(f"Unsupported matrix file format: {matrix_entry}")
         return matrix_entry
 
-    def pixelGenerator(pMatrixList, pOffsetList, sort_pixels=False, dtype=np.float32):
+    def pixeldenoiser(pMatrixList, pOffsetList, sort_pixels=False, dtype=np.float32):
         """
-        Memory-efficient generator that yields pixel DataFrames from sparse Hi-C matrices.
+        Memory-efficient denoiser that yields pixel DataFrames from sparse Hi-C matrices.
         Only upper-triangular nonzero entries are returned.
         
         Parameters
@@ -959,7 +972,7 @@ def writeCooler(pMatrixList, pBinSizeInt, pOutfile, pChromosomeList, pChromSizeL
     log.info(f"Writing cooler file to {pOutfile}")
 
     #write out the cooler
-    cooler.create_cooler(pOutfile, bins=bins, pixels=pixelGenerator(pMatrixList=pMatrixList, pOffsetList=offsetList), dtypes={'count': np.float64}, ordered=True, metadata=pMetadata)
+    cooler.create_cooler(pOutfile, bins=bins, pixels=pixeldenoiser(pMatrixList=pMatrixList, pOffsetList=offsetList), dtypes={'count': np.float64}, ordered=True, metadata=pMetadata)
 
 def distanceNormalize(pSparseCsrMatrix, pWindowSize_bins):
     #compute the means along the diagonals (= same distance)

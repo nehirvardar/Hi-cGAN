@@ -4,9 +4,10 @@ from tensorflow import dtypes as tfdtypes
 from scipy.sparse import save_npz, csr_matrix
 from tqdm import tqdm
 import concurrent.futures
-
+import scipy.sparse as sp
 from . import utils
 from . import records
+import cooler
 
 
 import logging
@@ -19,6 +20,7 @@ class DataContainer():
         self.matrixFilePath = matrixFilePath
         self.chromatinFolder = chromatinFolder
         self.FactorDataArray = None
+        self.RandomInputArray = None
         self.nr_factors = None
         self.sparseHiCMatrix = None
         self.sequenceArray = None
@@ -44,113 +46,101 @@ class DataContainer():
         self.data_loaded = False
 
     def __loadFactorData(self, ignoreChromLengths=False, scaleFeatures=False, clampFeatures=False):
-        #load chromatin factor data from bigwig files
         if self.chromatinFolder is None:
             return
-        #ensure that binSizes for matrix (if given) and factors match
-        if self.binSize is None:
-            msg = "No binSize given; use a Hi-C matrix or explicitly specify binSize for the container"   
-            raise TypeError(msg)
-        ###load data for a specific chromsome
-        #get the names of the bigwigfiles
-        bigwigFileList = utils.getBigwigFileList(self.chromatinFolder)
-        bigwigFileList = sorted(bigwigFileList)
-        if len(bigwigFileList) is None:
-            msg = "Warning: folder {:s} does not contain any bigwig files"
-            msg = msg.format(self.chromatinFolder)
-            print(msg)
+
+        import glob
+        import os
+        import zlib
+        import numpy as np
+        import scipy.sparse as sp
+
+        c_clean = str(self.chromosome).replace("chr", "")
+        candidates = [
+            os.path.join(self.chromatinFolder, f"chr{c_clean}.npz"),
+            os.path.join(self.chromatinFolder, f"{c_clean}.npz"),
+        ]
+        npz_files = [f for f in candidates if os.path.exists(f)]
+        if len(npz_files) == 0:
+            search_pattern = os.path.join(self.chromatinFolder, f"*{self.chromosome}.npz")
+            npz_files = glob.glob(search_pattern)
+
+        if len(npz_files) == 0:
+            print(f"In {self.chromatinFolder} no .npz file for {self.chromosome} ")
             return
-        #check the chromosome name prefixes (e.g. "" or "chr") and sizes
-        chromSizeList = []
-        prefixDict_factors = dict()
-        for bigwigFile in bigwigFileList:
-            try:
-                prefixDict_factors[bigwigFile] = utils.getChromPrefixBigwig(bigwigFile)
-                chromname = prefixDict_factors[bigwigFile] + self.chromosome
-                chromSizeList.append( utils.getChromSizesFromBigwig(bigwigFile)[chromname] )
-            except Exception as e:
-                msg = str(e) + "\n"
-                msg += "Could not load data from bigwigfile {}".format(bigwigFile) 
-                raise IOError(msg)
-        #the chromosome lengths should be equal in all bigwig files
-        if len(set(chromSizeList)) != 1 and not ignoreChromLengths:
-            msg = "Invalid data. Chromosome lengths differ in bigwig files:"
-            for i, filename in enumerate(bigwigFileList):
-                msg += "{:s}: {:d}\n".format(filename, chromSizeList[i])
-            raise IOError(msg)
-        elif len(set(chromSizeList)) != 1 and ignoreChromLengths:
-            chromSize_factors = min(chromSizeList)
-        else:
-            chromSize_factors = chromSizeList[0]
-        #the chromosome lengths of matrices and bigwig files must be equal
-        if self.chromSize_matrix is not None \
-                and self.chromSize_matrix != chromSize_factors:
-            msg = "Chrom lengths not equal between matrix and bigwig files\n"
-            msg += "Matrix: {:d} -- Factors: {:d}".format(self.chromSize_matrix, chromSize_factors)
-            raise IOError(msg)
-        #load the data into memory now
-        self.factorNames = [os.path.splitext(os.path.basename(name))[0] for name in bigwigFileList]
-        self.nr_factors = len(self.factorNames)
-        self.prefixDict_factors = prefixDict_factors
-        self.chromSize_factors = chromSize_factors
-        nr_bins = int( np.ceil(self.chromSize_factors / self.binSize) )
-        self.FactorDataArray = np.empty(shape=(len(bigwigFileList),nr_bins))
-        msg = "Loaded {:d} chromatin features from folder {:s}\n"
-        msg = msg.format(self.nr_factors, self.chromatinFolder)
-        featLoadedMsgList = [] #pretty printing for features loaded
 
-        def process_bigwig_file(bigwigFile):
-            chromname = self.prefixDict_factors[bigwigFile] + self.chromosome
-            tmpArray = utils.binChromatinFactor(pBigwigFileName=bigwigFile,
-                                                pBinSizeInt=self.binSize,
-                                                pChromStr=chromname,
-                                                pChromSize=self.chromSize_factors)
-            if clampFeatures:
-                tmpArray = utils.clampArray(tmpArray)
+        npz_file = npz_files[0]
+
+        try:
+            # Load sparse RNA interaction matrix at original 250kb resolution (no 250kb -> 25kb upscaling)
+            sparse_mat = sp.load_npz(npz_file)
+            factor_matrix = sparse_mat.toarray().astype(np.float32)  # (N_rna, N_rna) 2D dense
+
             if scaleFeatures:
-                tmpArray = utils.scaleArray(tmpArray)
-            return tmpArray
+                m_max = factor_matrix.max()
+                if m_max > 0:
+                    factor_matrix /= m_max
 
-        #The row a track is written to is its position in the sorted file list,
-        #not the order in which its thread happened to finish. as_completed()
-        #yields in completion order, so enumerating it and using that index put
-        #each track in whichever row it won the race for: with two or more
-        #bigwig files the channel order of FactorDataArray varied from run to
-        #run, and within a run from chromosome to chromosome, while
-        #self.factorNames stayed sorted. The log line named the wrong file for
-        #the same reason.
-        results = [None] * len(bigwigFileList)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futureToIndex = {executor.submit(process_bigwig_file, bigwigFile): i
-                             for i, bigwigFile in enumerate(bigwigFileList)}
-            for future in concurrent.futures.as_completed(futureToIndex):
-                results[futureToIndex[future]] = future.result()
-        for i, tmpArray in enumerate(results):
-            self.FactorDataArray[i] = tmpArray
-            nr_nonzero_abs = np.count_nonzero(tmpArray)
-            nr_nonzero_perc = nr_nonzero_abs / tmpArray.size * 100
-            msg2 = "{:s} - min. {:.3f} - max. {:.3f} - nnz. {:d} ({:.2f}%)"
-            msg2 = msg2.format(bigwigFileList[i], tmpArray.min(), tmpArray.max(), nr_nonzero_abs, nr_nonzero_perc)
-            featLoadedMsgList.append(msg2)
-        self.FactorDataArray = np.transpose(self.FactorDataArray)
-        print(msg + "\n".join(featLoadedMsgList))
-            
+            self.FactorDataArray = factor_matrix
+
+            # Create or load 1 fixed random matrix per chromosome so training and testing share the same matrix
+            parent_dir = os.path.dirname(os.path.normpath(self.chromatinFolder))
+            random_dir = os.path.join(parent_dir, "random_input")
+            os.makedirs(random_dir, exist_ok=True)
+            random_file = os.path.join(random_dir, f"chr{c_clean}.npy")
+
+            if os.path.exists(random_file):
+                rand_mat = np.load(random_file).astype(np.float32)
+                if rand_mat.shape != factor_matrix.shape:
+                    chrom_seed = zlib.crc32(f"chr{c_clean}".encode("utf-8"))
+                    rng = np.random.default_rng(chrom_seed)
+                    rand_mat = rng.normal(0.0, 1.0, size=factor_matrix.shape).astype(np.float32)
+                    np.save(random_file, rand_mat)
+            else:
+                chrom_seed = zlib.crc32(f"chr{c_clean}".encode("utf-8"))
+                rng = np.random.default_rng(chrom_seed)
+                rand_mat = rng.normal(0.0, 1.0, size=factor_matrix.shape).astype(np.float32)
+                np.save(random_file, rand_mat)
+
+            self.RandomInputArray = rand_mat
+
+            if self.binSize is None:
+                self.binSize = 250000  # Default 250kb resolution for RNA matrices
+
+            self.chromSize_factors = self.chromSize_matrix if self.chromSize_matrix else factor_matrix.shape[0] * self.binSize
+            self.nr_factors = 1
+            self.factorNames = [os.path.basename(npz_file)]
+
+            print(f"[{self.chromosome}] RNA GT matrix {self.FactorDataArray.shape} and fixed random matrix loaded ({random_file})")
+
+        except Exception as e:
+            raise IOError(f"Error while loading RNA data: {e}")
+
+
     def __loadMatrixData(self, scaleMatrix=False):
-        #load Hi-C matrix from cooler file
         if self.matrixFilePath is None:
             return
         try:
-            prefixDict_matrix = {self.matrixFilePath: utils.getChromPrefixCooler(self.matrixFilePath)}
-            chromname = prefixDict_matrix[self.matrixFilePath] + self.chromosome
-            chromsize_matrix = utils.getChromSizesFromCooler(self.matrixFilePath)[chromname]
-            sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname)
-        except:
-            msg = "Error: Could not load data from Hi-C matrix {:s}"
-            msg = msg.format(self.matrixFilePath)
+            chromsizes = utils.getChromSizesFromCooler(self.matrixFilePath)
+            actual_chrom = "chr" + self.chromosome if ("chr" + self.chromosome) in chromsizes else self.chromosome
+            if actual_chrom not in chromsizes:
+                actual_chrom = self.chromosome.replace("chr", "")
+
+            chromsize_matrix = chromsizes[actual_chrom]
+
+            c = cooler.Cooler(self.matrixFilePath)
+            binSize = c.binsize
+            sparseHiCMatrix = c.matrix(balance=False, sparse=True).fetch(actual_chrom).tocsr()
+
+        except Exception as e:
+            msg = f"Error: Could not load data from Hi-C matrix {self.matrixFilePath} Error details: {e}"
             raise IOError(msg)
+
+
         #scale to 0..1, if requested
         if scaleMatrix:
-            sparseHiCMatrix = utils.scaleArray(sparseHiCMatrix)       
+            sparseHiCMatrix = utils.scaleArray(sparseHiCMatrix)
+
         #ensure that chrom sizes for matrix and factors are the same
         if self.chromSize_factors is not None and self.chromSize_factors != chromsize_matrix:
             msg = "Chromsize of matrix does not match bigwig files\n"
@@ -158,7 +148,8 @@ class DataContainer():
             msg = msg.format(chromsize_matrix, self.chromSize_factors)
             raise IOError(msg)
         self.chromSize_matrix = chromsize_matrix
-        #ensure that binSizes for matrix and factors (if given) match
+
+        #ensure that binSizes for matrix and factors match
         if self.binSize is None or self.binSize == binSize:
             self.binSize = binSize
             self.sparseHiCMatrix = sparseHiCMatrix
@@ -175,6 +166,7 @@ class DataContainer():
     def __unloadFactorData(self):
         #unload chromatin factor data to save memory, but do not touch metadata 
         self.FactorDataArray = None
+        self.RandomInputArray = None
         
     def __unloadMatrixData(self):
         #unload matrix data to save memory, but do not touch metadata
@@ -199,10 +191,11 @@ class DataContainer():
             raise TypeError(msg)
         if isinstance(maximumDistance, int):
             maximumDistance = np.clip(maximumDistance, a_min=1, a_max=self.windowSize)
-        self.__loadMatrixData(scaleMatrix=scaleTargets)
+
+        # Load RNA matrix data directly (used as Ground Truth, no .cool Hi-C matrix needed)
         self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
         self.windowSize = windowSize
-        self.flankingSize = flankingSize
+        self.flankingSize = flankingSize if flankingSize is not None else 0
         self.maximumDistance = maximumDistance
         self.minTargetCoverage = float(minTargetCoverage)
         self.excludedRegions = excludedRegions
@@ -282,9 +275,9 @@ class DataContainer():
         target_ct = int( np.floor(nr_samples/nr_files) )
         samples_per_file = [target_ct]*(nr_files-1) + [nr_samples-(nr_files-1)*target_ct]
         sample_indices = [sum(samples_per_file[0:i]) for i in range(len(samples_per_file)+1)] 
-        #write the single files
-        folderName = self.chromatinFolder.strip("/").replace("/","_")
-        recordfiles = [os.path.join(pOutputFolder, "{:s}_{:s}_{:03d}.tfrecord".format(folderName, str(self.chromosome), i + 1)) for i in range(nr_files)]
+        # Write single TFRecord files using a clean folder basename prefix
+        folderName = os.path.basename(os.path.normpath(self.chromatinFolder))
+        recordfiles = [os.path.join(pOutputFolder, "data_{:s}_{:s}_{:03d}.tfrecord".format(folderName, str(self.chromosome), i + 1)) for i in range(nr_files)]
 
         def storeTFRecord(recordfile, firstIndex, lastIndex, outfolder):
             log.debug("Prepare dict...")
@@ -330,16 +323,17 @@ class DataContainer():
 
     def getBinCoverage(self):
         '''
-        Boolean array, one entry per bin of the Hi-C matrix, True where the bin
-        has at least one contact. Bins inside a gap of the matrix (unmappable
-        regions, or the windows a published dataset simply does not cover, such
-        as Akita's target folds) have an all-zero row and come out False.
-        Returns None if no matrix is loaded.
+        Boolean array, one entry per bin of the target matrix, True where the bin
+        has at least one contact. Bins inside a gap of the matrix have an all-zero
+        row and come out False. Returns None if no matrix is loaded.
         '''
-        if self.sparseHiCMatrix is None:
-            return None
-        rowNnz = np.asarray((self.sparseHiCMatrix != 0).sum(axis=1)).ravel()
-        return rowNnz > 0
+        if self.sparseHiCMatrix is not None:
+            rowNnz = np.asarray((self.sparseHiCMatrix != 0).sum(axis=1)).ravel()
+            return rowNnz > 0
+        if self.FactorDataArray is not None:
+            rowNnz = np.asarray((self.FactorDataArray != 0).sum(axis=1)).ravel()
+            return rowNnz > 0
+        return None
 
     def __binsFromBed(self, pPathList, pLabel):
         '''
@@ -469,8 +463,8 @@ class DataContainer():
         excluded = self.getExcludedBins()
         included = self.getIncludedBins()
         useCoverage = self.minTargetCoverage > 0.0
-        if useCoverage and self.sparseHiCMatrix is None:
-            msg = "minTargetCoverage is set but no Hi-C matrix is loaded; coverage filter ignored"
+        if useCoverage and self.sparseHiCMatrix is None and self.FactorDataArray is None:
+            msg = "minTargetCoverage is set but no target matrix is loaded; coverage filter ignored"
             log.warning(msg)
             useCoverage = False
         if not useCoverage and excluded is None and included is None:
@@ -478,7 +472,7 @@ class DataContainer():
         nr_samples = self.__getNumberRawSamples()
         if not nr_samples:
             return
-        flankingSize = self.flankingSize if self.flankingSize is not None else self.windowSize
+        flankingSize = self.flankingSize if self.flankingSize is not None else 0
         nr_bins = self.__getNumberBins()
         startInd = np.arange(nr_samples) + flankingSize
         #windows running past the end of the matrix (the factor array can be
@@ -599,7 +593,7 @@ class DataContainer():
         trainmatrix = self.sparseHiCMatrix[startInd:stopInd,startInd:stopInd].todense()
         trainmatrix = np.array(np.nan_to_num(trainmatrix))
         if self.targetValueRange is not None:
-            #Map the target onto [0, 1], the range the generator's sigmoid can
+            #Map the target onto [0, 1], the range the denoiser's sigmoid can
             #actually produce. The bounds come from the data (see
             #utils.observedValueRange), not from a constant, and the SAME bounds
             #are used for every chromosome and inverted at prediction time.
@@ -614,35 +608,57 @@ class DataContainer():
             trainmatrix = utils.toUnitRange(trainmatrix, lo, hi)
         trainmatrix = np.expand_dims(trainmatrix, axis=-1) #make Hi-C (sub-)matrix an RGB image
         return trainmatrix
-    
+
     def __getFactorData(self, idx):
-        if self.chromatinFolder is None:
+        if self.chromatinFolder is None or self.FactorDataArray is None:
             return None
         if not self.data_loaded:
             msg = "Error: Load data first"
             raise RuntimeError(msg)
-        #the 0-th feature matrix starts at position 0
+
         windowSize = self.windowSize
         flankingSize = self.flankingSize
         if flankingSize is None:
-            flankingSize = windowSize
-            self.flankingSize = windowSize
-        startIdx = idx
-        endIdx = startIdx + 2*flankingSize + windowSize
-        factorArray = self.FactorDataArray[startIdx:endIdx]
+            flankingSize = 0
+            self.flankingSize = 0
+
+        startInd = idx + flankingSize
+        stopInd = startInd + windowSize
+
+        factorArray = self.FactorDataArray[startInd:stopInd, startInd:stopInd]
+        factorArray = np.nan_to_num(factorArray)
+
+        if self.targetValueRange is not None:
+            lo, hi = self.targetValueRange
+            factorArray = utils.toUnitRange(factorArray, lo, hi)
+
         factorArray = np.expand_dims(factorArray, axis=-1)
         return factorArray
+
+    def __getRandomInputData(self, idx):
+        if self.RandomInputArray is None:
+            return None
+        windowSize = self.windowSize
+        flankingSize = self.flankingSize if self.flankingSize is not None else 0
+        startInd = idx + flankingSize
+        stopInd = startInd + windowSize
+
+        # Slice the 2D window from the chromosome's fixed random matrix
+        randomWindow = self.RandomInputArray[startInd:stopInd, startInd:stopInd]
+        randomWindow = np.expand_dims(randomWindow, axis=-1)
+        return randomWindow
 
     def getSampleData(self, idx):
         if not self.data_loaded:
             return None
         idx = self.mapSampleIndex(idx)
-        factorArray = self.__getFactorData(idx)
-        matrixArray = self.__getMatrixData(idx)
-        if matrixArray is not None:
-            matrixArray = matrixArray.astype("float32")
-        return {"factorData": factorArray.astype("float32"), 
-                "out_matrixData": matrixArray}
+        rna_gt_matrix = self.__getFactorData(idx).astype("float32")
+        random_input = self.__getRandomInputData(idx).astype("float32")
+
+        return {
+            "factorData": random_input,      # Window sliced from the chromosome's single random matrix
+            "out_matrixData": rna_gt_matrix  # Window sliced from the chromosome's Ground Truth RNA matrix
+        }
         
     def plotFeatureAtIndex(self, idx, outpath, figuretype="png"):
         if not self.data_loaded:

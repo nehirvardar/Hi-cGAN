@@ -2,18 +2,19 @@ import csv
 import os
 import numpy as np
 import tensorflow as tf
+import keras
 import concurrent.futures
 import argparse
 from datetime import datetime
 import cooler
 import h5py
 
-from .lib import hicGAN
-from .lib import dataContainer
-from .lib import records
-from .lib import utils
+from lib import hicGAN
+from lib import dataContainer
+from lib import records
+from lib import utils
 
-from hicgan._version import __version__
+__version__ = "1.0.0"
 
 import logging
 import pickle
@@ -22,22 +23,22 @@ log = logging.getLogger(__name__)
 
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trainingMatrices", "-tm", required=True,
+    parser.add_argument("--trainingMatrices", "-tm", required=False,
                         type=str, nargs='+',
                         help="mcooler matrices for training.")
-    parser.add_argument("--trainingChromosomes", "-tchroms", required=True,
+    parser.add_argument("--trainingChromosomes", "-tchroms", required=False,
                         type=str, nargs='+',
                         help="Train chromosomes. Must be present in all train matrices.")
-    parser.add_argument("--trainingChromatinFolders", "-tcp", required=True,
+    parser.add_argument("--trainingChromatinFolders", "-tcp", required=False,
                         type=str, nargs='+',
                         help="Path where chromatin factors for training reside (bigwig files).")
-    parser.add_argument("--validationMatrices", "-vm", required=True,
+    parser.add_argument("--validationMatrices", "-vm", required=False,
                         type=str, nargs='+',
                         help="Cooler matrices for validation.")
-    parser.add_argument("--validationChromosomes", "-vchroms", required=True,
+    parser.add_argument("--validationChromosomes", "-vchroms", required=False,
                         type=str, nargs='+',
                         help="Validation chromosomes. Must be present in all validation matrices.")
-    parser.add_argument("--validationChromatinFolders", "-vcp", required=True,
+    parser.add_argument("--validationChromatinFolders", "-vcp", required=False,
                         type=str, nargs='+',
                         help="Path where chromatin factors for validation reside (bigwig files).")
     parser.add_argument("--windowSize", "-ws", required=True,
@@ -55,31 +56,23 @@ def parse_arguments(args=None):
     parser.add_argument("--lossWeightPixel", "-lwp", required=False,
                         type=float,
                         default=100.0,
-                        help="Loss weight for L1/L2 error of generator.")
-    parser.add_argument("--lossWeightDiscriminator", "-lwd", required=False,
-                        type=float,
-                        default=0.5,
-                        help="Loss weight (multiplicator) for the discriminator loss.")
+                        help="Loss weight for L1/L2 error of denoiser.")
     parser.add_argument("--lossTypePixel", "-ltp", required=False,
                         type=str, choices=["L1", "L2"],
                         default="L1",
-                        help="Type of per-pixel loss to use for the generator.")
+                        help="Type of per-pixel loss to use for the denoiser.")
     parser.add_argument("--lossWeightTV", "-lwt", required=False,
                         type=float,
                         default=1e-10,
-                        help="Loss weight for Total-Variation-loss of generator.")
-    parser.add_argument("--lossWeightAdversarial", "-lwa", required=False,
-                        type=float,
-                        default=1.0,
-                        help="Loss weight for adversarial loss in generator.")
-    parser.add_argument("--learningRateGenerator", "-lrg", required=False,
+                        help="Loss weight for Total-Variation-loss of denoiser.")
+    parser.add_argument("--learningRatedenoiser", "-lrg", required=False,
                         type=float,
                         default=2e-5,
-                        help="Learning rate for Adam optimizer of generator.")
-    parser.add_argument("--learningRateDiscriminator", "-lrd", required=False,
-                        type=float,
-                        default=1e-6,
-                        help="Learning rate for Adam optimizer of discriminator.")
+                        help="Learning rate for Adam optimizer of denoiser.")
+    parser.add_argument("--timesteps", "-T", required=False,
+                        type=int, default=1000,
+                        help="Total noise step for diffusion model.")
+
     parser.add_argument("--beta1", "-b1", required=False,
                         type=float,
                         default=0.5,
@@ -97,7 +90,7 @@ def parse_arguments(args=None):
                              "range to target_value_range.json in the output folder so "
                              "hicPredict can invert it. Use this whenever the target can be "
                              "negative -- an Akita-style log observed/expected target is "
-                             "about half negative, and the generator ends in a sigmoid, so "
+                             "about half negative, and the denoiser ends in a sigmoid, so "
                              "without this the model is asked for values it cannot emit and "
                              "the discriminator can tell real from generated by sign alone.")
     parser.add_argument("--targetValueRange", "-tvr", required=False, type=str,
@@ -191,9 +184,9 @@ def parse_arguments(args=None):
     parser.add_argument("--seed", "-sd", required=False,
                         type=int, default=None,
                         help="Seed for Python, NumPy and TensorFlow random number "
-                             "generators. Set it to make a run repeatable, or to "
+                             "denoisers. Set it to make a run repeatable, or to "
                              "obtain independent runs of the same configuration "
-                             "by varying it. Unset leaves the generators "
+                             "by varying it. Unset leaves the denoisers "
                              "unseeded, which is the previous behaviour.")
     parser.add_argument("--keepTFRecords", "-k", required=False,
                         action='store_true',
@@ -201,7 +194,10 @@ def parse_arguments(args=None):
                         help="Do not delete TFRecord files after training.")
     parser.add_argument('--version', action='version',
                            version='%(prog)s {}'.format(__version__))
-
+    parser.add_argument("--dataDir", "-d", required=False, type=str,
+                        help="data directory (inputs)")
+    parser.add_argument("--splitFile", "-sf", required=False, type=str,
+                        help="split file shows train/val/test splits of data")
     return parser
 def create_container(chrom, matrix, chromatinpath):
         container = dataContainer.DataContainer(chromosome=chrom,
@@ -209,11 +205,11 @@ def create_container(chrom, matrix, chromatinpath):
                                                 chromatinFolder=chromatinpath)
         return container
 
-def create_data(pTrainingMatrices, 
-                pTrainingChromosomes, 
-                ptrainingChromatinFolders, 
-                pValidationMatrices, 
-                pValidationChromosomes, 
+def create_data(pTrainingMatrices,
+                pTrainingChromosomes,
+                ptrainingChromatinFolders,
+                pValidationMatrices,
+                pValidationChromosomes,
                 pvalidationChromatinFolders,
                 pWindowSize,
                 pOutputFolder,
@@ -237,14 +233,11 @@ def create_data(pTrainingMatrices,
     #ensure each chrom name is used only once, but allow the same chrom for train and validation
     #sort the lists and write to param dict
     # trainChromNameList = trainingChromosomes.replace(",","")
-    # trainChromNameList = trainChromNameList.rstrip().split(" ")  
+    # trainChromNameList = trainChromNameList.rstrip().split(" ")
     trainChromNameList = [x.lstrip("chr") for x in pTrainingChromosomes]
-    trainChromNameList = sorted(list(set(trainChromNameList)))
     paramDict["trainChromNameList"] = trainChromNameList
-    # valChromNameList = validationChromosomes.replace(",","")
-    # valChromNameList = valChromNameList.rstrip().split(" ")
+
     valChromNameList = [x.lstrip("chr") for x in pValidationChromosomes]
-    valChromNameList = sorted(list(set(valChromNameList)))
     paramDict["valChromNameList"] = valChromNameList
 
     #ensure there are as many matrices as chromatin paths
@@ -263,19 +256,16 @@ def create_data(pTrainingMatrices,
     traindataContainerList = []
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        for chrom in trainChromNameList:
-            for matrix, chromatinpath in zip(pTrainingMatrices, ptrainingChromatinFolders):
-                future = executor.submit(create_container, chrom, matrix, chromatinpath)
-                traindataContainerList.append(future.result())
-
+        for chrom, matrix, chromatinpath in zip(trainChromNameList, pTrainingMatrices, ptrainingChromatinFolders):
+            future = executor.submit(create_container, chrom, matrix, chromatinpath)
+            traindataContainerList.append(future.result())
     #prepare the validation data containers. No data is loaded yet.
     valdataContainerList = []
 
     with concurrent.futures.ProcessPoolExecutor() as executor:
-        for chrom in valChromNameList:
-            for matrix, chromatinpath in zip(pValidationMatrices, pvalidationChromatinFolders):
-                future = executor.submit(create_container, chrom, matrix, chromatinpath)
-                valdataContainerList.append(future.result())
+        for chrom, matrix, chromatinpath in zip(valChromNameList, pValidationMatrices, pvalidationChromatinFolders):
+            future = executor.submit(create_container, chrom, matrix, chromatinpath)
+            valdataContainerList.append(future.result())
 
     #Measure the target value range ONCE, over every training matrix and
     #chromosome, and reuse it everywhere. Per-chromosome ranges would map the
@@ -299,7 +289,8 @@ def create_data(pTrainingMatrices,
                 #the dense window instead. Asking for both would crash.
                 "scaleTargets": False if pScaleTargetToUnitRange else noScaleNorm,
                 "windowSize": pWindowSize,
-                "flankingSize": pWindowSize,
+                # Set flankingSize to 0 since 2D RNA matrices at 250kb resolution do not require 1D flanking context
+                "flankingSize": 0,
                 "maximumDistance": None,
                 "minTargetCoverage": pMinTargetCoverage,
                 "excludedRegions": pExcludeRegions,
@@ -357,7 +348,7 @@ def create_data(pTrainingMatrices,
     #data is no longer needed
     for container in traindataContainerList + valdataContainerList:
         container.unloadData()
-    
+
     print(tfRecordFilenames)
     print(len(tfRecordFilenames))
     print(len(usedTrainContainerList))
@@ -375,17 +366,15 @@ def training(pTfRecordFilenames,
              pOutputFolder,
              pEpochs,
              pLossWeightPixel,
-             pLossWeightDiscriminator,
-             pLossWeightAdversarial,
              pLossTypePixel,
              pLossWeightTV,
-             pLearningRateGenerator,
-             pLearningRateDiscriminator,
+             pLearningRatedenoiser,
              pBeta1,
+             pTimesteps,
              pFigureFileFormat,
              pPlotFrequency,
              pFlipSamples,
-             pScope,
+             strategy,
              pBatchSize,
              pRecordSize,
              pStoredFeaturesDict,
@@ -429,7 +418,7 @@ def training(pTfRecordFilenames,
         trainDs = trainDs.map(lambda x: records.parse_function(x, pStoredFeaturesDict), num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
         #Map an untransformed target onto [0, 1] here rather than at write time.
-        #The generator ends in a sigmoid and cannot emit a negative number, while
+        #The denoiser ends in a sigmoid and cannot emit a negative number, while
         #an Akita-style target is about half negative; records written with
         #--noScaleNorm hold the raw values, so one affine step at read time makes
         #them usable without rewriting hundreds of GB.
@@ -465,31 +454,28 @@ def training(pTfRecordFilenames,
         if pFlipSamples:
             steps_per_epoch *= 2
 
-        hicGanModel = hicGAN.HiCGAN(log_dir=pOutputFolder, 
-                                        number_factors=pNumberOfFactors,
-                                        loss_weight_pixel=pLossWeightPixel,
-                                        loss_weight_adversarial=pLossWeightAdversarial,
-                                        loss_weight_discriminator=pLossWeightDiscriminator, 
-                                        loss_type_pixel=pLossTypePixel, 
-                                        loss_weight_tv=pLossWeightTV, 
-                                        input_size=pWindowSize,
-                                        learning_rate_generator=pLearningRateGenerator,
-                                        learning_rate_discriminator=pLearningRateDiscriminator,
-                                        adam_beta_1=pBeta1,
-                                        plot_type=pFigureFileFormat,
-                                        plot_frequency=pPlotFrequency,
-                                        scope=pScope,
-                                        mixed_precision=pMixedPrecision,
-                                        restore_checkpoint=pResume)
-        
-        hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
+        diffusionModel = hicGAN.HiCGAN(
+                log_dir=pOutputFolder,
+                number_factors=pNumberOfFactors,
+                input_size=pWindowSize,
+                learning_rate=pLearningRatedenoiser,
+                timesteps=pTimesteps,
+                adam_beta_1=pBeta1,
+                plot_type=pFigureFileFormat,
+                plot_frequency=pPlotFrequency,
+                scope=strategy,
+                mixed_precision=pMixedPrecision,
+                restore_checkpoint=pResume)
+
+        diffusionModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
         log.info("Starting training at %s" % datetime.now())
-        hicGanModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
-                        steps_per_epoch=steps_per_epoch,
-                        validation_steps=pValidationSteps)
+        # fit function
+        diffusionModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
+                               steps_per_epoch=steps_per_epoch,
+                               validation_steps=pValidationSteps)
         log.info("Training finished at %s" % datetime.now())
-
+            
 
 def delete_model_files(pTFRecordFiles):
     log.info("Cleaning up temporary files...")
@@ -503,7 +489,38 @@ def delete_model_files(pTFRecordFiles):
 def main(args=None):
     args = parse_arguments().parse_args(args)
 
-    #seed every generator that can affect a run: weight initialisation, the
+    #read data from split.txt
+    if args.splitFile and args.dataDir:
+        train_chroms = []
+        val_chroms = []
+
+        with open(args.splitFile, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    chrom, split = parts[0], parts[1].lower()
+                    if split == 'train':
+                        train_chroms.append(chrom)
+                    elif split == 'val':
+                        val_chroms.append(chrom)
+
+        args.trainingChromosomes = train_chroms
+        args.validationChromosomes = val_chroms
+
+        # Resolve RNA ground truth folder (supports 'rna_gt' or 'rna' inside dataDir)
+        rna_subdir = "rna_gt" if os.path.isdir(os.path.join(args.dataDir, "rna_gt")) else "rna"
+        rna_dir = os.path.join(args.dataDir, rna_subdir)
+
+        args.trainingMatrices = [os.path.join(rna_dir, f"{c}.npz") for c in train_chroms]
+        args.validationMatrices = [os.path.join(rna_dir, f"{c}.npz") for c in val_chroms]
+
+        args.trainingChromatinFolders = [rna_dir] * len(train_chroms)
+        args.validationChromatinFolders = [rna_dir] * len(val_chroms)
+
+        print(f"{len(train_chroms)} Train, {len(val_chroms)} Validation chromosomes (from {rna_dir})")
+    # =================================================================
+
+    #seed every denoiser that can affect a run: weight initialisation, the
     #shuffle buffer and dropout all draw from these
     if args.seed is not None:
         import random
@@ -549,15 +566,19 @@ def main(args=None):
         print("Exiting. Flags --createDataOnly and --trainOnly are mutually exclusive; choose only one or neither.")
         return
 
-    for matrix in args.trainingMatrices + args.validationMatrices:
-        if not os.path.exists(matrix):
-            msg = "Exiting. Matrix file not found: {:s}".format(matrix)
-            print(msg)
-            return
-        if not matrix.endswith(".cool"):
-            msg = "Exiting. Only .cool matrices are supported: {:s}".format(matrix)
-            print(msg)
-            return
+    # Validate matrix files (.npz RNA matrices or .cool matrices)
+    if args.trainingMatrices and args.validationMatrices:
+        for matrix in args.trainingMatrices + args.validationMatrices:
+            if matrix is None:
+                continue
+            if not os.path.exists(matrix):
+                msg = "Exiting. Matrix file not found: {:s}".format(matrix)
+                print(msg)
+                return
+            if not (matrix.endswith(".npz") or matrix.endswith(".cool")):
+                msg = "Exiting. Only .npz or .cool matrices are supported: {:s}".format(matrix)
+                print(msg)
+                return
     
     # gpu = tf.config.list_physical_devices('GPU')
     # # if gpu:
@@ -580,47 +601,30 @@ def main(args=None):
     #             raise ValueError("Invalid GPU index: {}".format(args.whichGPU - 1))
     #         # strategy = tf.distribute.OneDeviceStrategy(device=gpu[args.whichGPU].name)
     #         strategy = tf.distribute.OneDeviceStrategy(device=f"/GPU:{args.whichGPU-1}")
+
     if (args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
         physical_gpus = tf.config.list_physical_devices('GPU')
 
         try:
-            if args.multiGPUTraining:
-                # --- MULTI GPU SETUP ---
-                # Ensure all physical GPUs are visible
+            if len(physical_gpus) == 0:
+                print("No GPU found, switching CPU", flush=True)
+                strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
+            elif args.multiGPUTraining:
                 tf.config.set_visible_devices(physical_gpus, 'GPU')
-                
-                # Enable memory growth for all
                 for gpu_device in physical_gpus:
                     tf.config.experimental.set_memory_growth(gpu_device, True)
-                    
                 strategy = tf.distribute.MirroredStrategy()
-                log.info(f"Using MirroredStrategy on {len(physical_gpus)} GPUs")
-
             else:
-                # --- SINGLE GPU SETUP ---
-                log.info("Using single GPU training")
-                
-                # Validation
                 target_index = args.whichGPU - 1
                 if target_index < 0 or target_index >= len(physical_gpus):
-                    raise ValueError(f"Invalid GPU index: {target_index}. Available: {len(physical_gpus)}")
-
-                # 1. HIDE other GPUs. Only make the selected structure visible to TF.
+                    target_index = 0
                 tf.config.set_visible_devices(physical_gpus[target_index], 'GPU')
-                
-                # 2. Set memory growth only on the visible device
                 tf.config.experimental.set_memory_growth(physical_gpus[target_index], True)
-
-                log.info("Physically selected GPU: {}".format(physical_gpus[target_index].name))
-
-                # 3. Define Strategy
-                # Note: Because we hid the other GPUs, TF sees this as the ONLY device.
-                # It is therefore logically indexed as "/GPU:0" regardless of physical ID.
                 strategy = tf.distribute.OneDeviceStrategy(device="/GPU:0")
 
         except Exception as e:
-            print("Error during GPU setup: {}".format(e))
-            raise e
+            print(f"Error while using GPU, switching CPU {e}", flush=True)
+            strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
 
         if args.mixedPrecision:
             # Set before any model layers are constructed so they adopt float16.
@@ -687,17 +691,14 @@ def main(args=None):
                 pOutputFolder=args.outputFolder,
                 pEpochs=args.epochs,
                 pLossWeightPixel=args.lossWeightPixel,
-                pLossWeightDiscriminator=args.lossWeightDiscriminator,
-                pLossWeightAdversarial=args.lossWeightAdversarial,
                 pLossTypePixel=args.lossTypePixel,
                 pLossWeightTV=args.lossWeightTV,
-                pLearningRateGenerator=args.learningRateGenerator,
-                pLearningRateDiscriminator=args.learningRateDiscriminator,
+                pLearningRatedenoiser=args.learningRatedenoiser,
                 pBeta1=args.beta1,
                 pFigureFileFormat=args.figureFileFormat,
                 pPlotFrequency=args.plotFrequency,
                 pFlipSamples=args.flipSamples,
-                pScope=scope,
+                strategy=strategy,
                 pBatchSize=args.batchSize,
                 pRecordSize=args.recordSize,
                 pStoredFeaturesDict=storedFeatures,
@@ -706,7 +707,11 @@ def main(args=None):
                 pResume=args.resume,
                 pMixedPrecision=args.mixedPrecision,
                 pValidationSteps=args.validationSteps,
-                pTargetValueRange=resolvedTargetRange
+                pTargetValueRange=resolvedTargetRange,
+                pTimesteps = args.timesteps
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)
+
+if __name__ == "__main__":
+    main()

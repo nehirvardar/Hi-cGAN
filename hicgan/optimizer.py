@@ -143,10 +143,10 @@ def parse_arguments(args=None):
     parser.add_argument("--binSize", "-b", required=True,
                         type=int,
                         help="Bin size for binning the chromatin features")
-    parser.add_argument("--generatorName", "-gn", required=False,
+    parser.add_argument("--denoiserName", "-gn", required=False,
                         type=str,
-                        default="generator_00099.keras",
-                        help="Name of the generator model file.")
+                        default="denoiser_00099.keras",
+                        help="Name of the denoiser model file.")
     parser.add_argument("--numberSamples", "-ns", required=False,
                         type=int, default=1,
                         help="Number of samples for the optimizer.")
@@ -284,7 +284,7 @@ def objective(config, pArgs):
                 pLossWeightAdversarial=config["loss_weight_adversarial"],
                 pLossTypePixel=config["loss_type_pixel"],
                 pLossWeightTV=config["loss_weight_tv"],
-                pLearningRateGenerator=config["learning_rate_generator"],
+                pLearningRatedenoiser=config["learning_rate_denoiser"],
                 pLearningRateDiscriminator=config["learning_rate_discriminator"],
                 pBeta1=config["beta1"],
                 pFigureFileFormat="png",
@@ -305,7 +305,7 @@ def objective(config, pArgs):
                 pass  # For now, we're just creating an empty file.
         prediction(
             pTrainedModel=os.path.join(
-                pArgs.outputFolder, trial_id, pArgs.generatorName),
+                pArgs.outputFolder, trial_id, pArgs.denoiserName),
             pPredictionChromosomesFolders=pArgs.predictionChromosomesFolders,
             pPredictionChromosomes=pArgs.predictionChromosomes,
             pOutputFolder=os.path.join(pArgs.outputFolder, trial_id),
@@ -604,7 +604,7 @@ def run_raytune(pArgs, pContinueExperiment=None):
         "loss_type_pixel": tune.choice(["L1", "L2"]),
         "loss_weight_tv": tune.uniform(1e-15, 1e-7),
         "loss_weight_adversarial": tune.uniform(0.5, 1.5),
-        "learning_rate_generator": tune.uniform(2e-15, 2e-3),
+        "learning_rate_denoiser": tune.uniform(2e-15, 2e-3),
         "learning_rate_discriminator": tune.uniform(1e-13, 1e-3),
         "beta1": tune.uniform(0.0, 1.0),
         "flip_samples": tune.choice(["--flipSamples", ""]),
@@ -619,7 +619,7 @@ def run_raytune(pArgs, pContinueExperiment=None):
             "loss_type_pixel": "L1",
             "loss_weight_tv": 8.080735989100953e-08,
             "loss_weight_adversarial": 0.9248942024710739,
-            "learning_rate_generator": 0.0006947782705665501,
+            "learning_rate_denoiser": 0.0006947782705665501,
             "learning_rate_discriminator": 0.0005652269944795734,
             "beta1": 0.40871128817217095,
             "flip_samples": "",

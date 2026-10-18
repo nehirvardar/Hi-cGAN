@@ -1,6 +1,7 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Conv2D, Conv1D, BatchNormalization, LeakyReLU, Conv2DTranspose, Dropout, ReLU, Flatten, Dense
-from tensorflow.keras.layers import GroupNormalization
+import keras
+from keras.layers import Conv2D, Conv1D, BatchNormalization, LeakyReLU, Conv2DTranspose, Dropout, ReLU, Flatten, Dense
+from keras.layers import GroupNormalization
 import numpy as np
 import os
 import matplotlib
@@ -14,164 +15,126 @@ import re
 #modified from tensorflow tutorial https://www.tensorflow.org/tutorials/generative/pix
 #also see: https://machinelearningmastery.com/how-to-implement-pix2pix-gan-models-from-scratch-with-keras/
 
+@keras.saving.register_keras_serializable(package="HiCGAN")
+class SpatialTimeEncoding(keras.layers.Layer):
+    def __init__(self, timesteps=1000, **kwargs):
+        super().__init__(**kwargs)
+        self.timesteps = float(timesteps)
+
+    def call(self, inputs):
+        dna, t = inputs
+        t_scaled = t / self.timesteps
+        t_expanded = tf.reshape(t_scaled, [-1, 1, 1, 1])
+        return tf.broadcast_to(t_expanded, tf.shape(dna))
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"timesteps": self.timesteps})
+        return config
+
 
 class HiCGAN():
-    def __init__(self, log_dir: str, 
-                    number_factors: int,
-                    loss_weight_pixel: float = 100, #factor for L1/L2 loss, like Isola et al. 2017
-                    loss_weight_adversarial: float = 1.0, #factor for adversarial loss in generator
-                    loss_weight_discriminator: float = 0.5, #factor for disc loss, like Isola et al. 2017
-                    loss_weight_tv: float = 1e-10, #factor for TV loss
-                    loss_type_pixel: str = "L1", #type of per-pixel error (L1, L2)
-                    input_size: int = 256,
-                    plot_frequency: int = 20,
-                    plot_type: str = "png",
-                    learning_rate_generator: float = 2e-5,
-                    learning_rate_discriminator: float = 1e-6,
-                    adam_beta_1: float = 0.5,
-                    pretrained_model_path: str = "",
-                    scope=None,
-                    mixed_precision: bool = False,
-                    restore_checkpoint: bool = False):
-        super().__init__()
-        # When True, optimizers are wrapped for loss scaling and the loss
-        # functions cast their inputs to float32. The global mixed_float16
-        # policy itself is set by the caller (training.main) before this model
-        # is constructed so that all layers pick it up.
-        self.mixed_precision = mixed_precision
+    def __init__(self, log_dir: str,
+                     number_factors: int,
+                     timesteps: int = 1000,  # Diffusion step count
+                     loss_weight_pixel: float = 1.0,
+                     input_size: int = 256,
+                     plot_frequency: int = 20,
+                     plot_type: str = "png",
+                     learning_rate: float = 2e-5,
+                     adam_beta_1: float = 0.5,
+                     pretrained_model_path: str = "",
+                     scope=None,
+                     mixed_precision: bool = False,
+                     restore_checkpoint: bool = False):
+            super().__init__()
 
-        self.OUTPUT_CHANNELS = 1
-        self.INPUT_CHANNELS = 1
-        self.input_size = 256
-        if input_size in [64,128,256, 512, 768, 1024]:
+            self.mixed_precision = mixed_precision
+            self.OUTPUT_CHANNELS = 1
+            self.INPUT_CHANNELS = 1
             self.input_size = input_size
-        self.number_factors = number_factors
-        self.loss_weight_pixel = loss_weight_pixel
-        self.loss_weight_discriminator = loss_weight_discriminator
-        self.loss_weight_adversarial = loss_weight_adversarial
-        self.loss_weight_tv = loss_weight_tv
-        self.loss_type_pixel = loss_type_pixel
-        self.generator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_generator, beta_1=adam_beta_1, name="Adam_Generator")
-        self.discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_discriminator, beta_1=adam_beta_1, name="Adam_Discriminator")
-        if self.mixed_precision:
-            # Dynamic loss scaling to keep float16 gradients from underflowing.
-            self.generator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.generator_optimizer)
-            self.discriminator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
+            self.number_factors = number_factors
+            self.loss_weight_pixel = loss_weight_pixel
 
-        self.generator_embedding = self.cnn_embedding()
-        self.discriminator_embedding = self.cnn_embedding()         
-        self.generator = self.Generator()
-        self.discriminator = self.Discriminator()
+            # NOISE SCHEDULER
+            self.timesteps = timesteps
+            beta_start = 1e-4
+            beta_end = 0.02
 
-        self.log_dir=log_dir
-        
-        self.checkpoint_dir = os.path.join(self.log_dir, 'training_checkpoints')
-        self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
-        self.checkpoint = tf.train.Checkpoint(generator_optimizer=self.generator_optimizer,
-                                    discriminator_optimizer=self.discriminator_optimizer,
-                                    generator=self.generator,
-                                    discriminator=self.discriminator)
-        self.start_epoch = 0
-        if restore_checkpoint:
-            latest_checkpoint = tf.train.latest_checkpoint(self.checkpoint_dir)
-            print(f"Current checkpoint directory: {self.checkpoint_dir}")
-            if latest_checkpoint:
-                print(f"Restoring from checkpoint: {latest_checkpoint}")
-                self.checkpoint.restore(latest_checkpoint)
-                basename = os.path.basename(latest_checkpoint)
-                m = re.search(r'ckpt-(\d+)$', basename)
-                if m:
-                    ckpt_num = int(m.group(1))
+            # Set beta_0 = 0.0 (alpha_bar_0 = 1.0) and linearly schedule betas for t = 1..timesteps
+            betas_steps = tf.cast(tf.linspace(beta_start, beta_end, self.timesteps), tf.float32)
+            self.betas = tf.concat([[0.0], betas_steps], axis=0)
+
+            self.alphas = 1.0 - self.betas
+
+            self.alphas_bar = tf.math.cumprod(self.alphas)
+
+            self.denoiser_optimizer = keras.optimizers.Adam(
+                learning_rate=learning_rate, beta_1=adam_beta_1, name="Adam_UNet")
+
+            if self.mixed_precision:
+                self.denoiser_optimizer = keras.mixed_precision.LossScaleOptimizer(self.denoiser_optimizer)
+
+            #Model Start
+            self.denoiser = self.denoiser()
+
+            self.log_dir = log_dir
+            self.checkpoint_dir = os.path.join(self.log_dir, 'training_checkpoints')
+            self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
+
+            self.checkpoint = tf.train.Checkpoint(denoiser_optimizer=self.denoiser_optimizer,
+                                                  denoiser=self.denoiser)
+            self.start_epoch = 0
+            if restore_checkpoint:
+                latest_checkpoint = tf.train.latest_checkpoint(self.checkpoint_dir)
+                if latest_checkpoint:
+                    print(f"Restoring from checkpoint: {latest_checkpoint}")
+                    self.checkpoint.restore(latest_checkpoint)
+                    basename = os.path.basename(latest_checkpoint)
+                    m = re.search(r'ckpt-(\d+)$', basename)
+                    if m:
+                        ckpt_num = int(m.group(1))
+                    else:
+                        try:
+                            ckpt_num = int(basename.split('-')[-1])
+                        except Exception:
+                            ckpt_num = 0
+                    self.start_epoch = ckpt_num
                 else:
-                    try:
-                        ckpt_num = int(basename.split('-')[-1])
-                    except Exception:
-                        ckpt_num = 0
-                # self.__epoch_counter = ckpt_num
-                self.start_epoch = ckpt_num
-                print(f"Resuming from checkpoint #{ckpt_num}.")
-            else:
-                print("No checkpoint found. Starting from scratch.")
-        self.plot_type = plot_type
-        if self.plot_type not in ["png", "pdf", "svg"]:
-            self.plot_type = "png"
-            print("plot type {:s} unsupported, changed to png".format(plot_type))
-        self.progress_plot_name = os.path.join(self.log_dir, "lossOverEpochs.{:s}".format(self.plot_type))
-        self.progress_plot_frequency = plot_frequency
-        self.example_plot_frequency = 5
+                    print("No checkpoint found. Starting from scratch.")
 
-        #losses per epochs
-        self.__gen_train_loss_epochs = []
-        self.__disc_train_loss_true_epochs = []
-        self.__disc_train_loss_fake_epochs = []
-        self.__gen_val_loss_epochs = []
-        self.__disc_val_loss_epochs = []
-        #losses per batch
-        self.__gen_train_loss_batches = []
-        self.__disc_train_loss_true_batches = []
-        self.__disc_train_loss_fake_batches = []
-        self.__gen_val_loss_batches = []
-        self.__disc_val_loss_batches = []
+            self.plot_type = plot_type if plot_type in ["png", "pdf", "svg"] else "png"
+            self.progress_plot_name = os.path.join(self.log_dir, "lossOverEpochs.{:s}".format(self.plot_type))
+            self.progress_plot_frequency = plot_frequency
+            self.example_plot_frequency = 5
 
-        self.__epoch_counter = 0
-        self.__batch_counter = 0
+            self.__gen_train_loss_epochs = []
+            self.__gen_val_loss_epochs = []
+            self.__gen_train_loss_batches = []
+            self.__gen_val_loss_batches = []
 
-        self.scope = scope
-
-    def cnn_embedding(self, nr_filters_list=[1024,512,512,256,256,128,128,64], kernel_width_list=[4,4,4,4,4,4,4,4], apply_dropout: bool = False):  
-        inputs = tf.keras.layers.Input(shape=(3*self.input_size, self.number_factors))
-        #add 1D convolutions
-        x = inputs
-        for i, (nr_filters, kernelWidth) in enumerate(zip(nr_filters_list, kernel_width_list)):
-            convParamDict = dict()
-            convParamDict["name"] = "conv1D_" + str(i + 1)
-            convParamDict["filters"] = nr_filters
-            convParamDict["kernel_size"] = kernelWidth
-            convParamDict["data_format"]="channels_last"
-            convParamDict["kernel_regularizer"]=tf.keras.regularizers.l2(0.01)
-            if kernelWidth > 1:
-                convParamDict["padding"] = "same"
-            x = Conv1D(**convParamDict)(x)
-            # x = BatchNormalization()(x)
-            x = GroupNormalization(groups=nr_filters, axis=-1)(x)
-            if apply_dropout:
-                x = Dropout(0.5)(x)
-            x = tf.keras.layers.LeakyReLU(alpha=0.2)(x)
-        #make the shape of a square matrix
-        x = Conv1D(filters=self.input_size, 
-                    strides=3, 
-                    kernel_size=4, 
-                    data_format="channels_last", 
-                    activation="sigmoid", 
-                    padding="same", name="conv1D_final")(x)
-        #ensure the matrix is symmetric, i.e. x = transpose(x)
-        x_T = tf.keras.layers.Permute((2,1))(x) #this is the matrix transpose
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x) #add transpose and divide by 2
-        #reshape the matrix into a 2D grayscale image
-        x = tf.keras.layers.Reshape((self.input_size,self.input_size,self.INPUT_CHANNELS))(x)
-        model = tf.keras.Model(inputs=inputs, outputs=x, name="CNN-embedding")
-        #model.build(input_shape=(3*self.INPUT_SIZE, self.NR_FACTORS))
-        #model.summary()
-        return model
-
+            self.__epoch_counter = 0
+            self.__batch_counter = 0
+            if scope is None:
+                scope = tf.distribute.get_strategy()
+            self.scope = scope
 
     @staticmethod
     def downsample(filters, size, apply_batchnorm=True):
         initializer = tf.random_normal_initializer(0., 0.02)
-        result = tf.keras.Sequential()
+        result = keras.Sequential()
         result.add(Conv2D(filters, size, strides=2, padding='same',
                                 kernel_initializer=initializer, use_bias=False))
         if apply_batchnorm:
             # result.add(BatchNormalization())
             result.add(GroupNormalization(groups=filters, axis=-1))
-        result.add(LeakyReLU(alpha=0.2))
+        result.add(LeakyReLU(negative_slope=0.2))
         return result
 
     @staticmethod
     def upsample(filters, size, apply_dropout=False):
         initializer = tf.random_normal_initializer(0., 0.02)
-        result = tf.keras.Sequential()
+        result = keras.Sequential()
         result.add(Conv2DTranspose(filters, size, strides=2,
                                             padding='same',
                                             kernel_initializer=initializer,
@@ -183,208 +146,161 @@ class HiCGAN():
         result.add(ReLU())
         return result
 
+    def denoiser(self):
+        # 3 different inputs
+        noisy_dna = keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="noisy_dna")
+        rna_condition = keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="rna_condition")
+        time_step = keras.layers.Input(shape=[1],
+                                          name="time_step")
 
-    def Generator(self):
-        inputs = tf.keras.layers.Input(shape=[3*self.input_size,self.number_factors], name="factorData")
+        time_channel = SpatialTimeEncoding(timesteps=self.timesteps)([noisy_dna, time_step])
 
-        twoD_conversion = self.generator_embedding
-        #the downsampling part of the network, defined for 256x256 images
-        down_stack = [
-            HiCGAN.downsample(64, 4, apply_batchnorm=False), # (bs, 128, 128, 64)
-            HiCGAN.downsample(128, 4), # (bs, 64, 64, 128)
-            HiCGAN.downsample(256, 4), # (bs, 32, 32, 256)
-            HiCGAN.downsample(512, 4), # (bs, 16, 16, 512)
-            HiCGAN.downsample(512, 4), # (bs, 8, 8, 512)
-            HiCGAN.downsample(512, 4), # (bs, 4, 4, 512)
-            HiCGAN.downsample(512, 4), # (bs, 2, 2, 512)
-            HiCGAN.downsample(512, 4, apply_batchnorm=False), # (bs, 1, 1, 512)
-        ]
-        #if the input images are smaller, leave out some layers accordingly
-        if self.input_size < 256:
-            down_stack = down_stack[:-2] + down_stack[-1:]
-        if self.input_size < 128:
-            down_stack = down_stack[:-2] + down_stack[-1:]
+        # Concat 3 channels as 1 block
+        x = keras.layers.Concatenate(axis=-1)([noisy_dna, rna_condition, time_channel])
 
-        #the upsampling portion of the generator, designed for 256x256 images
-        up_stack = [
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 2, 2, 1024)
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 4, 4, 1024)
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 8, 8, 1024)
-            HiCGAN.upsample(512, 4), # (bs, 16, 16, 1024)
-            HiCGAN.upsample(256, 4), # (bs, 32, 32, 512)
-            HiCGAN.upsample(128, 4), # (bs, 64, 64, 256)
-            HiCGAN.upsample(64, 4), # (bs, 128, 128, 128)
-        ]
-        #for smaller images, take layers away, otherwise downsampling won't work
-        if self.input_size < 256:
-            up_stack = up_stack[:2] + up_stack[3:]
-        if self.input_size < 128:
-            up_stack = up_stack[:2] + up_stack[3:]
+        # Dynamic Architecture
+        num_downsamples = int(np.round(np.log2(self.input_size)))
+        down_filters = [min(64 * (2 ** i), 512) for i in range(num_downsamples)]
+        up_filters = [min(64 * (2 ** i), 512) for i in reversed(range(num_downsamples - 1))]
+
+        down_stack = []
+        for i, f in enumerate(down_filters):
+            apply_norm = (i > 0 and i < num_downsamples - 1)
+            down_stack.append(HiCGAN.downsample(f, 4, apply_batchnorm=apply_norm))
+
+        up_stack = []
+        for i, f in enumerate(up_filters):
+            #prevent overfitting
+            apply_drop = (i < 3)
+            up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 
         initializer = tf.random_normal_initializer(0., 0.02)
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4,
-                                                strides=2,
-                                                padding='same',
-                                                kernel_initializer=initializer) # (bs, 256, 256, 3)
 
-        x = inputs
-        x = twoD_conversion(x)
-
-        # Downsampling through the model
+        #Downsampling
         skips = []
         for down in down_stack:
             x = down(x)
             skips.append(x)
 
-        skips = reversed(skips[:-1])
+        skips = list(reversed(skips[:-1]))
 
-        # Upsampling and establishing the skip connections
+        #Upsampling
         for up, skip in zip(up_stack, skips):
             x = up(x)
-            x = tf.keras.layers.Concatenate()([x, skip])
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4, strides=2, padding='same', kernel_initializer=initializer) 
+            if x.shape[1] != skip.shape[1] or x.shape[2] != skip.shape[2]:
+                x = tf.keras.layers.Resizing(skip.shape[1], skip.shape[2])(x)
+            x = keras.layers.Concatenate()([x, skip])
+
+        # Output: unconstrained pixel-wise noise prediction (symmetry is enforced on final denoised x_0)
+        last = keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4, strides=2, padding='same',
+                                               kernel_initializer=initializer)
         x = last(x)
-        #enforce symmetry
-        x_T = tf.keras.layers.Permute((2,1,3))(x)
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x)
-        x = tf.keras.layers.Activation("sigmoid")(x)
+        if x.shape[1] != self.input_size or x.shape[2] != self.input_size:
+            x = tf.keras.layers.Resizing(self.input_size, self.input_size)(x)
 
-        return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
+        return keras.Model(inputs=[noisy_dna, rna_condition, time_step], outputs=x, name="UNet_Diffusion")
 
-
-    def generator_loss(self, disc_generated_output, gen_output, target):
-        # Compute the loss in float32 (no-op without mixed precision; required
-        # for numerical stability and dtype matching when float16 is active).
-        disc_generated_output = tf.cast(disc_generated_output, tf.float32)
-        gen_output = tf.cast(gen_output, tf.float32)
-        target = tf.cast(target, tf.float32)
-        advers_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_generated_output), logits=disc_generated_output) )
-        # mean squared error or mean absolute error
-        if self.loss_type_pixel == "L1":
-            pixel_loss = tf.reduce_mean(tf.abs(target - gen_output))
-        else: 
-            pixel_loss = tf.reduce_mean(tf.square(target - gen_output))
-        tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
-        total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
-        return total_gen_loss, advers_loss, pixel_loss
-
-
-    def Discriminator(self):
-        initializer = tf.random_normal_initializer(0., 0.02)
-
-        inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
-        tar = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.OUTPUT_CHANNELS], name='target_image')
-        embedding = self.discriminator_embedding
-        #Patch-GAN (Isola et al.)
-        d = embedding(inp)
-        d = tf.keras.layers.Concatenate()([d, tar])
-        if self.input_size > 64:
-            #downsample and symmetrize 1 
-            d = HiCGAN.downsample(64, 4, False)(d) # (bs, inp.size/2, inp.size/2, 64)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-            #downsample and symmetrize 2
-            d = HiCGAN.downsample(128, 4)(d)# (bs, inp.size/4, inp.size/4, 128)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-        else:    
-            #downsample and symmetrize 3
-            d = HiCGAN.downsample(256, 4)(d)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-        #downsample and symmetrize 4
-        d = HiCGAN.downsample(256, 4)(d) # (bs, inp.size/8, inp.size/8, 256)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-        d = Conv2D(512, 4, strides=1, padding="same", kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 512)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-        # d = BatchNormalization()(d)
-        d = LeakyReLU(alpha=0.2)(d)
-        d = Conv2D(1, 4, strides=1, padding="same",
-                        kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 1)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
-        #d = tf.keras.layers.Activation("sigmoid")(d) #sigmoid will be done in the loss function itself
-        return tf.keras.Model(inputs=[inp, tar], outputs=d, name="Discriminator")
-
-    def discriminator_loss(self, disc_real_output, disc_generated_output):
-        disc_real_output = tf.cast(disc_real_output, tf.float32)
-        disc_generated_output = tf.cast(disc_generated_output, tf.float32)
-        real_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_real_output), logits=disc_real_output) )
-        generated_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.zeros_like(disc_generated_output), logits=disc_generated_output) )
-        total_disc_loss = self.loss_weight_discriminator * (real_loss + generated_loss)
-        return total_disc_loss, real_loss, generated_loss
 
     @tf.function
     def distributed_train_step(self, input_data):
-        input_image, target = input_data[0]["factorData"], input_data[1]["out_matrixData"]
-        per_replica_losses = self.scope.run(self.train_step, args=(input_image, target, ))
-        return self.scope.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
-    
+        rna_matrix = input_data[0]["factorData"]
+        real_dna_matrix = input_data[1]["out_matrixData"]
+
+        per_replica_losses = self.scope.run(self.train_step, args=(rna_matrix, real_dna_matrix,))
+        # Average the loss across replicas so multi-GPU training reports mean MSE
+        return self.scope.reduce(tf.distribute.ReduceOp.MEAN, per_replica_losses, axis=None)
+
     @tf.function
-    def train_step(self, input_image, target):
-        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-            gen_output = self.generator(input_image, training=True)
+    def train_step(self, rna_matrix, real_dna_matrix):
+        batch_size = tf.shape(real_dna_matrix)[0]
 
-            disc_real_output = self.discriminator([input_image, target], training=True)
-            disc_generated_output = self.discriminator([input_image, gen_output], training=True)
+        t = tf.random.uniform(shape=[batch_size, 1], minval=1, maxval=self.timesteps + 1, dtype=tf.int32)
 
-            gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
-            disc_loss, disc_real_loss, disc_gen_loss = self.discriminator_loss(disc_real_output, disc_generated_output)
+        noise = tf.random.normal(shape=tf.shape(real_dna_matrix))
+
+        # FORWARD PROCESS
+        alpha_bar_t = tf.gather(self.alphas_bar, t)
+        alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
+
+        # DDPM
+        noisy_dna = tf.sqrt(alpha_bar_t) * real_dna_matrix + tf.sqrt(1.0 - alpha_bar_t) * noise
+
+        with tf.GradientTape() as tape:
+            predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
+
+            loss = tf.reduce_mean(tf.square(noise - predicted_noise))  #mse
 
             if self.mixed_precision:
-                # scaled loss must be computed inside the tape
-                scaled_gen_loss = self.generator_optimizer.get_scaled_loss(gen_total_loss)
-                scaled_disc_loss = self.discriminator_optimizer.get_scaled_loss(disc_loss)
+                scaled_loss = self.denoiser_optimizer.get_scaled_loss(loss)
 
+        #BACKPROPAGATION
         if self.mixed_precision:
-            generator_gradients = self.generator_optimizer.get_unscaled_gradients(
-                gen_tape.gradient(scaled_gen_loss, self.generator.trainable_variables))
-            discriminator_gradients = self.discriminator_optimizer.get_unscaled_gradients(
-                disc_tape.gradient(scaled_disc_loss, self.discriminator.trainable_variables))
+            scaled_gradients = tape.gradient(scaled_loss, self.denoiser.trainable_variables)
+            gradients = self.denoiser_optimizer.get_unscaled_gradients(scaled_gradients)
         else:
-            generator_gradients = gen_tape.gradient(gen_total_loss,
-                                                    self.generator.trainable_variables)
-            discriminator_gradients = disc_tape.gradient(disc_loss,
-                                                        self.discriminator.trainable_variables)
+            gradients = tape.gradient(loss, self.denoiser.trainable_variables)
 
-        self.generator_optimizer.apply_gradients(zip(generator_gradients,
-                                                self.generator.trainable_variables))
-        self.discriminator_optimizer.apply_gradients(zip(discriminator_gradients,
-                                                    self.discriminator.trainable_variables))
-        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss
+        self.denoiser_optimizer.apply_gradients(zip(gradients, self.denoiser.trainable_variables))
+
+        return loss
 
     @tf.function
-    def validationStep(self, input_image, target):
-        gen_output = self.generator(input_image, training=True)
+    def validationStep(self, rna_matrix, real_dna_matrix):
+        batch_size = tf.shape(real_dna_matrix)[0]
 
-        disc_real_output = self.discriminator([input_image, target], training=True)
-        disc_generated_output = self.discriminator([input_image, gen_output], training=True)
+        t = tf.random.uniform(shape=[batch_size, 1], minval=1, maxval=self.timesteps + 1, dtype=tf.int32)
+        noise = tf.random.normal(shape=tf.shape(real_dna_matrix))
 
-        gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
-        disc_loss, _, _ = self.discriminator_loss(disc_real_output, disc_generated_output)
-        return gen_total_loss, disc_loss
+        alpha_bar_t = tf.gather(self.alphas_bar, t)
+        alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
+        noisy_dna = tf.sqrt(alpha_bar_t) * real_dna_matrix + tf.sqrt(1.0 - alpha_bar_t) * noise
+
+        #prediction
+        predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
+        loss = tf.reduce_mean(tf.square(noise - predicted_noise))
+        return loss
 
     def generate_images(self, model, test_input, tar, epoch: int):
-        prediction = model(test_input, training=True)
-        pred_mse = tf.reduce_mean(tf.square( tar["out_matrixData"][0], prediction[0] ))
+        rna_condition = test_input["factorData"][:1]
+        real_dna = tar["out_matrixData"][:1]
+        batch_size = 1
+
+        x_t = tf.random.normal(shape=(batch_size, self.input_size, self.input_size, 1))
+
+        for t_step in reversed(range(1, self.timesteps + 1)):
+            t_batch = tf.fill([batch_size, 1], tf.cast(t_step, tf.float32))
+            predicted_noise = model([x_t, rna_condition, t_batch], training=False)
+
+            alpha_t = self.alphas[t_step]
+            alpha_bar_t = self.alphas_bar[t_step]
+            beta_t = self.betas[t_step]
+
+            coef1 = 1.0 / tf.sqrt(alpha_t)
+            coef2 = (1.0 - alpha_t) / tf.sqrt(1.0 - alpha_bar_t)
+
+            x_t = coef1 * (x_t - coef2 * predicted_noise)
+
+            if t_step > 1:
+                noise = tf.random.normal(shape=tf.shape(x_t))
+                x_t = x_t + tf.sqrt(beta_t) * noise
+
+        # Enforce symmetry on the final denoised matrix x_0
+        prediction = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        pred_mse = tf.reduce_mean(tf.square(real_dna[0] - prediction[0]))
+
         figname = "testpred_epoch_{:05d}.png".format(epoch)
         figname = os.path.join(self.log_dir, figname)
-        display_list = [test_input["factorData"][0], tar["out_matrixData"][0], prediction[0]]
-        titleList = ['Input Image', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
+        # Plot Random Input condition, Ground Truth RNA matrix, and Predicted RNA matrix
+        display_list = [rna_condition[0], real_dna[0], prediction[0]]
+        titleList = ['Random Input', 'Ground Truth RNA', 'Predicted RNA (MSE: {:.5f})'.format(pred_mse)]
 
-        fig1, axs1 = plt.subplots(1,len(display_list), figsize=(15,15))
+        fig1, axs1 = plt.subplots(1, len(display_list), figsize=(15, 5))
         for i in range(len(display_list)):
-            axs1[i].imshow(display_list[i] * 0.5 + 0.5)
+            img = np.squeeze(display_list[i].numpy() if hasattr(display_list[i], 'numpy') else display_list[i])
+            im = axs1[i].imshow(img, cmap='coolwarm')
             axs1[i].set_title(titleList[i])
+            fig1.colorbar(im, ax=axs1[i], fraction=0.046, pad=0.04)
+        fig1.tight_layout()
         fig1.savefig(figname)
         plt.close(fig1)
         del fig1, axs1
@@ -408,11 +324,27 @@ class HiCGAN():
             print(f"Checkpoint epoch {self.start_epoch} is greater than or equal to total epochs {epochs}. Starting from scratch.")
             exit(1)
 
+        vis_sample_input = None
+        vis_sample_target = None
+        # Select a validation sample with non-zero Ground Truth RNA interactions for visualization
+        for test_in, test_tar in test_ds:
+            targets = test_tar["out_matrixData"]
+            sums = tf.reduce_sum(tf.abs(targets), axis=[1, 2, 3])
+            max_idx = int(tf.argmax(sums))
+            if float(sums[max_idx]) > 0.0:
+                vis_sample_input = {k: v[max_idx:max_idx+1] for k, v in test_in.items()}
+                vis_sample_target = {k: v[max_idx:max_idx+1] for k, v in test_tar.items()}
+                break
+
+        if vis_sample_input is None:
+            for test_in, test_tar in test_ds.take(1):
+                vis_sample_input = {k: v[:1] for k, v in test_in.items()}
+                vis_sample_target = {k: v[:1] for k, v in test_tar.items()}
+
         for epoch in range(self.start_epoch, epochs):
             #generate sample output
-            if epoch % self.example_plot_frequency == 0:
-                for example_input, example_target in test_ds.take(1):
-                    self.generate_images(self.generator, example_input, example_target, epoch)
+            if epoch % self.example_plot_frequency == 0 and vis_sample_input is not None:
+                self.generate_images(self.denoiser, vis_sample_input, vis_sample_target, epoch)
             
             
             train_pbar = tqdm(total=steps_per_epoch)
@@ -420,106 +352,72 @@ class HiCGAN():
             train_samples_in_epoch = 0
 
             for distributed_input in distributed_dataset:
-               
                 train_samples_in_epoch += 1
-                gen_loss, _, disc_loss_real, disc_loss_fake = self.distributed_train_step(distributed_input)
 
-                self.__disc_train_loss_true_batches.append(disc_loss_real)
-                self.__disc_train_loss_fake_batches.append(disc_loss_fake)
+                gen_loss = self.distributed_train_step(distributed_input)
                 self.__gen_train_loss_batches.append(gen_loss)
-                train_bar_postfixDict= {"g": "{:.4f}".format(self.__gen_train_loss_batches[-1]),
-                                         "dt": "{:.3f}".format(self.__disc_train_loss_true_batches[-1]),
-                                         "df": "{:.3f}".format(self.__disc_train_loss_fake_batches[-1])}
+
+                train_bar_postfixDict = {"Loss (MSE)": "{:.4f}".format(self.__gen_train_loss_batches[-1])}
                 if len(self.__gen_val_loss_epochs) > 0:
-                    train_bar_postfixDict["v"] = "{:.3f}".format(self.__gen_val_loss_epochs[-1])
-                train_pbar.set_postfix( train_bar_postfixDict )
+                    train_bar_postfixDict["Val_Loss"] = "{:.3f}".format(self.__gen_val_loss_epochs[-1])
+                train_pbar.set_postfix(train_bar_postfixDict)
                 train_pbar.update(1)
                 self.__batch_counter += 1
+
             train_pbar.close()
             self.__gen_train_loss_epochs.append(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_true_epochs.append(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_fake_epochs.append(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:]))
 
             # Validation
             validation_samples_in_epoch = 0
             vds = test_ds.take(validation_steps) if validation_steps else test_ds
             for input_image, target in vds:
-                gen_loss_val, disc_loss_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
-                self.__gen_val_loss_batches.append(gen_loss_val)
-                self.__disc_val_loss_batches.append(disc_loss_val)
+                val_loss = self.validationStep(input_image["factorData"], target["out_matrixData"])
+                self.__gen_val_loss_batches.append(val_loss)
                 validation_samples_in_epoch += 1
-            self.__disc_val_loss_epochs.append(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:]))
-            self.__gen_val_loss_epochs.append(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
+            if validation_samples_in_epoch > 0:
+                self.__gen_val_loss_epochs.append(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
 
             #count the epoch
             self.__epoch_counter += 1
 
-            # saving the model every 20 epochs
+            # saving the model periodically
             if (epoch + 1) % self.progress_plot_frequency == 0:
                 #plot loss
-                utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
-                              pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
-                                                    self.__disc_train_loss_true_epochs, 
-                                                    self.__disc_train_loss_fake_epochs, 
-                                                    self.__disc_val_loss_epochs],
-                              pGeneratorLossNameList=["training", "validation"],
-                              pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
+                utils.plotLoss(pdenoiserLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
+                              pDiscLossValueLists=[],
+                              pdenoiserLossNameList=["training", "validation"],
+                              pDiscLossNameList=[],
                               pFilename=self.progress_plot_name,
                               useLogscaleList=[True, False])
                 np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
                                     genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
-                self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
-                self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
-
+                                    genLossVal=self.__gen_val_loss_batches)
+                self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_{:05d}.keras".format(epoch)), save_format="keras")
 
             self.checkpoint.save(file_prefix = self.checkpoint_prefix)
-        utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
-                              pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
-                                                    self.__disc_train_loss_true_epochs, 
-                                                    self.__disc_train_loss_fake_epochs, 
-                                                    self.__disc_val_loss_epochs],
-                              pGeneratorLossNameList=["training", "validation"],
-                              pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
-                              pFilename=self.progress_plot_name,
-                              useLogscaleList=[True, False])
-        np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
-                                    genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
-        self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
-        self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
+
+        # Final save after training completes
+        utils.plotLoss(pdenoiserLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
+                      pDiscLossValueLists=[],
+                      pdenoiserLossNameList=["training", "validation"],
+                      pDiscLossNameList=[],
+                      pFilename=self.progress_plot_name,
+                      useLogscaleList=[True, False])
+        np.savez(os.path.join(self.log_dir, "lossValues_final.npz"), 
+                            genLossTrain=self.__gen_train_loss_batches, 
+                            genLossVal=self.__gen_val_loss_batches)
+        self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_final.keras"), save_format="keras")
 
     def plotModels(self, pOutputPath: str, pFigureFileFormat: str):
-        generatorPlotName = "generatorModel.{:s}".format(pFigureFileFormat)
-        generatorPlotName = os.path.join(pOutputPath, generatorPlotName)
-        discriminatorPlotName = "discriminatorModel.{:s}".format(pFigureFileFormat)
-        discriminatorPlotName = os.path.join(pOutputPath, discriminatorPlotName)
-        generatorEmbeddingPlotName = "generatorEmbeddingModel.{:s}".format(pFigureFileFormat)
-        generatorEmbeddingPlotName = os.path.join(pOutputPath, generatorEmbeddingPlotName)
-        discriminatorEmbeddingPlotName = "discriminatorEmbeddingModel.{:s}".format(pFigureFileFormat)
-        discriminatorEmbeddingPlotName = os.path.join(pOutputPath, discriminatorEmbeddingPlotName)
-        #Architecture diagrams are a nicety, and they need pydot plus a graphviz
-        #binary. Without them keras raises ImportError, which used to abort the
-        #whole training run before a single step -- losing the job over a
-        #picture. Warn and carry on instead.
-        for model, name in ((self.generator, generatorPlotName),
-                            (self.discriminator, discriminatorPlotName),
-                            (self.generator_embedding, generatorEmbeddingPlotName),
-                            (self.discriminator_embedding, discriminatorEmbeddingPlotName)):
-            try:
-                tf.keras.utils.plot_model(model, show_shapes=True, to_file=name)
-            except (ImportError, OSError) as ex:
-                msg = ("skipping the architecture diagram {:s}: {:s}. "
-                       "Install pydot and graphviz if you want it; training is "
-                       "unaffected.").format(name, str(ex).split("\n")[0])
-                print(msg)
-                break
+        denoiserPlotName = "denoiserModel.{:s}".format(pFigureFileFormat)
+        denoiserPlotName = os.path.join(pOutputPath, denoiserPlotName)
+        try:
+            tf.keras.utils.plot_model(self.denoiser, show_shapes=True, to_file=denoiserPlotName)
+        except (ImportError, OSError) as ex:
+            msg = ("skipping the architecture diagram {:s}: {:s}. "
+                   "Install pydot and graphviz if you want it; training is "
+                   "unaffected.").format(denoiserPlotName, str(ex).split("\n")[0])
+            print(msg)
 
     # def predict(self, test_ds, steps_per_record):
     #     predictedArray = []
@@ -532,11 +430,12 @@ class HiCGAN():
     #     # Concatenate along batch dimension instead of converting list
     #     predictedArray = np.concatenate(predictedArray, axis=0)
     #     return predictedArray
+
     def predict(self, test_ds, steps_per_record):
         predictedArray = []
 
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        if self.denoiser is None:
+            raise ValueError("denoiser is None. Please call loaddenoiser() first.")
 
         # Debug print to verify request
         print(f"DEBUG: Starting prediction. Steps arg: {steps_per_record}.")
@@ -607,8 +506,8 @@ class HiCGAN():
         predict() and the quadratic dataset.skip() re-decoding used by the old
         save-memory prediction loop.
         '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        if self.denoiser is None:
+            raise ValueError("denoiser is None. Please call loaddenoiser() first.")
         for batch in test_ds:
             # robust input extraction (mirrors predict())
             if isinstance(batch, (tuple, list)):
@@ -638,8 +537,8 @@ class HiCGAN():
         only the triangle crosses the bus and it crosses as float16 rather than
         float32, and removes the host-side gather entirely.
         '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        if self.denoiser is None:
+            raise ValueError("denoiser is None. Please call loaddenoiser() first.")
         r, c = np.triu_indices(window_size)
         flat = tf.constant(r * window_size + c, dtype=tf.int32)
 
@@ -689,7 +588,7 @@ class HiCGAN():
         Summing where the values are produced removes that entirely. Only the
         band crosses the bus, once per chromosome, and no per-window file is
         written at all. For chromosome 1 at 2 kb the band is 248 MB, which fits
-        on the card next to the generator with room to spare.
+        on the card next to the denoiser with room to spare.
 
         The scatter is a constant index pattern shifted along the chromosome:
         the cell a window's (r, c) entry lands in is ((c-r), r + j), where j is
@@ -702,8 +601,8 @@ class HiCGAN():
         here. Returns the band as (W, matrix_size) float32 together with the
         number of windows summed into it.
         '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        if self.denoiser is None:
+            raise ValueError("denoiser is None. Please call loaddenoiser() first.")
         W = int(window_size)
         matrixSize = int(matrix_size)
         flanking = int(flanking_size)
@@ -725,7 +624,7 @@ class HiCGAN():
             if out.shape.rank == 4 and out.shape[-1] == 1:
                 out = tf.squeeze(out, axis=-1)
             out = tf.reshape(out, [tf.shape(out)[0], W * W])
-            #a generator trained under mixed precision emits float16; the band
+            #a denoiser trained under mixed precision emits float16; the band
             #is summed in float32 regardless, since up to windowSize windows
             #land on the same cell
             tri = tf.cast(tf.gather(out, flatWindow, axis=1), tf.float32)
@@ -765,25 +664,57 @@ class HiCGAN():
         return result, allStarts
 
     @tf.function
-    def predictionStep(self, input_batch, training=False):
-        return self.generator(input_batch, training=training)
-  
-    
-    # def loadGenerator(self, trainedModelPath: str):
+    def predictionStep(self, input_batch, training=False, sample_steps: int = 50):
+
+        rna_condition = input_batch
+        if len(rna_condition.shape) == 3:
+            rna_condition = tf.expand_dims(rna_condition, axis=-1)
+        batch_size = tf.shape(rna_condition)[0]
+
+        x_t = tf.random.normal(shape=(batch_size, self.input_size, self.input_size, 1))
+
+        stride = tf.maximum(1, self.timesteps // sample_steps)
+
+        for t_step in tf.range(self.timesteps, 0, -stride):
+            t_batch = tf.fill([batch_size, 1], tf.cast(t_step, tf.float32))
+            t_prev = tf.maximum(0, t_step - stride)
+
+            predicted_noise = self.denoiser([x_t, rna_condition, t_batch], training=False)
+
+            # Compute effective alpha and beta across the strided interval (t_prev -> t_step)
+            alpha_bar_t = self.alphas_bar[t_step]
+            alpha_bar_prev = self.alphas_bar[t_prev]
+            alpha_step = alpha_bar_t / alpha_bar_prev
+            beta_step = 1.0 - alpha_step
+
+            coef1 = 1.0 / tf.sqrt(alpha_step)
+            coef2 = beta_step / tf.sqrt(1.0 - alpha_bar_t)
+
+            x_t = coef1 * (x_t - coef2 * predicted_noise)
+
+            noise = tf.random.normal(shape=tf.shape(x_t))
+            noise_term = tf.where(t_step > stride, tf.sqrt(beta_step) * noise, tf.zeros_like(x_t))
+            x_t = x_t + noise_term
+
+        # Enforce symmetry on the final denoised matrix x_0
+        x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        return x_t
+
+    # def load_denoiser(self, trainedModelPath: str):
     #     '''
-    #         load a trained generator model for prediction
+    #         load a trained denoiser model for prediction
     #     '''
     #     try:
     #         trainedModel = tf.keras.models.load_model(filepath=trainedModelPath, 
     #                                               custom_objects={"CustomReshapeLayer": CustomReshapeLayer(self.input_size)}, safe_mode=False)
-    #         self.generator = trainedModel
+    #         self.denoiser = trainedModel
     #     except Exception as e:
     #         msg = str(e)
     #         msg += "\nError: failed to load trained model"
     #         raise ValueError(msg)
-    def loadGenerator(self, trainedModelPath: str):
+    def load_denoiser(self, trainedModelPath: str):
         '''
-        Load a trained generator model for prediction with detailed diagnostics.
+        Load a trained denoiser model for prediction with detailed diagnostics.
         '''
         try:
             print(f"Attempting to load model from: {trainedModelPath}")
@@ -791,31 +722,29 @@ class HiCGAN():
             # 1. Define custom layers
             custom_layers = {
                 "CustomReshapeLayer": CustomReshapeLayer,
+                "GroupNormalization": keras.layers.GroupNormalization,
+                "SpatialTimeEncoding": SpatialTimeEncoding,
             }
-            
-            # 2. Add GroupNormalization
-            # Try native Keras (TF 2.12+)
-            # if hasa?ttr(tf.keras.layers, "GroupNormalization"):
-            custom_layers["GroupNormalization"] = tf.keras.layers.GroupNormalization
-            # else:
-            #     # Fallback for older TF versions using addons
-            #     try:
-            #         import tensorflow_addons as tfa
-            #         custom_layers["GroupNormalization"] = tfa.layers.GroupNormalization
-            #     except ImportError:
-            #         print("Warning: Could not import GroupNormalization from keras or addons.")
 
-            # 3. Load the model
-            self.generator = tf.keras.models.load_model(
-                filepath=trainedModelPath, 
-                custom_objects=custom_layers, 
-                safe_mode=False
-            )
+            if os.path.isdir(trainedModelPath) or "ckpt" in trainedModelPath:
+                ckpt = tf.train.Checkpoint(denoiser=self.denoiser)
+                latest = tf.train.latest_checkpoint(trainedModelPath) if os.path.isdir(trainedModelPath) else trainedModelPath
+                if latest:
+                    print(f"Restoring denoiser from checkpoint: {latest}")
+                    ckpt.restore(latest).expect_partial()
+                else:
+                    raise FileNotFoundError(f"No checkpoint found at {trainedModelPath}")
+            else:
+                self.denoiser = tf.keras.models.load_model(
+                    filepath=trainedModelPath, 
+                    custom_objects=custom_layers, 
+                    safe_mode=False
+                )
             print("Model loaded successfully. Running diagnostics...")
 
             # --- DIAGNOSTICS ---
             # Check 1: Are weights all zeros or NaNs?
-            all_weights = self.generator.get_weights()
+            all_weights = self.denoiser.get_weights()
             if len(all_weights) > 0:
                 total_weight_sum = np.sum([np.sum(np.abs(w)) for w in all_weights])
                 has_nan = np.any([np.isnan(np.sum(w)) for w in all_weights])
@@ -831,10 +760,13 @@ class HiCGAN():
             print(" -> Diagnostics passed. Weights look valid.")
 
         except Exception as e:
-            msg = f"Failed to load generator.\nDetail: {str(e)}"
+            msg = f"Failed to load denoiser.\nDetail: {str(e)}"
             raise ValueError(msg)
+
+    # Alias for backward compatibility
+    loaddenoiser = load_denoiser
         
-class CustomReshapeLayer(tf.keras.layers.Layer):
+class CustomReshapeLayer(keras.layers.Layer):
     '''
     reshape a 1D tensor such that it represents 
     the upper triangular part of a square 2D matrix with shape (matsize, matsize)
@@ -859,3 +791,4 @@ class CustomReshapeLayer(tf.keras.layers.Layer):
 
     def get_config(self):
         return {"matsize": self.matsize}
+

@@ -5,12 +5,19 @@ import os
 import csv
 import tensorflow as tf
 from scipy import sparse
-from .lib import dataContainer
-from .lib import records
-from .lib import hicGAN
-from .lib import utils
 import logging
-from hicgan._version import __version__
+try:
+    from .lib import dataContainer
+    from .lib import records
+    from .lib import hicGAN
+    from .lib import utils
+    from hicgan._version import __version__
+except (ImportError, ValueError):
+    from lib import dataContainer
+    from lib import records
+    from lib import hicGAN
+    from lib import utils
+    __version__ = "1.0.0"
 import pickle
 
 log = logging.getLogger(__name__)
@@ -20,7 +27,7 @@ def parse_arguments(args=None):
     # parser = argparse.ArgumentParser(description="Hi-cGAN Prediction")
     parser.add_argument("--trainedModel", "-trm", required=False,
                         type=str,
-                        help="Trained generator model to predict from")
+                        help="Trained denoiser model to predict from")
     parser.add_argument("--predictionChromosomesFolders", "-tcp", required=False,
                         type=str,
                         help="Path where test data (bigwig files) resides")
@@ -45,16 +52,29 @@ def parse_arguments(args=None):
                         default=10, 
                         help="Multiplier for scaling the predicted coolers")
     parser.add_argument("--binSize", "-b", required=False,
-                        type=int, 
-                        help="Bin size for binning the chromatin features")
+                        type=int,
+                        default=250000,
+                        help="Bin size for matrices (default: 250000 for 250kb RNA matrices)")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int,
                         default=32, 
                         help="Batch size for predicting")
     parser.add_argument("--windowSize", "-ws", required=False,
                         type=int,
+                        default=64,
                         choices=[64, 128, 256, 512, 768, 1024],
                         help="Window size for predicting; must be the same as in trained model. Supported values are 64, 128, and 256")
+    parser.add_argument("--dataDir", "-d", required=False,
+                        type=str,
+                        help="Data directory containing rna_gt (or rna) and random_input folders")
+    parser.add_argument("--splitFile", "-sf", required=False,
+                        type=str,
+                        help="Split file (splits.txt) specifying train/val/test chromosomes")
+    parser.add_argument("--split", required=False,
+                        type=str,
+                        default="test",
+                        choices=["test", "train", "val", "all"],
+                        help="Which split from splitFile to evaluate (default: test)")
     parser.add_argument("--targetValueRange", "-tvr", required=False,
                         type=str,
                         help="Undo the [0, 1] mapping that training applied, so the "
@@ -218,7 +238,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
     scalematrix = True
     maxdist = None
     windowSize = int(windowSize)
-    flankingsize = windowSize
+    # Set flankingsize to 0 for 250kb 2D RNA matrices
+    flankingsize = 0
 
     paramDict = locals().copy()
     predictionChunksDir = os.path.join(outputFolder, "prediction_chunks")
@@ -278,24 +299,13 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         matrixSizeList = loaded_vars.get("matrixSizeList")
 
     if pMode in ["predict", "all"]:
-        trained_GAN = hicGAN.HiCGAN(log_dir=outputFolder, number_factors=nr_factors, scope=pScope)
-        trained_GAN.loadGenerator(trainedModelPath=trainedmodel)
+        trained_GAN = hicGAN.HiCGAN(log_dir=outputFolder, number_factors=nr_factors, input_size=windowSize, scope=pScope)
+        trained_GAN.load_denoiser(trainedModelPath=trainedmodel)
         predictionFiles = []
         predictedChroms = []
 
-        # In all-mode the rebuild of a finished chromosome is started while the
-        # next one is still on the GPU. The two phases use different resources
-        # -- the forward pass is GPU-bound and the rebuild is CPU-bound -- and
-        # chromosomes are independent, so waiting for the last prediction before
-        # starting the first rebuild leaves the card idle for the whole rebuild.
-        # The pool is the same one make-matrix uses; only the moment of
-        # submission differs.
         rebuildPool = None
         rebuildAsync = []
-        #Summing on the GPU needs every window position to be predicted, so it
-        #is the path for a whole chromosome and not for a restricted set of
-        #regions, where the individual windows are the output rather than an
-        #intermediate.
         useBand = pIncludeRegions is None and bool(matrixSizeList)
         bandStarts = []
         if pMode == "all":
@@ -306,10 +316,6 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                   flush=True)
             rebuildPool = multiprocessing.get_context("spawn").Pool(processes=nRebuild)
 
-        # Derive the chromosome from the container itself rather than the
-        # originally requested chromNameList: some chromosomes may have been
-        # skipped (too few bins at this binSize), so positional zipping with
-        # the full request list would misalign names and predictions.
         for idx, (record, container, nr_samples) in enumerate(
                 zip(tfRecordFilenames, testdataContainerList, sampleSizeList)):
             chrom = container.chromosome
@@ -321,17 +327,6 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             testDs = testDs.batch(batchSize, drop_remainder=False)
             testDs = testDs.prefetch(tf.data.experimental.AUTOTUNE)
 
-            # The overlapping windows are summed on the GPU, where they are
-            # produced, and only the resulting band comes back. Every cell of
-            # the rebuilt matrix is covered by up to windowSize windows, so the
-            # per-window triangles are that many redundant copies of the same
-            # result: at 2 kb a genome is 397 GB of them against 3 GB of band.
-            # Writing them out and reading them back was the whole cost of
-            # prediction on anything but a local disk.
-            #
-            # The per-window path is kept for --includeRegions, where the
-            # windows are the point rather than an intermediate, and where they
-            # are few enough to store.
             if useBand:
                 bandFile = os.path.join(predictionChunksDir, f"band_chr{chrom}.npy")
                 matrixSize = int(matrixSizeList[idx])
@@ -339,7 +334,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     test_ds=testDs,
                     window_size=windowSize,
                     matrix_size=matrixSize,
-                    flanking_size=windowSize,
+                    flanking_size=flankingsize,
                     window_starts=windowStartsList[idx] if windowStartsList else None)
                 written = int(starts.size)
                 np.save(bandFile, band)
@@ -361,32 +356,13 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     os.remove(record)
                 continue
 
-            # Stream predictions one batch at a time. Each batch is reduced to
-            # its upper-triangle as float16 immediately, so the full-chromosome
-            # float32 stack is never held in memory and the dataset is decoded
-            # exactly once (the previous save-memory path used dataset.skip(),
-            # which re-decodes the dataset O(numberOfBatches) times).
             triu_r, triu_c = np.triu_indices(windowSize)
             log.debug("Streaming predictions and extracting triangles...")
             predFile = os.path.join(predictionChunksDir, f"pred_chr{chrom}.npy")
 
-            # Each batch is written to disk as it arrives. The previous version
-            # appended every batch to a list and then called np.concatenate,
-            # holding the whole chromosome twice: once as the list, once as the
-            # joined copy. At a bin size of 2048 chromosome 1 is roughly 32 GB of
-            # float16, so the peak was 64 GB and the out-of-memory handler killed
-            # the run. Writing as we go bounds the peak at a single batch.
-            #
-            # The rows are streamed to a raw file and the .npy header is written
-            # afterwards, once the true row count is known. Sizing a memory-mapped
-            # array up front would need that count in advance, and the estimate
-            # taken from the data container is not always exact.
             rawFile = predFile + ".raw"
             written = 0
             with open(rawFile, "wb") as rawHandle:
-                # the upper triangle is extracted inside the graph, so only the
-                # reduced float16 array crosses the bus and the host does no
-                # gather between two GPU calls
                 for tri in trained_GAN.predict_stream_triu(test_ds=testDs,
                                                            window_size=windowSize):
                     rawHandle.write(np.ascontiguousarray(tri).tobytes())
@@ -413,7 +389,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
 
             if rebuildPool is not None:
                 matrixFile = os.path.join(matrixChunksDir, f"matrix_chr{chrom}.npz")
-                job = (predFile, matrixFile, windowSize, windowSize, pSaveMemory,
+                job = (predFile, matrixFile, windowSize, flankingsize, pSaveMemory,
                        windowStartsList[idx] if windowStartsList else None,
                        matrixSizeList[idx] if matrixSizeList else None,
                        tuple(targetValueRange) if targetValueRange is not None else None,
@@ -422,8 +398,6 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     (chrom, matrixFile, rebuildPool.apply_async(
                         utils.rebuildChromosomeToFile, (job,))))
 
-            # the tfrecord is of no further use once its chromosome is predicted,
-            # and at a small bin size it is the largest thing on the scratch disk
             if os.path.exists(record):
                 os.remove(record)
         log.debug("Prediction on all chromosomes completed.")
@@ -431,28 +405,18 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             rebuildPool.terminate()
             rebuildPool.join()
             rebuildPool = None
-        # keep the downstream chromosome list consistent with what was predicted
         chromNameList = predictedChroms
 
         log.info("Cleaning up temporary files...")
         for tfrecordfile in tfRecordFilenames:
             if os.path.exists(tfrecordfile):
                 os.remove(tfrecordfile)
-        #Written in "all" mode as well as in "predict" mode. The GPU pass is the
-        #part that cannot be repeated cheaply, and without this file a rebuild
-        #that fails, or one you want to redo with different settings, costs the
-        #whole prediction again: the triangles on disk are useless without the
-        #window positions they came from. Sixty kB buys that back.
         save_vars = {
             "predictionFiles": predictionFiles,
             "chromNameList": chromNameList,
             "windowSize": windowSize,
             "windowStartsList": windowStartsList,
             "matrixSizeList": matrixSizeList,
-            #"band" means the files hold the summed band and the window starts
-            #it was summed from; "windows" means one triangle per window, which
-            #still has to be folded. make-matrix cannot tell them apart from the
-            #arrays alone.
             "chunkFormat": "band" if useBand else "windows",
             "bandStarts": bandStarts if useBand else None,
         }
@@ -477,14 +441,11 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         chromNameList = loaded_vars["chromNameList"]
         windowStartsList = loaded_vars.get("windowStartsList")
         matrixSizeList = loaded_vars.get("matrixSizeList")
-        #absent in pickles written before the band was summed on the GPU, which
-        #could only have held per-window triangles
         chunkFormat = loaded_vars.get("chunkFormat", "windows")
         bandStarts = loaded_vars.get("bandStarts")
         if "windowSize" in loaded_vars:
             windowSize = int(loaded_vars["windowSize"])
 
-        # Backward compatibility: older pickles stored all predictions in-memory.
         if predictionFiles is None and "predList" in loaded_vars:
             predictionFiles = []
             for chrom, predArray in zip(chromNameList, loaded_vars["predList"]):
@@ -494,8 +455,6 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             log.info("Converted legacy in-memory predictions to disk-backed chunks in %s", predictionChunksDir)
 
     if pMode in ["make-matrix", "all"]:
-        # all-mode already submitted every chromosome during the prediction loop.
-        # Most of them have finished by now; this only waits for the tail.
         if pMode == "all" and rebuildAsync:
             matrixFiles = []
             for chrom, matrixFile, result in rebuildAsync:
@@ -513,6 +472,9 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                               pOutfile=matrixname,
                               pChromosomeList=chromNameList)
 
+            # Save visual evaluation plots comparing Random Input, Ground Truth RNA, and Predicted RNA
+            save_visual_results(chromNameList, matrixFiles, predictionChromosomesFolders, outputFolder, windowSize)
+
             parameterFile = os.path.join(outputFolder, pParameterOutputFile)
             with open(parameterFile, "w") as csvfile:
                 dictWriter = csv.DictWriter(csvfile, fieldnames=sorted(list(paramDict.keys())))
@@ -521,7 +483,6 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             return
 
         if pMode == "all":
-            # In all-mode the prediction step produced the chunk file list.
             if "predictionFiles" not in locals():
                 predictionFiles = []
                 for chrom in chromNameList:
@@ -533,21 +494,11 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             log.error("No prediction chunk files found in %s", predictionChunksDir)
             return
 
-        #None when the whole chromosome was predicted, which is the common case
-        #and the behaviour rebuildMatrix defaults to
         if not windowStartsList:
             windowStartsList = [None] * len(chromNameList)
         if not matrixSizeList:
             matrixSizeList = [None] * len(chromNameList)
 
-        #Chromosomes are independent of each other: each one reads its own
-        #prediction chunk and writes its own matrix chunk, and nothing is shared.
-        #So they are rebuilt in parallel, the way hicBuildMatrix parallelises
-        #over regions. The worker is in hicgan.lib.utils rather than here so a
-        #spawned process does not import TensorFlow.
-        #
-        #targetValueRange is applied inside the worker, which is why it must be
-        #a plain tuple rather than anything holding a file handle.
         bandMode = (locals().get("chunkFormat", "band" if locals().get("useBand") else "windows")
                     == "band")
         worker = utils.rebuildChromosomeFromBand if bandMode else utils.rebuildChromosomeToFile
@@ -565,7 +516,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                              tuple(targetValueRange) if targetValueRange is not None else None,
                              multiplier))
             else:
-                jobs.append((predFile, matrixFile, windowSize, windowSize, pSaveMemory,
+                jobs.append((predFile, matrixFile, windowSize, flankingsize, pSaveMemory,
                              windowStarts, matrixSize,
                              tuple(targetValueRange) if targetValueRange is not None else None,
                              multiplier))
@@ -599,36 +550,122 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                       pOutfile=matrixname, 
                       pChromosomeList=chromNameList)
 
+        # Save visual evaluation plots comparing Random Input, Ground Truth RNA, and Predicted RNA
+        save_visual_results(chromNameList, matrixFiles, predictionChromosomesFolders, outputFolder, windowSize)
+
         parameterFile = os.path.join(outputFolder, pParameterOutputFile) 
         with open(parameterFile, "w") as csvfile:
             dictWriter = csv.DictWriter(csvfile, fieldnames=sorted(list(paramDict.keys())))
             dictWriter.writeheader()
             dictWriter.writerow(paramDict)
-        
-       
+
+
+def save_visual_results(chrom_list, matrix_files, chromatin_folder, output_folder, window_size, num_windows=3):
+    """Generate visual plots comparing the chromosome's Random Input, Ground Truth RNA, and Predicted RNA."""
+    if not chromatin_folder:
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    parent_dir = os.path.dirname(os.path.normpath(chromatin_folder))
+    random_dir = os.path.join(parent_dir, "random_input")
+
+    for chrom, mat_file in zip(chrom_list, matrix_files):
+        c_clean = str(chrom).replace("chr", "")
+        gt_path = os.path.join(chromatin_folder, f"chr{c_clean}.npz")
+        if not os.path.exists(gt_path):
+            gt_path = os.path.join(chromatin_folder, f"{c_clean}.npz")
+        if not os.path.exists(gt_path) or not os.path.exists(mat_file):
+            continue
+
+        gt_mat = sparse.load_npz(gt_path).toarray().astype(np.float32)
+        if gt_mat.max() > 0:
+            gt_mat = gt_mat / gt_mat.max()
+
+        pred_sparse = sparse.load_npz(mat_file).toarray().astype(np.float32)
+        # Symmetrize the rebuilt upper-triangular matrix for display and metric comparison
+        pred_mat = pred_sparse + pred_sparse.T - np.diag(np.diag(pred_sparse))
+        if pred_mat.max() > 0:
+            pred_mat = pred_mat / pred_mat.max()
+
+        rand_path = os.path.join(random_dir, f"chr{c_clean}.npy")
+        if os.path.exists(rand_path):
+            rand_mat = np.load(rand_path).astype(np.float32)
+        else:
+            rand_mat = np.zeros_like(gt_mat)
+
+        # Select top windows with highest Ground Truth RNA interaction signal
+        n_bins = gt_mat.shape[0]
+        max_start = max(1, n_bins - window_size)
+        stride = max(1, window_size // 2)
+        scored_windows = []
+        for s in range(0, max_start, stride):
+            score = float(np.sum(np.abs(gt_mat[s:s + window_size, s:s + window_size])))
+            scored_windows.append((score, s))
+        scored_windows.sort(reverse=True, key=lambda x: x[0])
+
+        for w_idx, (_, s) in enumerate(scored_windows[:num_windows], start=1):
+            e = s + window_size
+            r_win = rand_mat[s:e, s:e]
+            g_win = gt_mat[s:e, s:e]
+            p_win = pred_mat[s:e, s:e]
+
+            mse = float(np.mean((g_win - p_win) ** 2))
+            mask = (g_win > 0) | (p_win > 0)
+            if np.sum(mask) > 10 and np.std(g_win[mask]) > 1e-8 and np.std(p_win[mask]) > 1e-8:
+                corr = float(np.corrcoef(g_win[mask].ravel(), p_win[mask].ravel())[0, 1])
+            else:
+                corr = 0.0
+
+            fig, axs = plt.subplots(1, 3, figsize=(15, 4.5))
+            panels = [
+                (r_win, f"Random Input (chr{c_clean})\nBins {s}-{e}"),
+                (g_win, f"Ground Truth RNA (chr{c_clean})\nBins {s}-{e}"),
+                (p_win, f"Predicted RNA\nMSE: {mse:.4f} | Pearson: {corr:.4f}")
+            ]
+            for ax, (img, title) in zip(axs, panels):
+                im = ax.imshow(img, cmap="coolwarm")
+                ax.set_title(title)
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig_path = os.path.join(output_folder, f"pred_chr{c_clean}_win_{w_idx}_bin_{s}.png")
+            fig.savefig(fig_path, dpi=150)
+            plt.close(fig)
+            print(f"  Saved visual plot: {fig_path} (MSE: {mse:.4f}, Pearson: {corr:.4f})")
 
 
 def main(args=None):
     args = parse_arguments().parse_args(args)
-    # print(args)
-    # 1. Get all physical GPUs
+
+    # Resolve chromosomes and RNA folder from --dataDir and --splitFile if provided
+    if args.dataDir and not args.predictionChromosomesFolders:
+        rna_subdir = "rna_gt" if os.path.isdir(os.path.join(args.dataDir, "rna_gt")) else "rna"
+        args.predictionChromosomesFolders = os.path.join(args.dataDir, rna_subdir)
+
+    if args.splitFile and not args.predictionChromosomes:
+        selected_chroms = []
+        target_split = args.split.lower()
+        with open(args.splitFile, "r") as fh:
+            for line in fh:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    chrom, sp_name = parts[0], parts[1].lower()
+                    if target_split == "all" or sp_name == target_split:
+                        selected_chroms.append(chrom)
+        args.predictionChromosomes = selected_chroms
+        print(f"Selected {len(selected_chroms)} '{args.split}' chromosome(s) from {args.splitFile}: {selected_chroms}")
 
     if args.mode == "all" or args.mode == "predict":
         physical_gpus = tf.config.list_physical_devices('GPU')
 
         if physical_gpus:
             try:
-                # Calculate index (assuming args.whichGPU is 1-based data like 1, 2, 3...)
                 index = args.whichGPU - 1
                 if index < 0 or index >= len(physical_gpus):
                     raise ValueError(f"Invalid GPU index: {index}. Available: {len(physical_gpus)}")
 
-                # 2. Key Step: Make ONLY the selected GPU visible to TensorFlow
-                # This prevents TF from touching the memory of the other GPU.
                 tf.config.set_visible_devices(physical_gpus[index], 'GPU')
-
-                # 3. Set memory growth only on the visible device
-                # Note: After setting visibility, we interact with the specific physical object
                 tf.config.experimental.set_memory_growth(physical_gpus[index], True)
 
                 log.info(f"Physically selected GPU: {physical_gpus[index].name}")
@@ -656,3 +693,7 @@ def main(args=None):
         pIncludeRegions=args.includeRegions,
         pTargetValueRange=args.targetValueRange,
         pRebuildProcesses=args.rebuildProcesses)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    main()
