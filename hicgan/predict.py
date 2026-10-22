@@ -75,6 +75,14 @@ def parse_arguments(args=None):
                         default="test",
                         choices=["test", "train", "val", "all"],
                         help="Which split from splitFile to evaluate (default: test)")
+    parser.add_argument("--numWindows", "-nw", required=False,
+                        type=int,
+                        default=5,
+                        help="Number of windows per chromosome to predict and visualize (default: 5)")
+    parser.add_argument("--steps", "-s", required=False,
+                        type=int,
+                        default=25,
+                        help="Number of reverse diffusion steps for prediction (default: 25)")
     parser.add_argument("--targetValueRange", "-tvr", required=False,
                         type=str,
                         help="Undo the [0, 1] mapping that training applied, so the "
@@ -635,6 +643,113 @@ def save_visual_results(chrom_list, matrix_files, chromatin_folder, output_folde
             print(f"  Saved visual plot: {fig_path} (MSE: {mse:.4f}, Pearson: {corr:.4f})")
 
 
+def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, output_folder, window_size, num_windows=5, sample_steps=25):
+    """Directly predict and visualize windows from pre-saved fixed random matrices without building full-chromosome TFRecords or .cool files."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_folder, exist_ok=True)
+    parent_dir = os.path.dirname(os.path.normpath(chromatin_folder))
+    random_dir = os.path.join(parent_dir, "random_input")
+
+    trained_GAN = hicGAN.HiCGAN(log_dir=output_folder, number_factors=1, input_size=window_size, scope=None)
+    trained_GAN.load_denoiser(trainedModelPath=trained_model_path)
+
+    all_mses = []
+    all_corrs = []
+
+    for chrom in chrom_list:
+        c_clean = str(chrom).replace("chr", "")
+        gt_path = os.path.join(chromatin_folder, f"chr{c_clean}.npz")
+        if not os.path.exists(gt_path):
+            gt_path = os.path.join(chromatin_folder, f"{c_clean}.npz")
+        rand_path = os.path.join(random_dir, f"chr{c_clean}.npy")
+
+        if not os.path.exists(gt_path):
+            print(f"Skipping chr{c_clean}: Ground Truth RNA file not found at {gt_path}")
+            continue
+        if not os.path.exists(rand_path):
+            raise FileNotFoundError(
+                f"Pre-generated random matrix not found at {rand_path}. "
+                f"Expected fixed random matrices in {random_dir}."
+            )
+
+        gt_mat = sparse.load_npz(gt_path).toarray().astype(np.float32)
+        if gt_mat.max() > 0:
+            gt_mat = gt_mat / gt_mat.max()
+
+        rand_mat = np.load(rand_path).astype(np.float32)
+
+        n_bins = gt_mat.shape[0]
+        if n_bins < window_size:
+            print(f"Skipping chr{c_clean}: {n_bins} bins < windowSize {window_size}")
+            continue
+
+        # Select top non-overlapping/strided windows with highest Ground Truth RNA signal
+        max_start = max(1, n_bins - window_size)
+        stride = max(1, window_size // 2)
+        scored_windows = []
+        for s in range(0, max_start, stride):
+            score = float(np.sum(np.abs(gt_mat[s:s + window_size, s:s + window_size])))
+            scored_windows.append((score, s))
+        scored_windows.sort(reverse=True, key=lambda x: x[0])
+        selected_starts = [s for _, s in scored_windows[:num_windows]]
+
+        # Batch all selected windows for this chromosome into a single GPU call
+        rand_windows = np.stack([rand_mat[s:s + window_size, s:s + window_size] for s in selected_starts], axis=0)
+        rand_batch = tf.convert_to_tensor(rand_windows[..., np.newaxis], dtype=tf.float32)
+
+        pred_batch = trained_GAN.predictionStep(rand_batch, training=False, sample_steps=sample_steps).numpy()
+        if pred_batch.ndim == 4 and pred_batch.shape[-1] == 1:
+            pred_batch = np.squeeze(pred_batch, axis=-1)
+
+        chrom_mses = []
+        chrom_corrs = []
+        for w_idx, (s, p_win) in enumerate(zip(selected_starts, pred_batch), start=1):
+            e = s + window_size
+            r_win = rand_mat[s:e, s:e]
+            g_win = gt_mat[s:e, s:e]
+
+            mse = float(np.mean((g_win - p_win) ** 2))
+            mask = (g_win > 0) | (p_win > 0)
+            if np.sum(mask) > 10 and np.std(g_win[mask]) > 1e-8 and np.std(p_win[mask]) > 1e-8:
+                corr = float(np.corrcoef(g_win[mask].ravel(), p_win[mask].ravel())[0, 1])
+                if np.isnan(corr):
+                    corr = 0.0
+            else:
+                corr = 0.0
+
+            chrom_mses.append(mse)
+            chrom_corrs.append(corr)
+            all_mses.append(mse)
+            all_corrs.append(corr)
+
+            fig, axs = plt.subplots(1, 3, figsize=(15, 4.5))
+            panels = [
+                (r_win, f"Random Input (chr{c_clean})\nBins {s}-{e}"),
+                (g_win, f"Ground Truth RNA (chr{c_clean})\nBins {s}-{e}"),
+                (p_win, f"Predicted RNA\nMSE: {mse:.4f} | Pearson: {corr:.4f}")
+            ]
+            for ax, (img, title) in zip(axs, panels):
+                im = ax.imshow(img, cmap="coolwarm")
+                ax.set_title(title)
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig_path = os.path.join(output_folder, f"pred_chr{c_clean}_win_{w_idx}_bin_{s}.png")
+            fig.savefig(fig_path, dpi=150)
+            plt.close(fig)
+            print(f"  [chr{c_clean}] Window {w_idx} (bins {s}-{e}): MSE = {mse:.4f}, Pearson = {corr:.4f} -> {fig_path}")
+
+        print(f"chr{c_clean} Summary -> Mean MSE: {np.mean(chrom_mses):.4f} | Mean Pearson: {np.mean(chrom_corrs):.4f}")
+
+    if all_mses:
+        print("=" * 60)
+        print(f"Overall ({len(all_mses)} windows across {len(chrom_list)} chromosomes) -> "
+              f"Mean MSE: {np.mean(all_mses):.4f} | Mean Pearson: {np.mean(all_corrs):.4f}")
+        print("=" * 60)
+
+
 def main(args=None):
     args = parse_arguments().parse_args(args)
 
@@ -675,7 +790,20 @@ def main(args=None):
                 print("Error setting up GPU: {}".format(e))
         else:
             log.info("No GPUs found. Running on CPU.")
-        
+
+    # Fast direct evaluation & visualization on the pre-generated fixed random matrices
+    if args.mode in ["all", "predict"] and args.trainedModel:
+        evaluate_chromosomes_fast(
+            trained_model_path=args.trainedModel,
+            chrom_list=args.predictionChromosomes,
+            chromatin_folder=args.predictionChromosomesFolders,
+            output_folder=args.outputFolder,
+            window_size=args.windowSize,
+            num_windows=args.numWindows,
+            sample_steps=args.steps
+        )
+        return
+
     prediction(pTrainedModel=args.trainedModel,
         pPredictionChromosomesFolders=args.predictionChromosomesFolders,
         pPredictionChromosomes=args.predictionChromosomes,

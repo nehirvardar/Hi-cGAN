@@ -260,37 +260,27 @@ class HiCGAN():
         loss = tf.reduce_mean(tf.square(noise - predicted_noise))
         return loss
 
-    def generate_images(self, model, test_input, tar, epoch: int):
-        rna_condition = test_input["factorData"][:1]
-        real_dna = tar["out_matrixData"][:1]
+    def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
+        rna_condition = tf.cast(test_input["factorData"][:1], tf.float32)
+        real_dna = tf.cast(tar["out_matrixData"][:1], tf.float32)
         batch_size = 1
 
-        x_t = tf.random.normal(shape=(batch_size, self.input_size, self.input_size, 1))
+        # Start reverse diffusion directly from the fixed random matrix window (no new random matrix generated)
+        x_t = rna_condition
+        stride = max(1, self.timesteps // sample_steps)
 
-        for t_step in reversed(range(1, self.timesteps + 1)):
+        for t_step in range(self.timesteps, 0, -stride):
             t_batch = tf.fill([batch_size, 1], tf.cast(t_step, tf.float32))
+            t_prev = max(0, t_step - stride)
             predicted_noise = model([x_t, rna_condition, t_batch], training=False)
 
-            alpha_t = self.alphas[t_step]
             alpha_bar_t = self.alphas_bar[t_step]
-            alpha_bar_prev = self.alphas_bar[t_step - 1]
-            beta_t = self.betas[t_step]
+            alpha_bar_prev = self.alphas_bar[t_prev]
 
-            # Estimate x_0 and clip to [0, 1] RNA target range for reverse-diffusion stability
+            # Deterministic DDIM update to t_prev with clipped x_0 prediction
             x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-
-            posterior_mean = (
-                (tf.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)) * x0_pred +
-                (tf.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * x_t
-            )
-            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-
-            if t_step > 1:
-                noise = tf.random.normal(shape=tf.shape(x_t))
-                x_t = posterior_mean + tf.sqrt(posterior_var) * noise
-            else:
-                x_t = posterior_mean
+            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
         # Enforce symmetry and valid [0, 1] range on the final denoised matrix x_0
         prediction = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
@@ -673,15 +663,15 @@ class HiCGAN():
         return result, allStarts
 
     @tf.function
-    def predictionStep(self, input_batch, training=False, sample_steps: int = 50):
+    def predictionStep(self, input_batch, training=False, sample_steps: int = 25):
 
-        rna_condition = input_batch
+        rna_condition = tf.cast(input_batch, tf.float32)
         if len(rna_condition.shape) == 3:
             rna_condition = tf.expand_dims(rna_condition, axis=-1)
         batch_size = tf.shape(rna_condition)[0]
 
-        x_t = tf.random.normal(shape=(batch_size, self.input_size, self.input_size, 1))
-
+        # Start reverse diffusion directly from the fixed random matrix window (no new random matrix generated)
+        x_t = rna_condition
         stride = tf.maximum(1, self.timesteps // sample_steps)
 
         for t_step in tf.range(self.timesteps, 0, -stride):
@@ -690,25 +680,13 @@ class HiCGAN():
 
             predicted_noise = self.denoiser([x_t, rna_condition, t_batch], training=False)
 
-            # Compute effective alpha and beta across the strided interval (t_prev -> t_step)
             alpha_bar_t = self.alphas_bar[t_step]
             alpha_bar_prev = self.alphas_bar[t_prev]
-            alpha_step = alpha_bar_t / alpha_bar_prev
-            beta_step = 1.0 - alpha_step
 
-            # Estimate x_0 and clip to [0, 1] to prevent negative/unbounded drift
+            # Deterministic DDIM step using the fixed random input trajectory
             x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-
-            posterior_mean = (
-                (tf.sqrt(alpha_bar_prev) * beta_step / (1.0 - alpha_bar_t)) * x0_pred +
-                (tf.sqrt(alpha_step) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * x_t
-            )
-            posterior_var = beta_step * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
-
-            noise = tf.random.normal(shape=tf.shape(x_t))
-            noise_term = tf.where(t_prev > 0, tf.sqrt(posterior_var) * noise, tf.zeros_like(x_t))
-            x_t = posterior_mean + noise_term
+            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
         # Enforce symmetry and [0, 1] bounds on the final denoised matrix x_0
         x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))

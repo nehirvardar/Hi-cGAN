@@ -51,7 +51,6 @@ class DataContainer():
 
         import glob
         import os
-        import zlib
         import numpy as np
         import scipy.sparse as sp
 
@@ -83,26 +82,18 @@ class DataContainer():
 
             self.FactorDataArray = factor_matrix
 
-            # Create or load 1 fixed random matrix per chromosome so training and testing share the same matrix
+            # Load the pre-saved fixed random matrix for this chromosome from data/random_input/
             parent_dir = os.path.dirname(os.path.normpath(self.chromatinFolder))
             random_dir = os.path.join(parent_dir, "random_input")
-            os.makedirs(random_dir, exist_ok=True)
             random_file = os.path.join(random_dir, f"chr{c_clean}.npy")
 
-            if os.path.exists(random_file):
-                rand_mat = np.load(random_file).astype(np.float32)
-                if rand_mat.shape != factor_matrix.shape:
-                    chrom_seed = zlib.crc32(f"chr{c_clean}".encode("utf-8"))
-                    rng = np.random.default_rng(chrom_seed)
-                    rand_mat = rng.normal(0.0, 1.0, size=factor_matrix.shape).astype(np.float32)
-                    np.save(random_file, rand_mat)
-            else:
-                chrom_seed = zlib.crc32(f"chr{c_clean}".encode("utf-8"))
-                rng = np.random.default_rng(chrom_seed)
-                rand_mat = rng.normal(0.0, 1.0, size=factor_matrix.shape).astype(np.float32)
-                np.save(random_file, rand_mat)
+            if not os.path.exists(random_file):
+                raise FileNotFoundError(
+                    f"Pre-generated random matrix not found at {random_file}. "
+                    f"Expected fixed random matrices in {random_dir}."
+                )
 
-            self.RandomInputArray = rand_mat
+            self.RandomInputArray = np.load(random_file).astype(np.float32)
 
             if self.binSize is None:
                 self.binSize = 250000  # Default 250kb resolution for RNA matrices
@@ -111,7 +102,7 @@ class DataContainer():
             self.nr_factors = 1
             self.factorNames = [os.path.basename(npz_file)]
 
-            print(f"[{self.chromosome}] RNA GT matrix {self.FactorDataArray.shape} and fixed random matrix loaded ({random_file})")
+            print(f"[{self.chromosome}] Loaded RNA GT {self.FactorDataArray.shape} and Random Input ({random_file})")
 
         except Exception as e:
             raise IOError(f"Error while loading RNA data: {e}")

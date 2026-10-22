@@ -142,6 +142,5 @@ logs/
 hicgan/output_model/
 hicgan/test_results/
 hicgan/data/gt/
-hicgan/data/random_input/
 output/
 01_core/
