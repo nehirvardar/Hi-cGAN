@@ -60,8 +60,15 @@ def writeTFRecord(pFilename: str, pRecordDict: dict):
             example = tf.train.Example(features=tf.train.Features(feature=feature))
             writer.write(example.SerializeToString())
 
-def mirror_function(tensor1, tensor2):
-    t1 = tf.reverse(tensor1, axis=[0])
-    t2 = tf.transpose(tensor2, perm=(1,0,2))
+def mirror_function(tensor1, tensor2, is_2d_input=False, is_grid_mode=False):
+    if is_2d_input or (tensor1.shape.rank == 3 and tensor1.shape[0] == tensor1.shape[1]):
+        t1 = tf.transpose(tensor1, perm=(1, 0, 2))
+        t1 = tf.image.rot90(t1, 2)
+    else:
+        t1 = tf.reverse(tensor1, axis=[0])
+        if is_grid_mode:
+            half_f = tf.shape(t1)[1] // 2
+            t1 = tf.concat([t1[:, half_f:, :], t1[:, :half_f, :]], axis=1)
+    t2 = tf.transpose(tensor2, perm=(1, 0, 2))
     t2 = tf.image.rot90(t2, 2)
     return {"factorData": t1}, {"out_matrixData": t2}

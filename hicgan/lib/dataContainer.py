@@ -14,17 +14,28 @@ log = logging.getLogger(__name__)
 
 
 class DataContainer():
-    def __init__(self, chromosome, matrixFilePath, chromatinFolder, binSize=None):
+    def __init__(self, chromosome, matrixFilePath, chromatinFolder, binSize=None,
+                 inputMode=None, numBins=None, randomSeed=None):
         self.chromosome = str(chromosome)
         self.matrixFilePath = matrixFilePath
         self.chromatinFolder = chromatinFolder
+        if inputMode is None:
+            if chromatinFolder is None or str(chromatinFolder).lower() in ("random", "random2d", "none", ""):
+                self.inputMode = "random2d"
+            else:
+                self.inputMode = "bigwig"
+        else:
+            self.inputMode = str(inputMode).lower()
         self.FactorDataArray = None
+        self.RandomMatrix2D = None
         self.nr_factors = None
         self.sparseHiCMatrix = None
         self.sequenceArray = None
-        self.binSize = None
-        if matrixFilePath is None: #otherwise it will be defined by the Hi-C matrix itself upon loading
-            self.binSize = binSize
+        self.binSize = binSize
+        self.numBins = int(numBins) if numBins is not None else None
+        self.original_num_bins = int(numBins) if numBins is not None else None
+        self.padded_bins = 0
+        self.randomSeed = randomSeed
         self.factorNames = None
         self.prefixDict_factors = None
         self.prefixDict_matrix = None
@@ -36,6 +47,11 @@ class DataContainer():
         self.windowSize = None
         self.flankingSize = None
         self.maximumDistance = None
+        self.windowMode = "diagonal"
+        self.gridStride = None
+        self.gridCoordinates = None
+        self.padShortChromosomes = True
+        self.logTransformTarget = False
         self.minTargetCoverage = 0.0
         self.excludedRegions = None
         self.includedRegions = None
@@ -44,6 +60,35 @@ class DataContainer():
         self.data_loaded = False
 
     def __loadFactorData(self, ignoreChromLengths=False, scaleFeatures=False, clampFeatures=False):
+        if self.inputMode == "random2d":
+            nr_bins = None
+            if self.sparseHiCMatrix is not None:
+                nr_bins = int(self.sparseHiCMatrix.shape[0])
+            elif self.numBins is not None:
+                nr_bins = int(self.numBins)
+            elif self.chromatinFolder is not None and utils.isNpzMatrixSource(self.chromatinFolder):
+                chromBins = utils.getChromBinsFromNpzSource(self.chromatinFolder)
+                nr_bins = chromBins.get(str(self.chromosome).lstrip("chr"))
+            if nr_bins is None or nr_bins <= 0:
+                msg = (
+                    f"Cannot determine bin count (n_bins) for chromosome '{self.chromosome}' in random2d mode. "
+                    f"Provide a target .npz/.cool matrix, numBins, or --chromSizesPath pointing to chrom_index.csv / .npz folder."
+                )
+                raise ValueError(msg)
+            if self.original_num_bins is None:
+                self.original_num_bins = nr_bins
+            self.numBins = nr_bins
+            if self.binSize is None:
+                self.binSize = utils.inferBinSizeFromPath(self.matrixFilePath or self.chromatinFolder, 250000)
+            self.chromSize_factors = int(nr_bins * self.binSize)
+            self.RandomMatrix2D = utils.generateSymmetricRandomMatrix(
+                pNumBins=nr_bins, pSeed=self.randomSeed, pChrom=self.chromosome
+            )
+            self.FactorDataArray = self.RandomMatrix2D
+            self.factorNames = ["random2d"]
+            self.nr_factors = 1
+            return
+
         #load chromatin factor data from bigwig files
         if self.chromatinFolder is None:
             return
@@ -55,7 +100,7 @@ class DataContainer():
         #get the names of the bigwigfiles
         bigwigFileList = utils.getBigwigFileList(self.chromatinFolder)
         bigwigFileList = sorted(bigwigFileList)
-        if len(bigwigFileList) is None:
+        if len(bigwigFileList) is None or len(bigwigFileList) == 0:
             msg = "Warning: folder {:s} does not contain any bigwig files"
             msg = msg.format(self.chromatinFolder)
             print(msg)
@@ -82,21 +127,25 @@ class DataContainer():
             chromSize_factors = min(chromSizeList)
         else:
             chromSize_factors = chromSizeList[0]
-        #the chromosome lengths of matrices and bigwig files must be equal
-        if self.chromSize_matrix is not None \
-                and self.chromSize_matrix != chromSize_factors:
-            msg = "Chrom lengths not equal between matrix and bigwig files\n"
-            msg += "Matrix: {:d} -- Factors: {:d}".format(self.chromSize_matrix, chromSize_factors)
-            raise IOError(msg)
+        nr_bins = int( np.ceil(chromSize_factors / self.binSize) )
+        if self.sparseHiCMatrix is not None and not utils.isNpzMatrixSource(self.matrixFilePath):
+            if self.chromSize_matrix is not None and self.chromSize_matrix != chromSize_factors:
+                msg = "Chrom lengths not equal between matrix and bigwig files\n"
+                msg += "Matrix: {:d} -- Factors: {:d}".format(self.chromSize_matrix, chromSize_factors)
+                raise IOError(msg)
         #load the data into memory now
         self.factorNames = [os.path.splitext(os.path.basename(name))[0] for name in bigwigFileList]
-        self.nr_factors = len(self.factorNames)
+        base_factors = len(self.factorNames)
+        self.nr_factors = base_factors * 2 if self.windowMode == "grid" else base_factors
         self.prefixDict_factors = prefixDict_factors
         self.chromSize_factors = chromSize_factors
-        nr_bins = int( np.ceil(self.chromSize_factors / self.binSize) )
         self.FactorDataArray = np.empty(shape=(len(bigwigFileList),nr_bins))
-        msg = "Loaded {:d} chromatin features from folder {:s}\n"
-        msg = msg.format(self.nr_factors, self.chromatinFolder)
+        if self.windowMode == "grid":
+            msg = "Loaded {:d} chromatin features (x2 for grid row/col pairs = {:d} input channels) from folder {:s}\n"
+            msg = msg.format(base_factors, self.nr_factors, self.chromatinFolder)
+        else:
+            msg = "Loaded {:d} chromatin features from folder {:s}\n"
+            msg = msg.format(self.nr_factors, self.chromatinFolder)
         featLoadedMsgList = [] #pretty printing for features loaded
 
         def process_bigwig_file(bigwigFile):
@@ -111,14 +160,6 @@ class DataContainer():
                 tmpArray = utils.scaleArray(tmpArray)
             return tmpArray
 
-        #The row a track is written to is its position in the sorted file list,
-        #not the order in which its thread happened to finish. as_completed()
-        #yields in completion order, so enumerating it and using that index put
-        #each track in whichever row it won the race for: with two or more
-        #bigwig files the channel order of FactorDataArray varied from run to
-        #run, and within a run from chromosome to chromosome, while
-        #self.factorNames stayed sorted. The log line named the wrong file for
-        #the same reason.
         results = [None] * len(bigwigFileList)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futureToIndex = {executor.submit(process_bigwig_file, bigwigFile): i
@@ -134,30 +175,76 @@ class DataContainer():
             featLoadedMsgList.append(msg2)
         self.FactorDataArray = np.transpose(self.FactorDataArray)
         print(msg + "\n".join(featLoadedMsgList))
+
+        # Align BigWig bin count with .npz target matrix (during training) or numBins from chrom_index.csv (during prediction)
+        target_bins = None
+        if self.sparseHiCMatrix is not None and utils.isNpzMatrixSource(self.matrixFilePath):
+            target_bins = int(self.sparseHiCMatrix.shape[0])
+        elif self.numBins is not None:
+            target_bins = int(self.numBins)
+
+        if target_bins is not None and self.FactorDataArray.shape[0] != target_bins:
+            bw_bins = int(self.FactorDataArray.shape[0])
+            if bw_bins > target_bins:
+                self.FactorDataArray = self.FactorDataArray[:target_bins, :]
+                align_msg = (
+                    f"[BIGWIG-ALIGN] Chromosome {self.chromosome}: BigWig bins ({bw_bins}) > target .npz bins ({target_bins}). "
+                    f"Cropped BigWig features to {target_bins} bins."
+                )
+            else:
+                pad_bw = target_bins - bw_bins
+                self.FactorDataArray = np.pad(
+                    self.FactorDataArray,
+                    ((0, pad_bw), (0, 0)),
+                    mode="constant",
+                    constant_values=0.0
+                )
+                align_msg = (
+                    f"[BIGWIG-ALIGN] Chromosome {self.chromosome}: BigWig bins ({bw_bins}) < target .npz bins ({target_bins}). "
+                    f"Zero-padded BigWig features by +{pad_bw} bins to {target_bins} bins."
+                )
+            log.info(align_msg)
+            print(align_msg, flush=True)
+            nr_bins = target_bins
+            self.chromSize_factors = int(nr_bins * self.binSize)
+
+        if self.original_num_bins is None:
+            self.original_num_bins = nr_bins
+        self.numBins = nr_bins
             
     def __loadMatrixData(self, scaleMatrix=False):
-        #load Hi-C matrix from cooler file
+        #load target matrix from .npz folder/file or cooler file
         if self.matrixFilePath is None:
             return
+        is_npz = utils.isNpzMatrixSource(self.matrixFilePath)
         try:
-            prefixDict_matrix = {self.matrixFilePath: utils.getChromPrefixCooler(self.matrixFilePath)}
-            chromname = prefixDict_matrix[self.matrixFilePath] + self.chromosome
-            chromsize_matrix = utils.getChromSizesFromCooler(self.matrixFilePath)[chromname]
-            sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname)
-        except:
-            msg = "Error: Could not load data from Hi-C matrix {:s}"
-            msg = msg.format(self.matrixFilePath)
+            if is_npz:
+                sparseHiCMatrix, binSize = utils.getMatrixFromNpz(
+                    self.matrixFilePath, self.chromosome, pBinSizeInt=self.binSize
+                )
+                chromsize_matrix = int(sparseHiCMatrix.shape[0] * binSize)
+            else:
+                prefixDict_matrix = {self.matrixFilePath: utils.getChromPrefixCooler(self.matrixFilePath)}
+                chromname = prefixDict_matrix[self.matrixFilePath] + self.chromosome
+                chromsize_matrix = utils.getChromSizesFromCooler(self.matrixFilePath)[chromname]
+                sparseHiCMatrix, binSize = utils.getMatrixFromCooler(self.matrixFilePath, chromname)
+        except Exception as e:
+            msg = "Error: Could not load data from target matrix {:s} for chr{:s}: {:s}"
+            msg = msg.format(str(self.matrixFilePath), str(self.chromosome), str(e))
             raise IOError(msg)
         #scale to 0..1, if requested
         if scaleMatrix:
             sparseHiCMatrix = utils.scaleArray(sparseHiCMatrix)       
         #ensure that chrom sizes for matrix and factors are the same
-        if self.chromSize_factors is not None and self.chromSize_factors != chromsize_matrix:
-            msg = "Chromsize of matrix does not match bigwig files\n"
-            msg += "Matrix: {:d} -- Bigwig files: {:d}"
-            msg = msg.format(chromsize_matrix, self.chromSize_factors)
-            raise IOError(msg)
+        if self.chromSize_factors is not None and not is_npz and self.chromSize_matrix != chromsize_matrix:
+            if self.chromSize_factors != chromsize_matrix:
+                msg = "Chromsize of matrix does not match bigwig files\n"
+                msg += "Matrix: {:d} -- Bigwig files: {:d}"
+                msg = msg.format(chromsize_matrix, self.chromSize_factors)
+                raise IOError(msg)
         self.chromSize_matrix = chromsize_matrix
+        self.original_num_bins = int(sparseHiCMatrix.shape[0])
+        self.numBins = int(sparseHiCMatrix.shape[0])
         #ensure that binSizes for matrix and factors (if given) match
         if self.binSize is None or self.binSize == binSize:
             self.binSize = binSize
@@ -167,14 +254,19 @@ class DataContainer():
             msg += "Matrix: {:d} -- Binned chromatin factors {:d}"
             msg = msg.format(binSize, self.binSize)
             raise IOError(msg)
-        msg = "Loaded cooler matrix {:s}\n".format(self.matrixFilePath)
-        msg += "chr. {:s}, matshape {:d}*{:d} -- min. {:d} -- max. {:d} -- nnz. {:d}"
-        msg = msg.format(self.chromosome, self.sparseHiCMatrix.shape[0], self.sparseHiCMatrix.shape[1], int(self.sparseHiCMatrix.min()), int(self.sparseHiCMatrix.max()), self.sparseHiCMatrix.getnnz() )
+        src_type = "npz" if is_npz else "cooler"
+        dmin = float(self.sparseHiCMatrix.min()) if self.sparseHiCMatrix.nnz > 0 else 0.0
+        dmax = float(self.sparseHiCMatrix.max()) if self.sparseHiCMatrix.nnz > 0 else 0.0
+        msg = "Loaded {:s} matrix {:s}\n".format(src_type, str(self.matrixFilePath))
+        msg += "chr. {:s}, matshape {:d}*{:d} -- min. {:.3f} -- max. {:.3f} -- nnz. {:d}"
+        msg = msg.format(self.chromosome, self.sparseHiCMatrix.shape[0], self.sparseHiCMatrix.shape[1], dmin, dmax, self.sparseHiCMatrix.getnnz() )
+        log.info(msg.replace("\n", " | "))
         print(msg)
     
     def __unloadFactorData(self):
         #unload chromatin factor data to save memory, but do not touch metadata 
         self.FactorDataArray = None
+        self.RandomMatrix2D = None
         
     def __unloadMatrixData(self):
         #unload matrix data to save memory, but do not touch metadata
@@ -188,26 +280,130 @@ class DataContainer():
         self.flankingSize = None
         self.maximumDistance = None
         self.sampleIndices = None
+        self.gridCoordinates = None
         self.excludedRegions = None
         self.includedRegions = None
         self.targetValueRange = None
         self.data_loaded = False
 
-    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None):
+    def __applyPaddingIfNeeded(self):
+        """Automatically pad short chromosomes so they have at least windowSize + 2*flankingSize bins, and log details."""
+        required_bins = int(self.windowSize + 2 * self.flankingSize)
+        n_bins = self.__getNumberBins()
+        if self.original_num_bins is None and n_bins > 0:
+            self.original_num_bins = int(n_bins)
+
+        if n_bins <= 0 or n_bins >= required_bins or not self.padShortChromosomes:
+            self.padded_bins = 0
+            log.info(
+                "[PADDING] Chromosome %s: original_bins=%d >= required_bins=%d (windowSize=%d, flankingSize=%d) -> no padding needed.",
+                str(self.chromosome), n_bins, required_bins, self.windowSize, self.flankingSize
+            )
+            return
+
+        pad_bins = required_bins - n_bins
+        self.padded_bins = int(pad_bins)
+
+        if self.sparseHiCMatrix is not None:
+            csr = self.sparseHiCMatrix.tocsr()
+            padded_indptr = np.concatenate([
+                csr.indptr,
+                np.full(pad_bins, csr.indptr[-1], dtype=csr.indptr.dtype)
+            ])
+            self.sparseHiCMatrix = csr_matrix(
+                (csr.data.copy(), csr.indices.copy(), padded_indptr),
+                shape=(required_bins, required_bins),
+                dtype=csr.dtype
+            )
+
+        if self.inputMode == "random2d" and self.RandomMatrix2D is not None:
+            self.RandomMatrix2D = np.pad(
+                self.RandomMatrix2D,
+                ((0, pad_bins), (0, pad_bins)),
+                mode="constant",
+                constant_values=0.0
+            )
+            self.FactorDataArray = self.RandomMatrix2D
+        elif self.FactorDataArray is not None:
+            self.FactorDataArray = np.pad(
+                self.FactorDataArray,
+                ((0, pad_bins), (0, 0)),
+                mode="constant",
+                constant_values=0.0
+            )
+
+        self.numBins = required_bins
+        if self.binSize is not None:
+            self.chromSize_factors = int(required_bins * self.binSize)
+            if self.chromSize_matrix is not None:
+                self.chromSize_matrix = int(required_bins * self.binSize)
+
+        msg = (
+            f"[PADDING] Chromosome {self.chromosome}: original_bins={n_bins} < required_bins={required_bins} "
+            f"(windowSize={self.windowSize}, flankingSize={self.flankingSize}, inputMode={self.inputMode}, "
+            f"windowMode={self.windowMode}). Added +{pad_bins} zero-padded bins at chromosome end -> "
+            f"new_shape=({required_bins}, {required_bins})."
+        )
+        log.info(msg)
+        print(msg, flush=True)
+
+    def __buildGridCoordinates(self):
+        """Build 2D upper-triangle grid coordinates (row_start, col_start) when windowMode == 'grid'."""
+        if self.windowMode != "grid":
+            self.gridCoordinates = None
+            return
+        n_bins = self.__getNumberBins()
+        cutout = int(self.windowSize + 2 * self.flankingSize)
+        max_start = max(0, n_bins - cutout)
+        stride = int(self.gridStride) if (self.gridStride is not None and int(self.gridStride) > 0) else max(1, self.windowSize // 2)
+        self.gridStride = stride
+        starts = list(range(0, max_start + 1, stride))
+        if len(starts) == 0 or starts[-1] != max_start:
+            starts.append(max_start)
+        coords = []
+        for i_idx, r in enumerate(starts):
+            for c in starts[i_idx:]:
+                coords.append((r, c))
+        self.gridCoordinates = np.asarray(coords, dtype=np.int64)
+        msg = (
+            f"[WINDOW-GRID] Chromosome {self.chromosome}: windowMode=grid, windowSize={self.windowSize}, "
+            f"gridStride={stride}, 1D_positions={len(starts)}, upper_triangle_windows={len(coords)} "
+            f"(matrix_bins={n_bins}, original_bins={self.original_num_bins})"
+        )
+        log.info(msg)
+        print(msg, flush=True)
+
+    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False,
+                 scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None,
+                 targetValueRange=None, inputMode=None, windowMode="diagonal", gridStride=None,
+                 padShortChromosomes=True, logTransformTarget=False, randomSeed=None):
         if not isinstance(windowSize, int):
             msg = "windowSize must be integer"
             raise TypeError(msg)
+        if inputMode is not None:
+            self.inputMode = str(inputMode).lower()
+        if randomSeed is not None:
+            self.randomSeed = randomSeed
+        self.windowMode = str(windowMode).lower() if windowMode else "diagonal"
+        self.gridStride = gridStride
+        self.padShortChromosomes = bool(padShortChromosomes)
+        self.logTransformTarget = bool(logTransformTarget)
+        if flankingSize is None:
+            flankingSize = 0 if self.inputMode == "random2d" else windowSize
         if isinstance(maximumDistance, int):
-            maximumDistance = np.clip(maximumDistance, a_min=1, a_max=self.windowSize)
-        self.__loadMatrixData(scaleMatrix=scaleTargets)
-        self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
+            maximumDistance = np.clip(maximumDistance, a_min=1, a_max=windowSize)
         self.windowSize = windowSize
-        self.flankingSize = flankingSize
+        self.flankingSize = int(flankingSize)
         self.maximumDistance = maximumDistance
         self.minTargetCoverage = float(minTargetCoverage)
         self.excludedRegions = excludedRegions
         self.includedRegions = includedRegions
         self.targetValueRange = targetValueRange
+
+        self.__loadMatrixData(scaleMatrix=scaleTargets)
+        self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
+        self.__applyPaddingIfNeeded()
+        self.__buildGridCoordinates()
         self.data_loaded = True
         self.__computeSampleIndices()
 
@@ -232,20 +428,21 @@ class DataContainer():
         windowSizeOK = self.windowSize == container.windowSize
         flankingSizeOK = self.flankingSize == container.flankingSize
         maximumDistanceOK = self.maximumDistance == container.maximumDistance
+        modeOK = (self.inputMode == container.inputMode) and (self.windowMode == container.windowMode)
         log.debug("Factors: {:s} -- Matrix: {:s} -- windowSize: {:s} -- flankingSize: {:s} -- maximumDistance: {:s}".format(str(factorsOK), str(matrixOK), str(windowSizeOK), str(flankingSizeOK), str(maximumDistanceOK)))
         log.debug("Chromatin folder: {:s} -- Nr. factors: {:s}".format(str(self.chromatinFolder), str(self.nr_factors)))
         log.debug("Chromatin folder: {:s} -- Nr. factors: {:s}".format(str(container.chromatinFolder), str(container.nr_factors)))
         #sanity check loading of bigwig files
-        if self.chromatinFolder is not None and self.nr_factors is None:
+        if self.inputMode == "bigwig" and self.chromatinFolder is not None and self.nr_factors is None:
             return False
-        if container.chromatinFolder is not None and container.nr_factors is None:
+        if container.inputMode == "bigwig" and container.chromatinFolder is not None and container.nr_factors is None:
             return False
         #if chromatin factors are present, the numbers and names of chromatin factors must match
         factorsOK = factorsOK and (self.nr_factors == container.nr_factors)
         # factorsOK = factorsOK and (self.factorNames == container.factorNames)
         log.debug("self.nr_factors: {:d} -- container.nr_factors: {:d}".format(self.nr_factors, container.nr_factors))
         log.debug("self.factorNames: {:s} -- container.factorNames: {:s}".format(str(self.factorNames), str(container.factorNames)))
-        return factorsOK and matrixOK and windowSizeOK and flankingSizeOK and maximumDistanceOK
+        return factorsOK and matrixOK and windowSizeOK and flankingSizeOK and maximumDistanceOK and modeOK
         
     def writeTFRecord(self, pOutputFolder, pRecordSize=None, pSaveMemory=False, pThreads=4):
         '''
@@ -283,8 +480,13 @@ class DataContainer():
         samples_per_file = [target_ct]*(nr_files-1) + [nr_samples-(nr_files-1)*target_ct]
         sample_indices = [sum(samples_per_file[0:i]) for i in range(len(samples_per_file)+1)] 
         #write the single files
-        folderName = self.chromatinFolder.strip("/").replace("/","_")
+        rawFolder = self.chromatinFolder if self.chromatinFolder else f"{self.inputMode}_{self.windowMode}"
+        folderName = str(rawFolder).strip("/").replace("/","_")
         recordfiles = [os.path.join(pOutputFolder, "{:s}_{:s}_{:03d}.tfrecord".format(folderName, str(self.chromosome), i + 1)) for i in range(nr_files)]
+        log.info(
+            "[TFRECORD] Writing %d samples for chr%s across %d file(s) (inputMode=%s, windowMode=%s)",
+            nr_samples, str(self.chromosome), nr_files, self.inputMode, self.windowMode
+        )
 
         def storeTFRecord(recordfile, firstIndex, lastIndex, outfolder):
             log.debug("Prepare dict...")
@@ -319,9 +521,7 @@ class DataContainer():
         '''
         True if this chromosome has enough bins (at the current binSize) to
         produce at least one sliding-window sample for the configured
-        windowSize/flankingSize. The sliding window spans
-        windowSize + 2*flankingSize bins, so chromosomes that are short
-        relative to the chosen resolution (large binSize) yield no samples.
+        windowSize/flankingSize.
         '''
         if not self.data_loaded or self.FactorDataArray is None:
             return False
@@ -331,10 +531,7 @@ class DataContainer():
     def getBinCoverage(self):
         '''
         Boolean array, one entry per bin of the Hi-C matrix, True where the bin
-        has at least one contact. Bins inside a gap of the matrix (unmappable
-        regions, or the windows a published dataset simply does not cover, such
-        as Akita's target folds) have an all-zero row and come out False.
-        Returns None if no matrix is loaded.
+        has at least one contact.
         '''
         if self.sparseHiCMatrix is None:
             return None
@@ -342,18 +539,6 @@ class DataContainer():
         return rowNnz > 0
 
     def __binsFromBed(self, pPathList, pLabel):
-        '''
-        Boolean array, one entry per bin, True where the bin overlaps a region
-        listed in the given BED file(s). Returns None if no file was given or
-        none of its regions falls on this chromosome.
-
-        Both naming conventions are accepted in the BED file, "chr21" and "21",
-        regardless of which one the matrix and the bigwig files use.
-
-        Shared by getExcludedBins and getIncludedBins: the two differ only in
-        what the caller does with the result, so parsing lived in one of them
-        and was about to be copied into the other.
-        '''
         if not pPathList:
             return None
         pathList = pPathList
@@ -387,8 +572,6 @@ class DataContainer():
                         continue
                     if end <= start:
                         continue
-                    #BED is half-open and 0-based, so a region ending exactly on a
-                    #bin boundary must not mark the following bin
                     firstBin = max(0, start // self.binSize)
                     lastBin = min(nr_bins, int(np.ceil(end / float(self.binSize))))
                     if lastBin > firstBin:
@@ -402,20 +585,9 @@ class DataContainer():
         return marked
 
     def getExcludedBins(self):
-        '''
-        Bins overlapping a region of the excludedRegions BED file(s).
-        '''
         return self.__binsFromBed(self.excludedRegions, "excluded")
 
     def getIncludedBins(self):
-        '''
-        Bins overlapping a region of the includedRegions BED file(s).
-
-        This is the counterpart used at PREDICTION time: it restricts the
-        sliding window to a named set of loci instead of running over the whole
-        chromosome. The intended use is to predict exactly the regions that were
-        held out of training, so nothing the model was fitted on is scored.
-        '''
         return self.__binsFromBed(self.includedRegions, "included")
 
     def __getNumberBins(self):
@@ -423,48 +595,11 @@ class DataContainer():
             return self.sparseHiCMatrix.shape[0]
         if self.FactorDataArray is not None:
             return self.FactorDataArray.shape[0]
+        if self.numBins is not None:
+            return int(self.numBins)
         return 0
 
     def __computeSampleIndices(self):
-        '''
-        Decide which sliding-window positions are used as samples.
-
-        By default every position is used, self.sampleIndices stays None and
-        nothing about the container changes. Two filters can restrict the set,
-        and they combine:
-
-        1. minTargetCoverage > 0 drops the positions whose TARGET submatrix lies
-           in a gap of the Hi-C matrix, instead of handing them to the model as
-           a block of zeros. This matters because __getMatrixData() runs the
-           target through nan_to_num, so a missing region is indistinguishable
-           from a region of genuinely zero contacts: the model is otherwise
-           taught to predict an empty map wherever the data happen to be absent.
-           On Akita's published GM12878 train fold, for instance, 25 % of the
-           window positions on the training chromosomes fall into such gaps.
-
-           Coverage is measured per bin rather than per pixel (see
-           getBinCoverage); gaps are contiguous stretches of the matrix with no
-           contacts at all, so the two agree, and the per-bin form is O(n)
-           instead of O(n * windowSize^2).
-
-        2. excludedRegions drops every position whose target window overlaps a
-           region listed in a BED file. Use it to hold regions out of training
-           deliberately: another method's test set, a blacklist, a locus kept
-           for evaluation. The overlap is tested against the target window only.
-           Chromatin features from the flanks may still reach into an excluded
-           region, which is intended: no label from that region is ever used,
-           but the model still sees the context around the windows it keeps.
-
-        3. includedRegions is the mirror image, used at prediction time: keep
-           ONLY the positions whose target window lies ENTIRELY inside a region
-           listed in a BED file. Containment, not overlap, and deliberately so.
-           It makes filter 3 the exact complement of filter 2: a window that
-           training dropped for touching an excluded region is a window that
-           overlaps it, and the windows fully inside are a subset of those. So
-           predicting with includedRegions = the same BED that training was
-           given as excludedRegions cannot produce a window containing a single
-           bin the model was fitted on.
-        '''
         self.sampleIndices = None
         excluded = self.getExcludedBins()
         included = self.getIncludedBins()
@@ -478,39 +613,61 @@ class DataContainer():
         nr_samples = self.__getNumberRawSamples()
         if not nr_samples:
             return
-        flankingSize = self.flankingSize if self.flankingSize is not None else self.windowSize
+        flankingSize = self.flankingSize if self.flankingSize is not None else (0 if self.inputMode == "random2d" else self.windowSize)
         nr_bins = self.__getNumberBins()
-        startInd = np.arange(nr_samples) + flankingSize
-        #windows running past the end of the matrix (the factor array can be
-        #longer than the matrix) count the missing bins as uncovered
-        stopInd = np.minimum(startInd + self.windowSize, nr_bins)
 
-        keep = np.ones(nr_samples, dtype=bool)
-        nr_gaps = 0
-        nr_excluded = 0
-        nr_outside = 0
-        if useCoverage:
-            #cumulative sum gives the covered-bin count of every window in one pass
-            cumulative = np.concatenate(([0], np.cumsum(self.getBinCoverage())))
-            coverage = (cumulative[stopInd] - cumulative[startInd]) / float(self.windowSize)
-            coverageOK = coverage >= self.minTargetCoverage
-            nr_gaps = int((~coverageOK).sum())
-            keep &= coverageOK
-        if excluded is not None:
-            cumulativeExcl = np.concatenate(([0], np.cumsum(excluded)))
-            untouched = (cumulativeExcl[stopInd] - cumulativeExcl[startInd]) == 0
-            nr_excluded = int((~untouched).sum())
-            keep &= untouched
-        if included is not None:
-            #fully contained: every bin of the target window is marked. The
-            #window length is stopInd - startInd rather than self.windowSize,
-            #because a window running past the end of the matrix is shorter and
-            #comparing against the nominal size would reject all of them.
-            cumulativeIncl = np.concatenate(([0], np.cumsum(included)))
-            inside = ((cumulativeIncl[stopInd] - cumulativeIncl[startInd])
-                      == (stopInd - startInd))
-            nr_outside = int((~inside).sum())
-            keep &= inside
+        if self.windowMode == "grid" and self.gridCoordinates is not None:
+            rStart = self.gridCoordinates[:, 0] + flankingSize
+            cStart = self.gridCoordinates[:, 1] + flankingSize
+            rStop = np.minimum(rStart + self.windowSize, nr_bins)
+            cStop = np.minimum(cStart + self.windowSize, nr_bins)
+            keep = np.ones(nr_samples, dtype=bool)
+            nr_gaps = 0
+            nr_excluded = 0
+            nr_outside = 0
+            if useCoverage:
+                cumulative = np.concatenate(([0], np.cumsum(self.getBinCoverage())))
+                covR = (cumulative[rStop] - cumulative[rStart]) / float(self.windowSize)
+                covC = (cumulative[cStop] - cumulative[cStart]) / float(self.windowSize)
+                coverageOK = (covR >= self.minTargetCoverage) & (covC >= self.minTargetCoverage)
+                nr_gaps = int((~coverageOK).sum())
+                keep &= coverageOK
+            if excluded is not None:
+                cumulativeExcl = np.concatenate(([0], np.cumsum(excluded)))
+                untouched = ((cumulativeExcl[rStop] - cumulativeExcl[rStart]) == 0) & ((cumulativeExcl[cStop] - cumulativeExcl[cStart]) == 0)
+                nr_excluded = int((~untouched).sum())
+                keep &= untouched
+            if included is not None:
+                cumulativeIncl = np.concatenate(([0], np.cumsum(included)))
+                inside = (((cumulativeIncl[rStop] - cumulativeIncl[rStart]) == (rStop - rStart)) &
+                          ((cumulativeIncl[cStop] - cumulativeIncl[cStart]) == (cStop - cStart)))
+                nr_outside = int((~inside).sum())
+                keep &= inside
+        else:
+            startInd = np.arange(nr_samples) + flankingSize
+            stopInd = np.minimum(startInd + self.windowSize, nr_bins)
+
+            keep = np.ones(nr_samples, dtype=bool)
+            nr_gaps = 0
+            nr_excluded = 0
+            nr_outside = 0
+            if useCoverage:
+                cumulative = np.concatenate(([0], np.cumsum(self.getBinCoverage())))
+                coverage = (cumulative[stopInd] - cumulative[startInd]) / float(self.windowSize)
+                coverageOK = coverage >= self.minTargetCoverage
+                nr_gaps = int((~coverageOK).sum())
+                keep &= coverageOK
+            if excluded is not None:
+                cumulativeExcl = np.concatenate(([0], np.cumsum(excluded)))
+                untouched = (cumulativeExcl[stopInd] - cumulativeExcl[startInd]) == 0
+                nr_excluded = int((~untouched).sum())
+                keep &= untouched
+            if included is not None:
+                cumulativeIncl = np.concatenate(([0], np.cumsum(included)))
+                inside = ((cumulativeIncl[stopInd] - cumulativeIncl[startInd])
+                          == (stopInd - startInd))
+                nr_outside = int((~inside).sum())
+                keep &= inside
 
         self.sampleIndices = np.nonzero(keep)[0]
         msg = "Chromosome {:s}: keeping {:d} of {:d} samples ({:.1f} %)".format(
@@ -522,6 +679,7 @@ class DataContainer():
             msg += "; {:d} overlapping an excluded region".format(nr_excluded)
         if included is not None:
             msg += "; {:d} not fully inside an included region".format(nr_outside)
+        log.info(msg)
         print(msg)
         if len(self.sampleIndices) == 0:
             msg = ("Chromosome {:s} has no window left. Either it is not covered by the target "
@@ -541,6 +699,13 @@ class DataContainer():
             return idx
         return int(self.sampleIndices[idx])
 
+    def getWindowCoordinates(self):
+        """Return the effective list/array of (row_start, col_start) for grid mode, or 1D start indices for diagonal mode."""
+        if self.windowMode == "grid" and self.gridCoordinates is not None:
+            coords = self.gridCoordinates if self.sampleIndices is None else self.gridCoordinates[self.sampleIndices]
+            return coords + int(self.flankingSize or 0)
+        return self.sampleIndices
+
     def getNumberSamples(self):
         if not self.data_loaded:
             return None
@@ -551,6 +716,10 @@ class DataContainer():
     def __getNumberRawSamples(self):
         if not self.data_loaded:
             return None
+        if self.windowMode == "grid" and self.gridCoordinates is not None:
+            n_grid = int(self.gridCoordinates.shape[0])
+            print(f"Number of grid samples (chr{self.chromosome}): {n_grid}")
+            return n_grid
         featureArrays = [self.FactorDataArray, self.sparseHiCMatrix, self.sequenceArray]
         cutouts = [self.windowSize+2*self.flankingSize, self.windowSize+2*self.flankingSize, (self.windowSize+2*self.flankingSize)*self.binSize]
         nr_samples_list = []
@@ -559,9 +728,6 @@ class DataContainer():
                 nr_samples_list.append(featureArray.shape[0] - cutout + 1)
             else:
                 nr_samples_list.append(0)
-        #if the (only) available feature is too short for one window, give an
-        #actionable message instead of the cryptic "binning went wrong" below.
-        #This is the typical failure when predicting at a coarse binSize.
         if not any(x > 0 for x in nr_samples_list):
             required_bins = self.windowSize + 2 * self.flankingSize
             nr_bins = self.FactorDataArray.shape[0] if self.FactorDataArray is not None else 0
@@ -570,66 +736,79 @@ class DataContainer():
                    "Use a finer binSize (smaller -b) or a smaller windowSize, or drop this chromosome.").format(
                        str(self.chromosome), nr_bins, str(self.binSize), self.windowSize, required_bins)
             raise RuntimeError(msg)
-        #check if all features have the same number of samples
         if len(set( [x for x in nr_samples_list if x>0] )) != 1:
-
             msg = "Error: sample binning / DNA sequence encoding went wrong"
             msg += " -- nr_samples_list: {:s}".format(str(nr_samples_list))
             msg += " -- featureArrays: {:s}".format(str([type(x) for x in featureArrays]))
             msg += " -- cutouts: {:s}".format(str(cutouts))
-
             raise RuntimeError(msg)
         print("Number of samples: " + " | ".join([str(x) for x in nr_samples_list]))
         return max(nr_samples_list)
 
     def __getMatrixData(self, idx):
         if self.matrixFilePath is None:
-            return None # this can't work
-        if not self.data_loaded:
-            msg = "Error: Load data first"
-            raise RuntimeError(msg)
-        #the 0-th matrix starts flankingSize away from the boundary
-        windowSize = self.windowSize
-        flankingSize = self.flankingSize
-        if flankingSize is None:
-            flankingSize = windowSize
-            self.flankingSize = windowSize
-        startInd = idx + flankingSize
-        stopInd = startInd + windowSize
-        trainmatrix = self.sparseHiCMatrix[startInd:stopInd,startInd:stopInd].todense()
-        trainmatrix = np.array(np.nan_to_num(trainmatrix))
-        if self.targetValueRange is not None:
-            #Map the target onto [0, 1], the range the generator's sigmoid can
-            #actually produce. The bounds come from the data (see
-            #utils.observedValueRange), not from a constant, and the SAME bounds
-            #are used for every chromosome and inverted at prediction time.
-            #
-            #Without this the target keeps its native range. For an Akita-style
-            #target that is roughly [-2, +2] with 56 % of a window below zero,
-            #and a sigmoid cannot emit a negative number at all: the pixel loss
-            #then carries an offset it can never remove, and the discriminator
-            #can separate real from generated on sign alone, which makes the
-            #adversarial gradient useless.
-            lo, hi = self.targetValueRange
-            trainmatrix = utils.toUnitRange(trainmatrix, lo, hi)
-        trainmatrix = np.expand_dims(trainmatrix, axis=-1) #make Hi-C (sub-)matrix an RGB image
-        return trainmatrix
-    
-    def __getFactorData(self, idx):
-        if self.chromatinFolder is None:
             return None
         if not self.data_loaded:
             msg = "Error: Load data first"
             raise RuntimeError(msg)
-        #the 0-th feature matrix starts at position 0
         windowSize = self.windowSize
         flankingSize = self.flankingSize
         if flankingSize is None:
-            flankingSize = windowSize
-            self.flankingSize = windowSize
-        startIdx = idx
-        endIdx = startIdx + 2*flankingSize + windowSize
-        factorArray = self.FactorDataArray[startIdx:endIdx]
+            flankingSize = 0 if self.inputMode == "random2d" else windowSize
+            self.flankingSize = flankingSize
+        if self.windowMode == "grid" and self.gridCoordinates is not None:
+            r0, c0 = int(self.gridCoordinates[idx, 0]), int(self.gridCoordinates[idx, 1])
+            rStart, rStop = r0 + flankingSize, r0 + flankingSize + windowSize
+            cStart, cStop = c0 + flankingSize, c0 + flankingSize + windowSize
+            trainmatrix = self.sparseHiCMatrix[rStart:rStop, cStart:cStop].todense()
+        else:
+            startInd = idx + flankingSize
+            stopInd = startInd + windowSize
+            trainmatrix = self.sparseHiCMatrix[startInd:stopInd, startInd:stopInd].todense()
+        trainmatrix = np.array(np.nan_to_num(trainmatrix))
+        if self.targetValueRange is not None:
+            lo, hi = self.targetValueRange[0], self.targetValueRange[1]
+            log_tf = self.targetValueRange[2] if len(self.targetValueRange) > 2 else self.logTransformTarget
+            trainmatrix = utils.toUnitRange(trainmatrix, lo, hi, pLogTransform=log_tf)
+        trainmatrix = np.expand_dims(trainmatrix, axis=-1)
+        return trainmatrix
+    
+    def __getFactorData(self, idx):
+        if self.inputMode == "bigwig" and self.chromatinFolder is None:
+            return None
+        if not self.data_loaded:
+            msg = "Error: Load data first"
+            raise RuntimeError(msg)
+        windowSize = self.windowSize
+        flankingSize = self.flankingSize
+        if flankingSize is None:
+            flankingSize = 0 if self.inputMode == "random2d" else windowSize
+            self.flankingSize = flankingSize
+
+        if self.inputMode == "random2d":
+            if self.windowMode == "grid" and self.gridCoordinates is not None:
+                r0, c0 = int(self.gridCoordinates[idx, 0]), int(self.gridCoordinates[idx, 1])
+                rStart, rStop = r0 + flankingSize, r0 + flankingSize + windowSize
+                cStart, cStop = c0 + flankingSize, c0 + flankingSize + windowSize
+                factorArray = self.RandomMatrix2D[rStart:rStop, cStart:cStop]
+            else:
+                startInd = idx + flankingSize
+                stopInd = startInd + windowSize
+                factorArray = self.RandomMatrix2D[startInd:stopInd, startInd:stopInd]
+            factorArray = np.expand_dims(factorArray, axis=-1)
+            return factorArray
+
+        # 1D BigWig mode
+        if self.windowMode == "grid" and self.gridCoordinates is not None:
+            r0, c0 = int(self.gridCoordinates[idx, 0]), int(self.gridCoordinates[idx, 1])
+            span = 2 * flankingSize + windowSize
+            f_row = self.FactorDataArray[r0 : r0 + span]
+            f_col = self.FactorDataArray[c0 : c0 + span]
+            factorArray = np.concatenate([f_row, f_col], axis=-1)
+        else:
+            startIdx = idx
+            endIdx = startIdx + 2 * flankingSize + windowSize
+            factorArray = self.FactorDataArray[startIdx:endIdx]
         factorArray = np.expand_dims(factorArray, axis=-1)
         return factorArray
 

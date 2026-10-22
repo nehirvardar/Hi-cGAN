@@ -3,9 +3,7 @@ from tensorflow.keras.layers import Conv2D, Conv1D, BatchNormalization, LeakyReL
 from tensorflow.keras.layers import GroupNormalization
 import numpy as np
 import os
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from . import utils
 import re
@@ -13,6 +11,10 @@ import re
 #implementation of adapted pix2pix cGAN
 #modified from tensorflow tutorial https://www.tensorflow.org/tutorials/generative/pix
 #also see: https://machinelearningmastery.com/how-to-implement-pix2pix-gan-models-from-scratch-with-keras/
+
+
+import logging
+log = logging.getLogger(__name__)
 
 
 class HiCGAN():
@@ -32,13 +34,17 @@ class HiCGAN():
                     pretrained_model_path: str = "",
                     scope=None,
                     mixed_precision: bool = False,
-                    restore_checkpoint: bool = False):
+                    restore_checkpoint: bool = False,
+                    use_embedding: bool = True,
+                    enforce_symmetry: bool = True):
         super().__init__()
         # When True, optimizers are wrapped for loss scaling and the loss
         # functions cast their inputs to float32. The global mixed_float16
         # policy itself is set by the caller (training.main) before this model
         # is constructed so that all layers pick it up.
         self.mixed_precision = mixed_precision
+        self.use_embedding = bool(use_embedding)
+        self.enforce_symmetry = bool(enforce_symmetry)
 
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
@@ -51,6 +57,16 @@ class HiCGAN():
         self.loss_weight_adversarial = loss_weight_adversarial
         self.loss_weight_tv = loss_weight_tv
         self.loss_type_pixel = loss_type_pixel
+
+        init_msg = (
+            f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
+            f"use_embedding={self.use_embedding} ({'1D BigWig -> cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
+            f"enforce_symmetry={self.enforce_symmetry}, loss_type_pixel={self.loss_type_pixel}, "
+            f"mixed_precision={self.mixed_precision}"
+        )
+        log.info(init_msg)
+        print(init_msg)
+
         self.generator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_generator, beta_1=adam_beta_1, name="Adam_Generator")
         self.discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_discriminator, beta_1=adam_beta_1, name="Adam_Discriminator")
         if self.mixed_precision:
@@ -58,8 +74,12 @@ class HiCGAN():
             self.generator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.generator_optimizer)
             self.discriminator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
 
-        self.generator_embedding = self.cnn_embedding()
-        self.discriminator_embedding = self.cnn_embedding()         
+        if self.use_embedding:
+            self.generator_embedding = self.cnn_embedding()
+            self.discriminator_embedding = self.cnn_embedding()
+        else:
+            self.generator_embedding = None
+            self.discriminator_embedding = None
         self.generator = self.Generator()
         self.discriminator = self.Discriminator()
 
@@ -145,9 +165,10 @@ class HiCGAN():
                     activation="sigmoid", 
                     padding="same", name="conv1D_final")(x)
         #ensure the matrix is symmetric, i.e. x = transpose(x)
-        x_T = tf.keras.layers.Permute((2,1))(x) #this is the matrix transpose
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x) #add transpose and divide by 2
+        if self.enforce_symmetry:
+            x_T = tf.keras.layers.Permute((2,1))(x) #this is the matrix transpose
+            x = tf.keras.layers.Add()([x, x_T])
+            x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x) #add transpose and divide by 2
         #reshape the matrix into a 2D grayscale image
         x = tf.keras.layers.Reshape((self.input_size,self.input_size,self.INPUT_CHANNELS))(x)
         model = tf.keras.Model(inputs=inputs, outputs=x, name="CNN-embedding")
@@ -185,9 +206,13 @@ class HiCGAN():
 
 
     def Generator(self):
-        inputs = tf.keras.layers.Input(shape=[3*self.input_size,self.number_factors], name="factorData")
+        if self.use_embedding:
+            inputs = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name="factorData")
+            x = self.generator_embedding(inputs)
+        else:
+            inputs = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name="factorData")
+            x = inputs
 
-        twoD_conversion = self.generator_embedding
         #the downsampling part of the network, defined for 256x256 images
         down_stack = [
             HiCGAN.downsample(64, 4, apply_batchnorm=False), # (bs, 128, 128, 64)
@@ -222,13 +247,6 @@ class HiCGAN():
             up_stack = up_stack[:2] + up_stack[3:]
 
         initializer = tf.random_normal_initializer(0., 0.02)
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4,
-                                                strides=2,
-                                                padding='same',
-                                                kernel_initializer=initializer) # (bs, 256, 256, 3)
-
-        x = inputs
-        x = twoD_conversion(x)
 
         # Downsampling through the model
         skips = []
@@ -244,10 +262,11 @@ class HiCGAN():
             x = tf.keras.layers.Concatenate()([x, skip])
         last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4, strides=2, padding='same', kernel_initializer=initializer) 
         x = last(x)
-        #enforce symmetry
-        x_T = tf.keras.layers.Permute((2,1,3))(x)
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x)
+        #enforce symmetry only in diagonal window mode
+        if self.enforce_symmetry:
+            x_T = tf.keras.layers.Permute((2,1,3))(x)
+            x = tf.keras.layers.Add()([x, x_T])
+            x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x)
         x = tf.keras.layers.Activation("sigmoid")(x)
 
         return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
@@ -273,45 +292,44 @@ class HiCGAN():
     def Discriminator(self):
         initializer = tf.random_normal_initializer(0., 0.02)
 
-        inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
+        def _maybe_symmetrize(tensor):
+            if not self.enforce_symmetry:
+                return tensor
+            t_T = tf.keras.layers.Permute((2, 1, 3))(tensor)
+            t = tf.keras.layers.Add()([tensor, t_T])
+            return tf.keras.layers.Lambda(lambda z: 0.5 * z)(t)
+
+        if self.use_embedding:
+            inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
+            d = self.discriminator_embedding(inp)
+        else:
+            inp = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name='input_image')
+            d = inp
+
         tar = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.OUTPUT_CHANNELS], name='target_image')
-        embedding = self.discriminator_embedding
         #Patch-GAN (Isola et al.)
-        d = embedding(inp)
         d = tf.keras.layers.Concatenate()([d, tar])
         if self.input_size > 64:
             #downsample and symmetrize 1 
             d = HiCGAN.downsample(64, 4, False)(d) # (bs, inp.size/2, inp.size/2, 64)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
             #downsample and symmetrize 2
             d = HiCGAN.downsample(128, 4)(d)# (bs, inp.size/4, inp.size/4, 128)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
         else:    
             #downsample and symmetrize 3
             d = HiCGAN.downsample(256, 4)(d)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
         #downsample and symmetrize 4
         d = HiCGAN.downsample(256, 4)(d) # (bs, inp.size/8, inp.size/8, 256)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         d = Conv2D(512, 4, strides=1, padding="same", kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 512)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         # d = BatchNormalization()(d)
         d = LeakyReLU(alpha=0.2)(d)
         d = Conv2D(1, 4, strides=1, padding="same",
                         kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 1)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         #d = tf.keras.layers.Activation("sigmoid")(d) #sigmoid will be done in the loss function itself
         return tf.keras.Model(inputs=[inp, tar], outputs=d, name="Discriminator")
 
@@ -374,16 +392,22 @@ class HiCGAN():
         return gen_total_loss, disc_loss
 
     def generate_images(self, model, test_input, tar, epoch: int):
-        prediction = model(test_input, training=True)
-        pred_mse = tf.reduce_mean(tf.square( tar["out_matrixData"][0], prediction[0] ))
+        inp_tensor = test_input["factorData"] if isinstance(test_input, dict) else test_input
+        prediction = model(inp_tensor, training=True)
+        tar_img = tf.cast(tar["out_matrixData"][0], tf.float32)
+        pred_img = tf.cast(prediction[0], tf.float32)
+        pred_mse = float(tf.reduce_mean(tf.square(tar_img - pred_img)))
         figname = "testpred_epoch_{:05d}.png".format(epoch)
         figname = os.path.join(self.log_dir, figname)
-        display_list = [test_input["factorData"][0], tar["out_matrixData"][0], prediction[0]]
-        titleList = ['Input Image', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
+        inp_sample = np.asarray(inp_tensor[0])
+        if inp_sample.ndim == 3 and inp_sample.shape[-1] == 1:
+            inp_sample = inp_sample[:, :, 0]
+        display_list = [inp_sample, np.squeeze(np.asarray(tar_img)), np.squeeze(np.asarray(pred_img))]
+        titleList = ['Input Feature / 2D Random', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
 
         fig1, axs1 = plt.subplots(1,len(display_list), figsize=(15,15))
         for i in range(len(display_list)):
-            axs1[i].imshow(display_list[i] * 0.5 + 0.5)
+            axs1[i].imshow(display_list[i] * 0.5 + 0.5, aspect='auto')
             axs1[i].set_title(titleList[i])
         fig1.savefig(figname)
         plt.close(fig1)
@@ -508,10 +532,16 @@ class HiCGAN():
         #binary. Without them keras raises ImportError, which used to abort the
         #whole training run before a single step -- losing the job over a
         #picture. Warn and carry on instead.
-        for model, name in ((self.generator, generatorPlotName),
-                            (self.discriminator, discriminatorPlotName),
-                            (self.generator_embedding, generatorEmbeddingPlotName),
-                            (self.discriminator_embedding, discriminatorEmbeddingPlotName)):
+        modelsToPlot = [
+            (self.generator, generatorPlotName),
+            (self.discriminator, discriminatorPlotName),
+        ]
+        if self.use_embedding and self.generator_embedding is not None and self.discriminator_embedding is not None:
+            modelsToPlot.extend([
+                (self.generator_embedding, generatorEmbeddingPlotName),
+                (self.discriminator_embedding, discriminatorEmbeddingPlotName),
+            ])
+        for model, name in modelsToPlot:
             try:
                 tf.keras.utils.plot_model(model, show_shapes=True, to_file=name)
             except (ImportError, OSError) as ex:
