@@ -120,18 +120,16 @@ def scaleArray(pArray):
         msg = "cannot normalize empty array"
         print(msg)
         return pArray
-    #A sparse matrix holding negative values cannot be shifted: scipy refuses to
-    #subtract a nonzero scalar because it would have to materialise every
-    #implicit zero. Say so here rather than letting the caller meet scipy's
-    #message, which does not hint at the cause or the cure.
-    if sparse.issparse(pArray) and pArray.min() < 0:
-        raise NotImplementedError(
-            "scaleArray cannot min-max a SPARSE matrix whose values go negative "
-            "(min {:.4g}). An Akita-style log observed/expected target is about "
-            "half negative. Use hicTraining --scaleTargetToUnitRange instead: it "
-            "measures the range once, maps the dense target window onto [0, 1], "
-            "and records the range so hicPredict --targetValueRange can invert "
-            "it.".format(float(pArray.min())))
+    # Clamp negative predictions in sparse matrices to 0 so min-max scaling can proceed
+    # without materializing implicit zeros.
+    if sparse.issparse(pArray):
+        if pArray.min() < 0:
+            pArray = pArray.copy()
+            pArray.data = np.maximum(pArray.data, 0.0)
+            pArray.eliminate_zeros()
+        if pArray.nnz == 0 or pArray.max() <= 0:
+            return pArray
+        return pArray / pArray.max()
     if pArray.max() - pArray.min() != 0:
         normArray = (pArray - pArray.min()) / (pArray.max() - pArray.min())
     elif pArray.max() > 0: #min = max >0

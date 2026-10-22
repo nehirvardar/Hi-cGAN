@@ -273,19 +273,28 @@ class HiCGAN():
 
             alpha_t = self.alphas[t_step]
             alpha_bar_t = self.alphas_bar[t_step]
+            alpha_bar_prev = self.alphas_bar[t_step - 1]
             beta_t = self.betas[t_step]
 
-            coef1 = 1.0 / tf.sqrt(alpha_t)
-            coef2 = (1.0 - alpha_t) / tf.sqrt(1.0 - alpha_bar_t)
+            # Estimate x_0 and clip to [0, 1] RNA target range for reverse-diffusion stability
+            x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
 
-            x_t = coef1 * (x_t - coef2 * predicted_noise)
+            posterior_mean = (
+                (tf.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)) * x0_pred +
+                (tf.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * x_t
+            )
+            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
 
             if t_step > 1:
                 noise = tf.random.normal(shape=tf.shape(x_t))
-                x_t = x_t + tf.sqrt(beta_t) * noise
+                x_t = posterior_mean + tf.sqrt(posterior_var) * noise
+            else:
+                x_t = posterior_mean
 
-        # Enforce symmetry on the final denoised matrix x_0
+        # Enforce symmetry and valid [0, 1] range on the final denoised matrix x_0
         prediction = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        prediction = tf.clip_by_value(prediction, 0.0, 1.0)
         pred_mse = tf.reduce_mean(tf.square(real_dna[0] - prediction[0]))
 
         figname = "testpred_epoch_{:05d}.png".format(epoch)
@@ -687,17 +696,23 @@ class HiCGAN():
             alpha_step = alpha_bar_t / alpha_bar_prev
             beta_step = 1.0 - alpha_step
 
-            coef1 = 1.0 / tf.sqrt(alpha_step)
-            coef2 = beta_step / tf.sqrt(1.0 - alpha_bar_t)
+            # Estimate x_0 and clip to [0, 1] to prevent negative/unbounded drift
+            x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
 
-            x_t = coef1 * (x_t - coef2 * predicted_noise)
+            posterior_mean = (
+                (tf.sqrt(alpha_bar_prev) * beta_step / (1.0 - alpha_bar_t)) * x0_pred +
+                (tf.sqrt(alpha_step) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * x_t
+            )
+            posterior_var = beta_step * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
 
             noise = tf.random.normal(shape=tf.shape(x_t))
-            noise_term = tf.where(t_step > stride, tf.sqrt(beta_step) * noise, tf.zeros_like(x_t))
-            x_t = x_t + noise_term
+            noise_term = tf.where(t_prev > 0, tf.sqrt(posterior_var) * noise, tf.zeros_like(x_t))
+            x_t = posterior_mean + noise_term
 
-        # Enforce symmetry on the final denoised matrix x_0
+        # Enforce symmetry and [0, 1] bounds on the final denoised matrix x_0
         x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        x_t = tf.clip_by_value(x_t, 0.0, 1.0)
         return x_t
 
     # def load_denoiser(self, trainedModelPath: str):
