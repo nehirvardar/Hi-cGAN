@@ -147,15 +147,15 @@ class HiCGAN():
         return result
 
     def denoiser(self):
-        # 3 different inputs
+        # 3 different inputs (rna_condition holds the multi-channel 2D .bigwig chromatin factors)
         noisy_dna = keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="noisy_dna")
-        rna_condition = keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="rna_condition")
+        rna_condition = keras.layers.Input(shape=[self.input_size, self.input_size, self.number_factors], name="rna_condition")
         time_step = keras.layers.Input(shape=[1],
                                           name="time_step")
 
         time_channel = SpatialTimeEncoding(timesteps=self.timesteps)([noisy_dna, time_step])
 
-        # Concat 3 channels as 1 block
+        # Concatenate noisy target, multi-channel chromatin condition, and time encoding
         x = keras.layers.Concatenate(axis=-1)([noisy_dna, rna_condition, time_channel])
 
         # Dynamic Architecture
@@ -170,8 +170,8 @@ class HiCGAN():
 
         up_stack = []
         for i, f in enumerate(up_filters):
-            #prevent overfitting
-            apply_drop = (i < 3)
+            # Disable heavy 50% dropout so spatial chromatin peaks are preserved accurately
+            apply_drop = False
             up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 
         initializer = tf.random_normal_initializer(0., 0.02)
@@ -228,7 +228,16 @@ class HiCGAN():
         with tf.GradientTape() as tape:
             predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
 
-            loss = tf.reduce_mean(tf.square(noise - predicted_noise))  #mse
+            # Weight non-zero RNA interaction pixels higher so sparse contacts are not ignored
+            pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+            noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
+
+            # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
+            x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
+            x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+
+            loss = noise_loss + x0_loss
 
             if self.mixed_precision:
                 scaled_loss = self.denoiser_optimizer.get_scaled_loss(loss)
@@ -257,16 +266,20 @@ class HiCGAN():
 
         #prediction
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
-        loss = tf.reduce_mean(tf.square(noise - predicted_noise))
-        return loss
+        pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+        noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
+        x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+        x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
+        x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+        return noise_loss + x0_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
         rna_condition = tf.cast(test_input["factorData"][:1], tf.float32)
         real_dna = tf.cast(tar["out_matrixData"][:1], tf.float32)
         batch_size = 1
 
-        # Start reverse diffusion directly from the fixed random matrix window (no new random matrix generated)
-        x_t = rna_condition
+        # Deterministic initial latent state x_T (1 channel) conditioned on multi-channel .bigwig factors
+        x_t = tf.random.stateless_normal(shape=(batch_size, self.input_size, self.input_size, 1), seed=[42, 42])
         stride = max(1, self.timesteps // sample_steps)
 
         for t_step in range(self.timesteps, 0, -stride):
@@ -289,9 +302,10 @@ class HiCGAN():
 
         figname = "testpred_epoch_{:05d}.png".format(epoch)
         figname = os.path.join(self.log_dir, figname)
-        # Plot Random Input condition, Ground Truth RNA matrix, and Predicted RNA matrix
-        display_list = [rna_condition[0], real_dna[0], prediction[0]]
-        titleList = ['Random Input', 'Ground Truth RNA', 'Predicted RNA (MSE: {:.5f})'.format(pred_mse)]
+        # Average across chromatin channels for 2D heatmap visualization
+        cond_vis = tf.reduce_mean(rna_condition[0], axis=-1)
+        display_list = [cond_vis, real_dna[0], prediction[0]]
+        titleList = ['Chromatin Input (BigWig)', 'Ground Truth RNA', 'Predicted RNA (MSE: {:.5f})'.format(pred_mse)]
 
         fig1, axs1 = plt.subplots(1, len(display_list), figsize=(15, 5))
         for i in range(len(display_list)):
@@ -670,8 +684,8 @@ class HiCGAN():
             rna_condition = tf.expand_dims(rna_condition, axis=-1)
         batch_size = tf.shape(rna_condition)[0]
 
-        # Start reverse diffusion directly from the fixed random matrix window (no new random matrix generated)
-        x_t = rna_condition
+        # Deterministic initial latent state x_T (1 channel) conditioned on multi-channel .bigwig factors
+        x_t = tf.random.stateless_normal(shape=(batch_size, self.input_size, self.input_size, 1), seed=[42, 42])
         stride = tf.maximum(1, self.timesteps // sample_steps)
 
         for t_step in tf.range(self.timesteps, 0, -stride):

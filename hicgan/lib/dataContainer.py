@@ -76,33 +76,31 @@ class DataContainer():
             factor_matrix = sparse_mat.toarray().astype(np.float32)  # (N_rna, N_rna) 2D dense
 
             if scaleFeatures:
+                # Apply log1p before [0, 1] scaling so non-zero RNA interactions are not squashed by single outliers
+                factor_matrix = np.log1p(np.maximum(factor_matrix, 0.0))
                 m_max = factor_matrix.max()
                 if m_max > 0:
                     factor_matrix /= m_max
 
             self.FactorDataArray = factor_matrix
 
-            # Load the pre-saved fixed random matrix for this chromosome from data/random_input/
-            parent_dir = os.path.dirname(os.path.normpath(self.chromatinFolder))
-            random_dir = os.path.join(parent_dir, "random_input")
-            random_file = os.path.join(random_dir, f"chr{c_clean}.npy")
-
-            if not os.path.exists(random_file):
-                raise FileNotFoundError(
-                    f"Pre-generated random matrix not found at {random_file}. "
-                    f"Expected fixed random matrices in {random_dir}."
-                )
-
-            self.RandomInputArray = np.load(random_file).astype(np.float32)
-
             if self.binSize is None:
                 self.binSize = 250000  # Default 250kb resolution for RNA matrices
 
-            self.chromSize_factors = self.chromSize_matrix if self.chromSize_matrix else factor_matrix.shape[0] * self.binSize
-            self.nr_factors = 1
-            self.factorNames = [os.path.basename(npz_file)]
+            # Load .bigwig chromatin factors for this chromosome and build 2D pairwise input channels
+            chromatin_3d, factor_names = utils.loadBigwigChromatinMatrix(
+                pBigwigFolder=self.chromatinFolder,
+                pChromStr=c_clean,
+                pNumBins=factor_matrix.shape[0],
+                pBinSizeInt=self.binSize
+            )
+            self.RandomInputArray = chromatin_3d
 
-            print(f"[{self.chromosome}] Loaded RNA GT {self.FactorDataArray.shape} and Random Input ({random_file})")
+            self.chromSize_factors = self.chromSize_matrix if self.chromSize_matrix else factor_matrix.shape[0] * self.binSize
+            self.nr_factors = int(chromatin_3d.shape[-1])
+            self.factorNames = factor_names
+
+            print(f"[{self.chromosome}] Loaded RNA GT {self.FactorDataArray.shape} and BigWig Chromatin Input {self.RandomInputArray.shape} ({', '.join(self.factorNames)})")
 
         except Exception as e:
             raise IOError(f"Error while loading RNA data: {e}")
@@ -634,20 +632,21 @@ class DataContainer():
         startInd = idx + flankingSize
         stopInd = startInd + windowSize
 
-        # Slice the 2D window from the chromosome's fixed random matrix
-        randomWindow = self.RandomInputArray[startInd:stopInd, startInd:stopInd]
-        randomWindow = np.expand_dims(randomWindow, axis=-1)
-        return randomWindow
+        # Slice the 2D multi-channel chromatin factor window (windowSize, windowSize, nr_factors)
+        chromWindow = self.RandomInputArray[startInd:stopInd, startInd:stopInd]
+        if chromWindow.ndim == 2:
+            chromWindow = np.expand_dims(chromWindow, axis=-1)
+        return chromWindow
 
     def getSampleData(self, idx):
         if not self.data_loaded:
             return None
         idx = self.mapSampleIndex(idx)
         rna_gt_matrix = self.__getFactorData(idx).astype("float32")
-        random_input = self.__getRandomInputData(idx).astype("float32")
+        chromatin_input = self.__getRandomInputData(idx).astype("float32")
 
         return {
-            "factorData": random_input,      # Window sliced from the chromosome's single random matrix
+            "factorData": chromatin_input,   # Window sliced from the chromosome's .bigwig chromatin matrices
             "out_matrixData": rna_gt_matrix  # Window sliced from the chromosome's Ground Truth RNA matrix
         }
         

@@ -23,12 +23,161 @@ log = logging.getLogger(__name__)
 
 
 def getBigwigFileList(pDirectory):
-    #returns a list of bigwig files in pDirectory
+    # Returns a sorted list of bigwig files in pDirectory
     retList = []
+    if not pDirectory or not os.path.isdir(pDirectory):
+        return retList
     for file in sorted(os.listdir(pDirectory)):
         if file.endswith(".bigwig") or file.endswith("bigWig") or file.endswith(".bw"):
-            retList.append(pDirectory + file)
+            retList.append(os.path.join(pDirectory, file))
     return retList
+
+
+def resolveBigwigFolder(pChromatinFolder):
+    """Locate the directory containing .bigwig/.bw files given a data or RNA GT folder."""
+    if not pChromatinFolder:
+        return None
+    norm_path = os.path.normpath(pChromatinFolder)
+    if os.path.isdir(norm_path) and getBigwigFileList(norm_path):
+        return norm_path
+    parent_dir = os.path.dirname(norm_path) if os.path.basename(norm_path) in ("rna_gt", "rna") else norm_path
+    preferred = os.path.join(parent_dir, "ctcf_H3K4me2_bigwig")
+    if os.path.isdir(preferred) and getBigwigFileList(preferred):
+        return preferred
+    if os.path.isdir(parent_dir):
+        for entry in sorted(os.listdir(parent_dir)):
+            cand = os.path.join(parent_dir, entry)
+            if os.path.isdir(cand) and getBigwigFileList(cand):
+                return cand
+    return None
+
+
+def binBigwigPurePython(pBigwigFileName, pChromStr, pNumBins, pBinSizeInt=250000):
+    """Pure-Python BigWig reader that bins chromosome signal into pNumBins at pBinSizeInt resolution."""
+    import struct
+    import zlib
+
+    c_clean = str(pChromStr).replace("chr", "")
+    accepted = {f"chr{c_clean}", c_clean}
+    n_bins = int(pNumBins)
+    bin_size = int(pBinSizeInt)
+
+    with open(pBigwigFileName, "rb") as f:
+        magic, version, zoomLevels, chromTreeOffset, fullDataOffset, fullIndexOffset = struct.unpack(
+            "<IHHQQQ", f.read(32)
+        )
+        if magic != 0x888FFC26:
+            raise ValueError(f"Invalid BigWig magic header in {pBigwigFileName}")
+
+        f.seek(chromTreeOffset)
+        ct_magic, blockSize, keySize, valSize, itemCount, _ = struct.unpack("<IIIIQQ", f.read(32))
+
+        chrom_id = None
+
+        def search_chrom_tree(offset):
+            nonlocal chrom_id
+            f.seek(offset)
+            is_leaf, _, cnt = struct.unpack("<BBH", f.read(4))
+            if is_leaf:
+                for _ in range(cnt):
+                    key = f.read(keySize).rstrip(b"\x00").decode("ascii", errors="ignore")
+                    cid, _ = struct.unpack("<II", f.read(valSize))
+                    if key in accepted:
+                        chrom_id = cid
+            else:
+                children = []
+                for _ in range(cnt):
+                    f.read(keySize)
+                    (child_off,) = struct.unpack("<Q", f.read(8))
+                    children.append(child_off)
+                for child_off in children:
+                    if chrom_id is None:
+                        search_chrom_tree(child_off)
+
+        search_chrom_tree(chromTreeOffset + 32)
+        if chrom_id is None:
+            return np.zeros(n_bins, dtype=np.float32)
+
+        def collect_rtree_leaves(offset):
+            f.seek(offset)
+            is_leaf, _, cnt = struct.unpack("<BBH", f.read(4))
+            leaves = []
+            if is_leaf:
+                for _ in range(cnt):
+                    sChr, sBase, eChr, eBase, dOff, dSize = struct.unpack("<IIIIQQ", f.read(32))
+                    if sChr <= chrom_id <= eChr:
+                        leaves.append((dOff, dSize))
+            else:
+                children = [struct.unpack("<IIIIQ", f.read(24)) for _ in range(cnt)]
+                for sChr, sBase, eChr, eBase, cOff in children:
+                    if sChr <= chrom_id <= eChr:
+                        leaves.extend(collect_rtree_leaves(cOff))
+            return leaves
+
+        leaves = collect_rtree_leaves(fullIndexOffset + 48)
+        sums = np.zeros(n_bins, dtype=np.float64)
+
+        for dOff, dSize in leaves:
+            f.seek(dOff)
+            raw = f.read(dSize)
+            buf = zlib.decompress(raw) if zoomLevels >= 0 else raw
+            cId, cStart, cEnd, itemStep, itemSpan, sectionType, _, itemCount = struct.unpack(
+                "<IIIIIBBH", buf[:24]
+            )
+            if cId != chrom_id or itemCount == 0:
+                continue
+            if sectionType == 1:  # bedGraph intervals (start, end, val)
+                arr = np.frombuffer(
+                    buf, dtype=[("s", "<u4"), ("e", "<u4"), ("v", "<f4")], offset=24, count=itemCount
+                )
+                b_idx = np.minimum(arr["s"] // bin_size, n_bins - 1)
+                lengths = np.maximum(1, arr["e"] - arr["s"]).astype(np.float64)
+                vals = np.nan_to_num(arr["v"], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+                np.add.at(sums, b_idx, vals * lengths / float(bin_size))
+            elif sectionType == 2:  # variableStep (start, val)
+                arr = np.frombuffer(
+                    buf, dtype=[("s", "<u4"), ("v", "<f4")], offset=24, count=itemCount
+                )
+                b_idx = np.minimum(arr["s"] // bin_size, n_bins - 1)
+                vals = np.nan_to_num(arr["v"], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+                np.add.at(sums, b_idx, vals * max(1, itemSpan) / float(bin_size))
+            elif sectionType == 3:  # fixedStep (val)
+                vals = np.frombuffer(buf, dtype="<f4", offset=24, count=itemCount)
+                vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+                starts = cStart + np.arange(itemCount, dtype=np.int64) * max(1, itemStep)
+                b_idx = np.minimum(starts // bin_size, n_bins - 1)
+                np.add.at(sums, b_idx, vals * max(1, itemSpan) / float(bin_size))
+
+    v = np.log1p(np.maximum(sums, 0.0)).astype(np.float32)
+    v_max = v.max()
+    if v_max > 0:
+        v /= v_max
+    return v
+
+
+def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=250000):
+    """Load all .bigwig tracks for a chromosome and convert them to a 2D (N, N, K) chromatin matrix."""
+    bw_dir = resolveBigwigFolder(pBigwigFolder)
+    if not bw_dir:
+        raise FileNotFoundError(f"Could not find any .bigwig/.bw folder from {pBigwigFolder}")
+    bw_files = getBigwigFileList(bw_dir)
+    if not bw_files:
+        raise FileNotFoundError(f"No .bigwig/.bw files found in {bw_dir}")
+
+    channels = []
+    factor_names = []
+    for bw_path in bw_files:
+        factor_names.append(os.path.splitext(os.path.basename(bw_path))[0])
+        v = binBigwigPurePython(bw_path, pChromStr, pNumBins, pBinSizeInt=pBinSizeInt)
+        # Construct symmetric 2D pairwise interaction feature map combining anchor product and stripe sum
+        mat_2d = 0.5 * np.sqrt(np.outer(v, v)) + 0.25 * (v[:, None] + v[None, :])
+        m_max = mat_2d.max()
+        if m_max > 0:
+            mat_2d = mat_2d / m_max
+        channels.append(mat_2d.astype(np.float32))
+
+    chromatin_3d = np.stack(channels, axis=-1)  # (N_bins, N_bins, nr_factors)
+    return chromatin_3d, factor_names
 
 def getChromSizesFromBigwig(pBigwigFileName):
     #returns the chrom sizes from a bigwig file in form of a dict
