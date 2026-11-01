@@ -53,7 +53,7 @@ def parse_arguments(args=None):
     parser.add_argument("--epochs", "-ep", required=True,
                         type=int, default=10,
                         help="Number of epochs for training.")
-    parser.add_argument("--earlyStoppingPatience", "--patience", "-esp", required=False,
+    parser.add_argument("--earlyStoppingPatience", "--earlyStop", "--patience", "-esp", "-es", required=False,
                         type=int, default=5,
                         help="Stop training if validation loss does not improve for this many consecutive epochs (default: 5; set 0 to disable).")
     parser.add_argument("--batchSize", "-bs", required=False,
