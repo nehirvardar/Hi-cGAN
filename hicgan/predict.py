@@ -42,6 +42,19 @@ def parse_arguments(args=None):
     parser.add_argument("--logTransformTarget", "-ltt", required=False,
                         action="store_true", default=False,
                         help="Apply expm1(x) after rescaling from [0, 1] (automatically enabled if target_value_range.json has log_transform=true).")
+    parser.add_argument("--flankPadChromosomes", "-fpc", required=False,
+                        type=str, nargs='+', default=None,
+                        help="Chromosome names (e.g. 21 22 or 'all') to pad with +flankingSize zero bins at both start and end "
+                             "so that predicted windows cover the entire [0..n_bins) chromosome range in 'bigwig' mode.")
+    parser.add_argument("--flankPadMaxBins", "-fpmb", required=False,
+                        type=int, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome with "
+                             "n_bins < flankPadMaxBins (e.g. 250).")
+    parser.add_argument("--flankPadMinRatio", "-fpmr", required=False,
+                        type=float, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome whose "
+                             "unpadded predictable bin ratio (n_bins - 2*flankingSize)/n_bins is below this threshold "
+                             "(accepts [0, 1] fraction like 0.5 or percentage like 50).")
     parser.add_argument("--npzOutputFolder", "-no", required=False,
                         type=str, default=None,
                         help="Directory where predicted per-chromosome chr{X}.npz files and chrom_index.csv will be written (default: <outputFolder>/npz_matrices).")
@@ -116,7 +129,8 @@ def parse_arguments(args=None):
 def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSize, 
                         scalefactors, clampfactors, scalematrix, windowSize, flankingsize, maxdist, batchSize,
                         includedRegions=None, inputMode="random2d", windowMode="diagonal", gridStride=None,
-                        chromSizesPath=None, randomSeed=42):
+                        chromSizesPath=None, randomSeed=42,
+                        flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
     
     containerCls = dataContainer.DataContainer
     testdataContainerList = []
@@ -151,7 +165,10 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
                 binSize=pBinSize,
                 inputMode=inputMode,
                 numBins=numBinsChrom,
-                randomSeed=randomSeed
+                randomSeed=randomSeed,
+                flankPadChromosomes=flankPadChromosomes,
+                flankPadMaxBins=flankPadMaxBins,
+                flankPadMinRatio=flankPadMinRatio
             )
         )
     effectiveFlanking = 0 if inputMode == "random2d" else flankingsize
@@ -165,6 +182,9 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         "includedRegions": includedRegions,
         "windowMode": windowMode,
         "gridStride": gridStride,
+        "flankPadChromosomes": flankPadChromosomes,
+        "flankPadMaxBins": flankPadMaxBins,
+        "flankPadMinRatio": flankPadMinRatio,
     }
     if len(testdataContainerList) == 0:
         msg = "Exiting. No data found"
@@ -201,8 +221,12 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         sampleSizeList.append(int(np.ceil(container.getNumberSamples() / batchSize)))
         nr_bins_chrom = container.FactorDataArray.shape[0] if container.FactorDataArray is not None else 0
         orig_bins_chrom = container.original_num_bins if container.original_num_bins is not None else nr_bins_chrom
+        left_pad_chrom = int(getattr(container, "left_padded_bins", 0) or 0)
         matrixSizeList.append(int(nr_bins_chrom))
-        originalBinsList.append(int(orig_bins_chrom))
+        if left_pad_chrom > 0:
+            originalBinsList.append((int(orig_bins_chrom), left_pad_chrom))
+        else:
+            originalBinsList.append(int(orig_bins_chrom))
         flankingSizeList.append(int(container.flankingSize))
         windowStartsList.append(None if container.sampleIndices is None
                                 else np.asarray(container.sampleIndices, dtype=np.int64))
@@ -231,7 +255,7 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         windowCoordsList,
     )
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="diagonal", pGridStride=None, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="diagonal", pGridStride=None, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None):
     trainedmodel = pTrainedModel
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
@@ -252,6 +276,26 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             inputMode = "bigwig"
     windowMode = pWindowMode or "diagonal"
     logTransformTarget = bool(pLogTransformTarget)
+
+    # Auto-detect flank padding settings from hicgan_metadata.pkl next to trainedModel if none were explicitly specified
+    if trainedmodel and pFlankPadChromosomes is None and pFlankPadMaxBins is None and pFlankPadMinRatio is None:
+        candidateMeta = os.path.join(os.path.dirname(os.path.abspath(trainedmodel)), "hicgan_metadata.pkl")
+        if os.path.exists(candidateMeta):
+            try:
+                with open(candidateMeta, "rb") as mf:
+                    meta_obj = pickle.load(mf)
+                if isinstance(meta_obj, dict):
+                    pFlankPadChromosomes = meta_obj.get("flankPadChromosomes")
+                    pFlankPadMaxBins = meta_obj.get("flankPadMaxBins")
+                    pFlankPadMinRatio = meta_obj.get("flankPadMinRatio")
+                    if any(x is not None for x in (pFlankPadChromosomes, pFlankPadMaxBins, pFlankPadMinRatio)):
+                        log.info(
+                            "[PREDICT-FLANK-PAD] Auto-loaded flank padding config from %s: "
+                            "flankPadChromosomes=%s, flankPadMaxBins=%s, flankPadMinRatio=%s",
+                            candidateMeta, str(pFlankPadChromosomes), str(pFlankPadMaxBins), str(pFlankPadMinRatio)
+                        )
+            except Exception as exc:
+                log.debug("Could not read flank padding metadata from %s: %s", candidateMeta, str(exc))
 
     # Auto-detect target_value_range.json next to trainedModel if not explicitly passed
     if not pTargetValueRange and trainedmodel:
@@ -338,6 +382,9 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             gridStride=pGridStride,
             chromSizesPath=pChromSizesPath,
             randomSeed=pSeed,
+            flankPadChromosomes=pFlankPadChromosomes,
+            flankPadMaxBins=pFlankPadMaxBins,
+            flankPadMinRatio=pFlankPadMinRatio,
         )
         if pMode == "create-data":
             save_vars = {
@@ -420,7 +467,9 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             chrom = container.chromosome
             storedFeaturesDict = container.storedFeatures
             actualFlanking = int(flankingSizeList[idx]) if flankingSizeList else flankingsize
-            origBins = int(originalBinsList[idx]) if originalBinsList else int(matrixSizeList[idx])
+            origBins = originalBinsList[idx] if originalBinsList else int(matrixSizeList[idx])
+            origBinsScalar = int(origBins[0]) if isinstance(origBins, (tuple, list)) else int(origBins)
+            leftPadScalar = int(origBins[1]) if isinstance(origBins, (tuple, list)) and len(origBins) > 1 else 0
             matrixSize = int(matrixSizeList[idx])
 
             testDs = tf.data.TFRecordDataset(record,
@@ -445,8 +494,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                 predictionFiles.append(predFile)
                 predictedChroms.append(chrom)
                 log.info(
-                    "[PREDICT-GRID] Predicted %d 2D grid windows for chr%s -> %s (paddedBins=%d, origBins=%d)",
-                    written, chrom, predFile, matrixSize, origBins
+                    "[PREDICT-GRID] Predicted %d 2D grid windows for chr%s -> %s (paddedBins=%d, origBins=%d, leftPad=%d)",
+                    written, chrom, predFile, matrixSize, origBinsScalar, leftPadScalar
                 )
                 if rebuildPool is not None:
                     matrixFile = os.path.join(matrixChunksDir, f"matrix_chr{chrom}.npz")
@@ -483,8 +532,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                 predictedChroms.append(chrom)
                 bandStarts.append(starts)
                 log.info(
-                    "[PREDICT-BAND] Summed %d windows for chr%s into %s (flanking=%d, paddedBins=%d, origBins=%d)",
-                    written, chrom, bandFile, actualFlanking, matrixSize, origBins
+                    "[PREDICT-BAND] Summed %d windows for chr%s into %s (flanking=%d, paddedBins=%d, origBins=%d, leftPad=%d)",
+                    written, chrom, bandFile, actualFlanking, matrixSize, origBinsScalar, leftPadScalar
                 )
 
                 if rebuildPool is not None:
@@ -827,4 +876,7 @@ def main(args=None):
         pChromSizesPath=args.chromSizesPath,
         pSeed=args.seed,
         pLogTransformTarget=args.logTransformTarget,
-        pNpzOutputFolder=args.npzOutputFolder)
+        pNpzOutputFolder=args.npzOutputFolder,
+        pFlankPadChromosomes=args.flankPadChromosomes,
+        pFlankPadMaxBins=args.flankPadMaxBins,
+        pFlankPadMinRatio=args.flankPadMinRatio)

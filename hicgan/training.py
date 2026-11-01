@@ -58,6 +58,19 @@ def parse_arguments(args=None):
     parser.add_argument("--logTransformTarget", "-ltt", required=False,
                         action="store_true", default=False,
                         help="Apply log1p(x) transform to target matrices before [0, 1] scaling (inverted via expm1 in hicPredict).")
+    parser.add_argument("--flankPadChromosomes", "-fpc", required=False,
+                        type=str, nargs='+', default=None,
+                        help="Chromosome names (e.g. 21 22 or 'all') to pad with +flankingSize zero bins at both start and end "
+                             "so that target windows cover the entire [0..n_bins) chromosome range in 'bigwig' mode.")
+    parser.add_argument("--flankPadMaxBins", "-fpmb", required=False,
+                        type=int, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome with "
+                             "n_bins < flankPadMaxBins (e.g. 250).")
+    parser.add_argument("--flankPadMinRatio", "-fpmr", required=False,
+                        type=float, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome whose "
+                             "unpadded predictable bin ratio (n_bins - 2*flankingSize)/n_bins is below this threshold "
+                             "(accepts [0, 1] fraction like 0.5 or percentage like 50).")
     parser.add_argument("--windowSize", "-ws", required=True,
                         type=int, choices=[64, 128, 256, 512, 768, 1024],
                         help="window size for submatrices.")
@@ -222,13 +235,17 @@ def parse_arguments(args=None):
 
     return parser
 
-def create_container(chrom, matrix, chromatinpath, binSize=None, inputMode="bigwig", randomSeed=42):
+def create_container(chrom, matrix, chromatinpath, binSize=None, inputMode="bigwig", randomSeed=42,
+                     flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
     container = dataContainer.DataContainer(chromosome=chrom,
                                             matrixFilePath=matrix,
                                             chromatinFolder=chromatinpath,
                                             binSize=binSize,
                                             inputMode=inputMode,
-                                            randomSeed=randomSeed)
+                                            randomSeed=randomSeed,
+                                            flankPadChromosomes=flankPadChromosomes,
+                                            flankPadMaxBins=flankPadMaxBins,
+                                            flankPadMinRatio=flankPadMinRatio)
     return container
 
 def create_data(pTrainingMatrices, 
@@ -254,7 +271,10 @@ def create_data(pTrainingMatrices,
                 pGridStride=None,
                 pBinSize=250000,
                 pRandomSeed=42,
-                pLogTransformTarget=False):
+                pLogTransformTarget=False,
+                pFlankPadChromosomes=None,
+                pFlankPadMaxBins=None,
+                pFlankPadMinRatio=None):
     os.makedirs(pOutputFolder, exist_ok=True)
     debugstate = None
     paramDict = locals().copy()
@@ -302,14 +322,20 @@ def create_data(pTrainingMatrices,
     for chrom in trainChromNameList:
         for matrix, chromatinpath in zip(pTrainingMatrices, ptrainingChromatinFolders):
             traindataContainerList.append(
-                create_container(chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed)
+                create_container(
+                    chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio
+                )
             )
 
     valdataContainerList = []
     for chrom in valChromNameList:
         for matrix, chromatinpath in zip(pValidationMatrices, pvalidationChromatinFolders):
             valdataContainerList.append(
-                create_container(chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed)
+                create_container(
+                    chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio
+                )
             )
 
     #Measure the target value range ONCE, over every training matrix and
@@ -357,6 +383,9 @@ def create_data(pTrainingMatrices,
         "windowMode": pWindowMode,
         "gridStride": pGridStride,
         "logTransformTarget": pLogTransformTarget,
+        "flankPadChromosomes": pFlankPadChromosomes,
+        "flankPadMaxBins": pFlankPadMaxBins,
+        "flankPadMinRatio": pFlankPadMinRatio,
     }
     if pExcludeRegions:
         missing = [f for f in pExcludeRegions if not os.path.isfile(f)]
@@ -722,7 +751,10 @@ def main(args=None):
                 pGridStride=args.gridStride,
                 pBinSize=args.binSize,
                 pRandomSeed=randomSeed,
-                pLogTransformTarget=args.logTransformTarget
+                pLogTransformTarget=args.logTransformTarget,
+                pFlankPadChromosomes=args.flankPadChromosomes,
+                pFlankPadMaxBins=args.flankPadMaxBins,
+                pFlankPadMinRatio=args.flankPadMinRatio
             )
             meta = {
                 "tfRecordFilenames": tfRecordFilenames,
@@ -736,6 +768,9 @@ def main(args=None):
                 "binSize": args.binSize,
                 "windowSize": args.windowSize,
                 "logTransformTarget": args.logTransformTarget,
+                "flankPadChromosomes": args.flankPadChromosomes,
+                "flankPadMaxBins": args.flankPadMaxBins,
+                "flankPadMinRatio": args.flankPadMinRatio,
                 "seed": randomSeed,
                 "created_at": datetime.utcnow().isoformat()
             }
