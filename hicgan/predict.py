@@ -735,6 +735,9 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
         factor_label = "+".join(factor_names)
         for w_idx, ((r_s, c_s), p_win) in enumerate(zip(selected_coords, pred_batch), start=1):
             r_e, c_e = r_s + window_size, c_s + window_size
+            if r_s == c_s:
+                # Diagonal windows lie on the main chromosome axis and are symmetric within themselves
+                p_win = 0.5 * (p_win + p_win.T)
             c_win = np.mean(chrom_pad[r_s:r_e, c_s:c_e, :], axis=-1)
             g_win = gt_pad[r_s:r_e, c_s:c_e]
 
