@@ -691,11 +691,84 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
             pBinSizeInt=250000
         )
 
-        # Pad both RNA GT and Chromatin Input on bottom/right with 0.0 to cover the 2D sliding grid (stride_step)
-        gt_pad, grid_coords, orig_n = utils.padMatrixToGrid(gt_mat, pWindowSize=window_size, pStride=stride_step)
-        chrom_pad, _, _ = utils.padMatrixToGrid(chrom_3d, pWindowSize=window_size, pStride=stride_step)
+        # Determine reconstruction stride so full-chromosome assembly stays fast even on chr1
+        n_steps_raw = max(1, int(np.ceil(max(1, n_bins - window_size) / float(stride_step))) + 1)
+        n_upper_raw = (n_steps_raw * (n_steps_raw + 1)) // 2
+        recon_stride = stride_step if n_upper_raw <= 500 else max(stride_step, window_size // 2)
 
-        # Score all non-empty 2D grid tiles by Ground Truth RNA signal and select distinct hotspots
+        # Pad both RNA GT and Chromatin Input on bottom/right with 0.0 to cover the 2D sliding grid
+        gt_pad, grid_coords, orig_n = utils.padMatrixToGrid(gt_mat, pWindowSize=window_size, pStride=recon_stride)
+        chrom_pad, _, _ = utils.padMatrixToGrid(chrom_3d, pWindowSize=window_size, pStride=recon_stride)
+        n_pad = gt_pad.shape[0]
+
+        # Predict all upper-triangular 2D grid windows (r_s <= c_s) in batches and mirror to lower triangle
+        upper_coords = [(r_s, c_s) for r_s, c_s in grid_coords if r_s <= c_s]
+        pred_sum = np.zeros((n_pad, n_pad), dtype=np.float32)
+        pred_count = np.zeros((n_pad, n_pad), dtype=np.float32)
+
+        eval_batch_size = 64
+        print(f"[chr{c_clean}] Reconstructing full ({n_bins}x{n_bins}) chromosome matrix from {len(upper_coords)} upper-triangular windows (stride={recon_stride})...")
+        for b_start in range(0, len(upper_coords), eval_batch_size):
+            b_coords = upper_coords[b_start:b_start + eval_batch_size]
+            b_windows = np.stack(
+                [chrom_pad[r_s:r_s + window_size, c_s:c_s + window_size, :] for r_s, c_s in b_coords],
+                axis=0
+            )
+            b_tensor = tf.convert_to_tensor(b_windows, dtype=tf.float32)
+            b_preds = trained_GAN.predictionStep(b_tensor, training=False, sample_steps=sample_steps).numpy()
+            if b_preds.ndim == 4 and b_preds.shape[-1] == 1:
+                b_preds = np.squeeze(b_preds, axis=-1)
+
+            for (r_s, c_s), p_win in zip(b_coords, b_preds):
+                r_e, c_e = r_s + window_size, c_s + window_size
+                if r_s == c_s:
+                    p_sym = 0.5 * (p_win + p_win.T)
+                    pred_sum[r_s:r_e, c_s:c_e] += p_sym
+                    pred_count[r_s:r_e, c_s:c_e] += 1.0
+                else:
+                    pred_sum[r_s:r_e, c_s:c_e] += p_win
+                    pred_count[r_s:r_e, c_s:c_e] += 1.0
+                    pred_sum[c_s:c_e, r_s:r_e] += p_win.T
+                    pred_count[c_s:c_e, r_s:r_e] += 1.0
+
+        pred_full_pad = pred_sum / np.maximum(pred_count, 1.0)
+        pred_full_pad = 0.5 * (pred_full_pad + pred_full_pad.T)
+        # Crop bottom/right padding back to original chromosome dimensions (n_bins, n_bins)
+        pred_full = pred_full_pad[:n_bins, :n_bins]
+
+        # Save full chromosome predicted matrix as sparse .npz
+        full_npz_path = os.path.join(output_folder, f"pred_chr{c_clean}_full.npz")
+        sparse.save_npz(full_npz_path, sparse.csr_matrix(pred_full))
+
+        # Compute full-chromosome metrics and save full-chromosome comparison plot
+        full_mse = float(np.mean((gt_mat - pred_full) ** 2))
+        full_mask = (gt_mat > 0) | (pred_full > 0)
+        if np.sum(full_mask) > 10 and np.std(gt_mat[full_mask]) > 1e-8 and np.std(pred_full[full_mask]) > 1e-8:
+            full_corr = float(np.corrcoef(gt_mat[full_mask].ravel(), pred_full[full_mask].ravel())[0, 1])
+            if np.isnan(full_corr):
+                full_corr = 0.0
+        else:
+            full_corr = 0.0
+
+        factor_label = "+".join(factor_names)
+        chrom_full_mean = np.mean(chrom_3d, axis=-1)
+        fig_full, axs_full = plt.subplots(1, 3, figsize=(18, 5.5))
+        full_panels = [
+            (chrom_full_mean, f"Chromatin ({factor_label}) Full chr{c_clean}\nShape: {n_bins}x{n_bins}"),
+            (gt_mat, f"Log-Normalized RNA GT Full chr{c_clean}\nShape: {n_bins}x{n_bins}"),
+            (pred_full, f"Predicted Full RNA chr{c_clean}\nMSE: {full_mse:.4f} | Pearson: {full_corr:.4f}")
+        ]
+        for ax, (img, title) in zip(axs_full, full_panels):
+            im = ax.imshow(img, cmap="coolwarm", vmin=0.0, vmax=1.0)
+            ax.set_title(title)
+            fig_full.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig_full.tight_layout()
+        full_fig_path = os.path.join(output_folder, f"pred_chr{c_clean}_full_matrix.png")
+        fig_full.savefig(full_fig_path, dpi=200)
+        plt.close(fig_full)
+        print(f"  [chr{c_clean}] Saved FULL chromosome matrix ({n_bins}x{n_bins}): MSE = {full_mse:.4f}, Pearson = {full_corr:.4f} -> {full_fig_path} & {full_npz_path}")
+
+        # Score all non-empty 2D grid tiles by Ground Truth RNA signal and select distinct hotspots for zoomed-in window plots
         scored_windows = []
         for r_s, c_s in grid_coords:
             tile = gt_pad[r_s:r_s + window_size, c_s:c_s + window_size]
@@ -719,25 +792,11 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
                     if len(selected_coords) >= num_windows:
                         break
 
-        # Batch all selected 2D grid windows for this chromosome into a single GPU call: (B, W, W, nr_factors)
-        chrom_windows = np.stack(
-            [chrom_pad[r_s:r_s + window_size, c_s:c_s + window_size, :] for r_s, c_s in selected_coords],
-            axis=0
-        )
-        chrom_batch = tf.convert_to_tensor(chrom_windows, dtype=tf.float32)
-
-        pred_batch = trained_GAN.predictionStep(chrom_batch, training=False, sample_steps=sample_steps).numpy()
-        if pred_batch.ndim == 4 and pred_batch.shape[-1] == 1:
-            pred_batch = np.squeeze(pred_batch, axis=-1)
-
         chrom_mses = []
         chrom_corrs = []
-        factor_label = "+".join(factor_names)
-        for w_idx, ((r_s, c_s), p_win) in enumerate(zip(selected_coords, pred_batch), start=1):
+        for w_idx, (r_s, c_s) in enumerate(selected_coords, start=1):
             r_e, c_e = r_s + window_size, c_s + window_size
-            if r_s == c_s:
-                # Diagonal windows lie on the main chromosome axis and are symmetric within themselves
-                p_win = 0.5 * (p_win + p_win.T)
+            p_win = pred_full_pad[r_s:r_e, c_s:c_e]
             c_win = np.mean(chrom_pad[r_s:r_e, c_s:c_e, :], axis=-1)
             g_win = gt_pad[r_s:r_e, c_s:c_e]
 
