@@ -15,7 +15,8 @@ log = logging.getLogger(__name__)
 
 class DataContainer():
     def __init__(self, chromosome, matrixFilePath, chromatinFolder, binSize=None,
-                 inputMode=None, numBins=None, randomSeed=None):
+                 inputMode=None, numBins=None, randomSeed=None,
+                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
         self.chromosome = str(chromosome)
         self.matrixFilePath = matrixFilePath
         self.chromatinFolder = chromatinFolder
@@ -35,6 +36,11 @@ class DataContainer():
         self.numBins = int(numBins) if numBins is not None else None
         self.original_num_bins = int(numBins) if numBins is not None else None
         self.padded_bins = 0
+        self.left_padded_bins = 0
+        self.right_padded_bins = 0
+        self.flankPadChromosomes = flankPadChromosomes
+        self.flankPadMaxBins = flankPadMaxBins
+        self.flankPadMinRatio = flankPadMinRatio
         self.randomSeed = randomSeed
         self.factorNames = None
         self.prefixDict_factors = None
@@ -286,40 +292,99 @@ class DataContainer():
         self.targetValueRange = None
         self.data_loaded = False
 
+    def __shouldApplyFlankPadding(self, n_bins: int):
+        """Determine if start/end flank padding (+flankingSize at both ends) should be applied to this chromosome."""
+        if self.flankingSize is None or int(self.flankingSize) <= 0 or n_bins <= 0:
+            return False, []
+
+        reasons = []
+        bare_chrom = str(self.chromosome).lstrip("chr").lower()
+
+        # 1. Explicit chromosome list (--flankPadChromosomes / flankPadChromosomes)
+        if self.flankPadChromosomes:
+            chrom_list = (
+                [self.flankPadChromosomes]
+                if isinstance(self.flankPadChromosomes, str)
+                else list(self.flankPadChromosomes)
+            )
+            normalized = {str(c).lstrip("chr").lower() for c in chrom_list if c is not None and str(c).strip() != ""}
+            if "all" in normalized or "*" in normalized:
+                reasons.append("flankPadChromosomes='all'")
+            elif bare_chrom in normalized:
+                reasons.append(f"chr{self.chromosome} in flankPadChromosomes")
+
+        # 2. Maximum bin count threshold (--flankPadMaxBins / flankPadMaxBins)
+        if self.flankPadMaxBins is not None and int(self.flankPadMaxBins) > 0:
+            max_bins_thresh = int(self.flankPadMaxBins)
+            if n_bins < max_bins_thresh:
+                reasons.append(f"n_bins({n_bins}) < flankPadMaxBins({max_bins_thresh})")
+
+        # 3. Minimum predictable (active) bin ratio threshold (--flankPadMinRatio / flankPadMinRatio)
+        if self.flankPadMinRatio is not None and float(self.flankPadMinRatio) > 0.0:
+            ratio_thresh = float(self.flankPadMinRatio)
+            if ratio_thresh > 1.0:
+                ratio_thresh = ratio_thresh / 100.0
+            active_bins = max(0, n_bins - 2 * int(self.flankingSize))
+            active_ratio = float(active_bins) / float(n_bins)
+            if active_ratio < ratio_thresh:
+                reasons.append(f"active_ratio({active_ratio:.3f}) < flankPadMinRatio({ratio_thresh:.3f})")
+
+        return (len(reasons) > 0), reasons
+
     def __applyPaddingIfNeeded(self):
-        """Automatically pad short chromosomes so they have at least windowSize + 2*flankingSize bins, and log details."""
+        """Apply start/end flank padding (when configured) and/or short-chromosome tail padding so all required windows fit."""
         required_bins = int(self.windowSize + 2 * self.flankingSize)
         n_bins = self.__getNumberBins()
         if self.original_num_bins is None and n_bins > 0:
             self.original_num_bins = int(n_bins)
 
-        if n_bins <= 0 or n_bins >= required_bins or not self.padShortChromosomes:
-            self.padded_bins = 0
+        self.left_padded_bins = 0
+        self.right_padded_bins = 0
+        self.padded_bins = 0
+
+        if n_bins <= 0:
+            return
+
+        apply_flank_pad, flank_reasons = self.__shouldApplyFlankPadding(n_bins)
+        if apply_flank_pad:
+            left_pad = int(self.flankingSize)
+            short_deficit = max(0, int(self.windowSize) - n_bins)
+            right_pad = int(self.flankingSize) + short_deficit
+        elif n_bins < required_bins and self.padShortChromosomes:
+            left_pad = 0
+            right_pad = int(required_bins - n_bins)
+        else:
             log.info(
                 "[PADDING] Chromosome %s: original_bins=%d >= required_bins=%d (windowSize=%d, flankingSize=%d) -> no padding needed.",
                 str(self.chromosome), n_bins, required_bins, self.windowSize, self.flankingSize
             )
             return
 
-        pad_bins = required_bins - n_bins
-        self.padded_bins = int(pad_bins)
+        total_bins = int(left_pad + n_bins + right_pad)
+        self.left_padded_bins = int(left_pad)
+        self.right_padded_bins = int(right_pad)
+        self.padded_bins = int(left_pad + right_pad)
 
         if self.sparseHiCMatrix is not None:
             csr = self.sparseHiCMatrix.tocsr()
-            padded_indptr = np.concatenate([
-                csr.indptr,
-                np.full(pad_bins, csr.indptr[-1], dtype=csr.indptr.dtype)
-            ])
+            shifted_indices = csr.indices.copy() + left_pad if left_pad > 0 else csr.indices.copy()
+            indptr_parts = []
+            if left_pad > 0:
+                indptr_parts.append(np.zeros(left_pad, dtype=csr.indptr.dtype))
+            indptr_parts.append(csr.indptr)
+            if right_pad > 0:
+                indptr_parts.append(np.full(right_pad, csr.indptr[-1], dtype=csr.indptr.dtype))
+            padded_indptr = np.concatenate(indptr_parts)
             self.sparseHiCMatrix = csr_matrix(
-                (csr.data.copy(), csr.indices.copy(), padded_indptr),
-                shape=(required_bins, required_bins),
+                (csr.data.copy(), shifted_indices, padded_indptr),
+                shape=(total_bins, total_bins),
                 dtype=csr.dtype
             )
 
         if self.inputMode == "random2d" and self.RandomMatrix2D is not None:
             self.RandomMatrix2D = np.pad(
                 self.RandomMatrix2D,
-                ((0, pad_bins), (0, pad_bins)),
+                ((left_pad, right_pad), (left_pad, right_pad)),
                 mode="constant",
                 constant_values=0.0
             )
@@ -327,23 +392,34 @@ class DataContainer():
         elif self.FactorDataArray is not None:
             self.FactorDataArray = np.pad(
                 self.FactorDataArray,
-                ((0, pad_bins), (0, 0)),
+                ((left_pad, right_pad), (0, 0)),
                 mode="constant",
                 constant_values=0.0
             )
 
-        self.numBins = required_bins
+        self.numBins = total_bins
         if self.binSize is not None:
-            self.chromSize_factors = int(required_bins * self.binSize)
+            self.chromSize_factors = int(total_bins * self.binSize)
             if self.chromSize_matrix is not None:
-                self.chromSize_matrix = int(required_bins * self.binSize)
+                self.chromSize_matrix = int(total_bins * self.binSize)
 
-        msg = (
-            f"[PADDING] Chromosome {self.chromosome}: original_bins={n_bins} < required_bins={required_bins} "
-            f"(windowSize={self.windowSize}, flankingSize={self.flankingSize}, inputMode={self.inputMode}, "
-            f"windowMode={self.windowMode}). Added +{pad_bins} zero-padded bins at chromosome end -> "
-            f"new_shape=({required_bins}, {required_bins})."
-        )
+        if apply_flank_pad:
+            unpadded_active = max(0, n_bins - 2 * int(self.flankingSize))
+            unpadded_ratio = 100.0 * float(unpadded_active) / float(n_bins)
+            msg = (
+                f"[FLANK-PADDING] Chromosome {self.chromosome}: original_bins={n_bins}, "
+                f"unpadded_active_bins={unpadded_active}/{n_bins} ({unpadded_ratio:.1f}%). "
+                f"Triggered by [{', '.join(flank_reasons)}]. "
+                f"Added +{left_pad} start (left) flank bins and +{right_pad} end (right) flank bins -> "
+                f"padded_shape=({total_bins}, {total_bins}), target windows now cover full [0..{n_bins}) bins."
+            )
+        else:
+            msg = (
+                f"[PADDING] Chromosome {self.chromosome}: original_bins={n_bins} < required_bins={required_bins} "
+                f"(windowSize={self.windowSize}, flankingSize={self.flankingSize}, inputMode={self.inputMode}, "
+                f"windowMode={self.windowMode}). Added +{right_pad} zero-padded bins at chromosome end -> "
+                f"new_shape=({total_bins}, {total_bins})."
+            )
         log.info(msg)
         print(msg, flush=True)
 
@@ -368,7 +444,7 @@ class DataContainer():
         msg = (
             f"[WINDOW-GRID] Chromosome {self.chromosome}: windowMode=grid, windowSize={self.windowSize}, "
             f"gridStride={stride}, 1D_positions={len(starts)}, upper_triangle_windows={len(coords)} "
-            f"(matrix_bins={n_bins}, original_bins={self.original_num_bins})"
+            f"(matrix_bins={n_bins}, original_bins={self.original_num_bins}, left_flank_pad={self.left_padded_bins})"
         )
         log.info(msg)
         print(msg, flush=True)
@@ -376,7 +452,8 @@ class DataContainer():
     def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False,
                  scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None,
                  targetValueRange=None, inputMode=None, windowMode="diagonal", gridStride=None,
-                 padShortChromosomes=True, logTransformTarget=False, randomSeed=None):
+                 padShortChromosomes=True, logTransformTarget=False, randomSeed=None,
+                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
         if not isinstance(windowSize, int):
             msg = "windowSize must be integer"
             raise TypeError(msg)
@@ -384,6 +461,12 @@ class DataContainer():
             self.inputMode = str(inputMode).lower()
         if randomSeed is not None:
             self.randomSeed = randomSeed
+        if flankPadChromosomes is not None:
+            self.flankPadChromosomes = flankPadChromosomes
+        if flankPadMaxBins is not None:
+            self.flankPadMaxBins = flankPadMaxBins
+        if flankPadMinRatio is not None:
+            self.flankPadMinRatio = flankPadMinRatio
         self.windowMode = str(windowMode).lower() if windowMode else "diagonal"
         self.gridStride = gridStride
         self.padShortChromosomes = bool(padShortChromosomes)
@@ -572,8 +655,8 @@ class DataContainer():
                         continue
                     if end <= start:
                         continue
-                    firstBin = max(0, start // self.binSize)
-                    lastBin = min(nr_bins, int(np.ceil(end / float(self.binSize))))
+                    firstBin = max(0, (start // self.binSize) + int(self.left_padded_bins))
+                    lastBin = min(nr_bins, int(np.ceil(end / float(self.binSize))) + int(self.left_padded_bins))
                     if lastBin > firstBin:
                         marked[firstBin:lastBin] = True
                         nr_regions += 1

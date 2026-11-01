@@ -122,15 +122,27 @@ class HiCGAN():
 
         #losses per epochs
         self.__gen_train_loss_epochs = []
+        self.__gen_train_pixel_loss_epochs = []
+        self.__gen_train_adv_loss_epochs = []
+        self.__gen_train_tv_loss_epochs = []
         self.__disc_train_loss_true_epochs = []
         self.__disc_train_loss_fake_epochs = []
         self.__gen_val_loss_epochs = []
+        self.__gen_val_pixel_loss_epochs = []
+        self.__gen_val_adv_loss_epochs = []
+        self.__gen_val_tv_loss_epochs = []
         self.__disc_val_loss_epochs = []
         #losses per batch
         self.__gen_train_loss_batches = []
+        self.__gen_train_pixel_loss_batches = []
+        self.__gen_train_adv_loss_batches = []
+        self.__gen_train_tv_loss_batches = []
         self.__disc_train_loss_true_batches = []
         self.__disc_train_loss_fake_batches = []
         self.__gen_val_loss_batches = []
+        self.__gen_val_pixel_loss_batches = []
+        self.__gen_val_adv_loss_batches = []
+        self.__gen_val_tv_loss_batches = []
         self.__disc_val_loss_batches = []
 
         self.__epoch_counter = 0
@@ -286,7 +298,7 @@ class HiCGAN():
             pixel_loss = tf.reduce_mean(tf.square(target - gen_output))
         tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
         total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
-        return total_gen_loss, advers_loss, pixel_loss
+        return total_gen_loss, advers_loss, pixel_loss, tv_loss
 
 
     def Discriminator(self):
@@ -355,7 +367,7 @@ class HiCGAN():
             disc_real_output = self.discriminator([input_image, target], training=True)
             disc_generated_output = self.discriminator([input_image, gen_output], training=True)
 
-            gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
+            gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
             disc_loss, disc_real_loss, disc_gen_loss = self.discriminator_loss(disc_real_output, disc_generated_output)
 
             if self.mixed_precision:
@@ -378,7 +390,7 @@ class HiCGAN():
                                                 self.generator.trainable_variables))
         self.discriminator_optimizer.apply_gradients(zip(discriminator_gradients,
                                                     self.discriminator.trainable_variables))
-        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss
+        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
 
     @tf.function
     def validationStep(self, input_image, target):
@@ -387,9 +399,9 @@ class HiCGAN():
         disc_real_output = self.discriminator([input_image, target], training=True)
         disc_generated_output = self.discriminator([input_image, gen_output], training=True)
 
-        gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
+        gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
         disc_loss, _, _ = self.discriminator_loss(disc_real_output, disc_generated_output)
-        return gen_total_loss, disc_loss
+        return gen_total_loss, disc_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
 
     def generate_images(self, model, test_input, tar, epoch: int):
         inp_tensor = test_input["factorData"] if isinstance(test_input, dict) else test_input
@@ -446,11 +458,14 @@ class HiCGAN():
             for distributed_input in distributed_dataset:
                
                 train_samples_in_epoch += 1
-                gen_loss, _, disc_loss_real, disc_loss_fake = self.distributed_train_step(distributed_input)
+                gen_loss, _, disc_loss_real, disc_loss_fake, gen_pixel, gen_adv, gen_tv = self.distributed_train_step(distributed_input)
 
-                self.__disc_train_loss_true_batches.append(disc_loss_real)
-                self.__disc_train_loss_fake_batches.append(disc_loss_fake)
-                self.__gen_train_loss_batches.append(gen_loss)
+                self.__disc_train_loss_true_batches.append(float(disc_loss_real))
+                self.__disc_train_loss_fake_batches.append(float(disc_loss_fake))
+                self.__gen_train_loss_batches.append(float(gen_loss))
+                self.__gen_train_pixel_loss_batches.append(float(gen_pixel))
+                self.__gen_train_adv_loss_batches.append(float(gen_adv))
+                self.__gen_train_tv_loss_batches.append(float(gen_tv))
                 train_bar_postfixDict= {"g": "{:.4f}".format(self.__gen_train_loss_batches[-1]),
                                          "dt": "{:.3f}".format(self.__disc_train_loss_true_batches[-1]),
                                          "df": "{:.3f}".format(self.__disc_train_loss_fake_batches[-1])}
@@ -460,23 +475,69 @@ class HiCGAN():
                 train_pbar.update(1)
                 self.__batch_counter += 1
             train_pbar.close()
-            self.__gen_train_loss_epochs.append(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_true_epochs.append(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_fake_epochs.append(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:]))
+            self.__gen_train_loss_epochs.append(float(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_pixel_loss_epochs.append(float(np.mean(self.__gen_train_pixel_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_adv_loss_epochs.append(float(np.mean(self.__gen_train_adv_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_tv_loss_epochs.append(float(np.mean(self.__gen_train_tv_loss_batches[-train_samples_in_epoch:])))
+            self.__disc_train_loss_true_epochs.append(float(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:])))
+            self.__disc_train_loss_fake_epochs.append(float(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:])))
 
             # Validation
             validation_samples_in_epoch = 0
             vds = test_ds.take(validation_steps) if validation_steps else test_ds
             for input_image, target in vds:
-                gen_loss_val, disc_loss_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
-                self.__gen_val_loss_batches.append(gen_loss_val)
-                self.__disc_val_loss_batches.append(disc_loss_val)
+                gen_loss_val, disc_loss_val, gen_pixel_val, gen_adv_val, gen_tv_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
+                self.__gen_val_loss_batches.append(float(gen_loss_val))
+                self.__gen_val_pixel_loss_batches.append(float(gen_pixel_val))
+                self.__gen_val_adv_loss_batches.append(float(gen_adv_val))
+                self.__gen_val_tv_loss_batches.append(float(gen_tv_val))
+                self.__disc_val_loss_batches.append(float(disc_loss_val))
                 validation_samples_in_epoch += 1
-            self.__disc_val_loss_epochs.append(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:]))
-            self.__gen_val_loss_epochs.append(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
+            self.__disc_val_loss_epochs.append(float(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_loss_epochs.append(float(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_pixel_loss_epochs.append(float(np.mean(self.__gen_val_pixel_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_adv_loss_epochs.append(float(np.mean(self.__gen_val_adv_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_tv_loss_epochs.append(float(np.mean(self.__gen_val_tv_loss_batches[-validation_samples_in_epoch:])))
+
+            disc_train_total_ep = float(self.loss_weight_discriminator * (self.__disc_train_loss_true_epochs[-1] + self.__disc_train_loss_fake_epochs[-1]))
+            log.info(
+                "[EPOCH-LOSS] epoch=%d/%d | train_gen_total=%.6f, train_pixel=%.6f, train_adv=%.6f, train_tv=%.6f, train_disc_total=%.6f, train_disc_true=%.6f, train_disc_fake=%.6f | "
+                "val_gen_total=%.6f, val_pixel=%.6f, val_adv=%.6f, val_tv=%.6f, val_disc_total=%.6f",
+                epoch + 1, epochs,
+                self.__gen_train_loss_epochs[-1], self.__gen_train_pixel_loss_epochs[-1], self.__gen_train_adv_loss_epochs[-1], self.__gen_train_tv_loss_epochs[-1],
+                disc_train_total_ep, self.__disc_train_loss_true_epochs[-1], self.__disc_train_loss_fake_epochs[-1],
+                self.__gen_val_loss_epochs[-1], self.__gen_val_pixel_loss_epochs[-1], self.__gen_val_adv_loss_epochs[-1], self.__gen_val_tv_loss_epochs[-1],
+                self.__disc_val_loss_epochs[-1]
+            )
 
             #count the epoch
             self.__epoch_counter += 1
+
+            def _save_loss_files(ep_idx):
+                disc_train_tot_epochs = [
+                    float(self.loss_weight_discriminator * (f + t))
+                    for f, t in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)
+                ]
+                np.savez(
+                    os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(ep_idx)),
+                    genLossTrain=self.__gen_train_loss_batches,
+                    genLossVal=self.__gen_val_loss_batches,
+                    discLossTrain_True=self.__disc_train_loss_true_batches,
+                    discLossTrain_Fake=self.__disc_train_loss_fake_batches,
+                    discLossVal=self.__disc_val_loss_batches,
+                    genLossTrainEpochs=self.__gen_train_loss_epochs,
+                    genPixelLossTrainEpochs=self.__gen_train_pixel_loss_epochs,
+                    genAdvLossTrainEpochs=self.__gen_train_adv_loss_epochs,
+                    genTvLossTrainEpochs=self.__gen_train_tv_loss_epochs,
+                    discLossTrainEpochs=disc_train_tot_epochs,
+                    discLossTrainTrueEpochs=self.__disc_train_loss_true_epochs,
+                    discLossTrainFakeEpochs=self.__disc_train_loss_fake_epochs,
+                    genLossValEpochs=self.__gen_val_loss_epochs,
+                    genPixelLossValEpochs=self.__gen_val_pixel_loss_epochs,
+                    genAdvLossValEpochs=self.__gen_val_adv_loss_epochs,
+                    genTvLossValEpochs=self.__gen_val_tv_loss_epochs,
+                    discLossValEpochs=self.__disc_val_loss_epochs,
+                )
 
             # saving the model every 20 epochs
             if (epoch + 1) % self.progress_plot_frequency == 0:
@@ -490,12 +551,7 @@ class HiCGAN():
                               pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
                               pFilename=self.progress_plot_name,
                               useLogscaleList=[True, False])
-                np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
-                                    genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
+                _save_loss_files(epoch)
                 self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
                 self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
 
@@ -510,12 +566,7 @@ class HiCGAN():
                               pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
                               pFilename=self.progress_plot_name,
                               useLogscaleList=[True, False])
-        np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
-                                    genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
+        _save_loss_files(epoch)
         self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
         self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
 

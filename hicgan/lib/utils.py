@@ -876,21 +876,30 @@ def symmetrizeSparseCsr(pMatrix):
     return sym
 
 
-def unpadMatrix(pMatrix, pOriginalSize, pChrom=None):
-    """Crop a padded chromosome matrix back to its original unpadded bin count."""
+def unpadMatrix(pMatrix, pOriginalSize, pChrom=None, pLeftPadBins=0):
+    """Crop a padded chromosome matrix back to its original unpadded bin count (supporting both tail padding and start/end flank padding)."""
     if pOriginalSize is None:
         return pMatrix
-    orig = int(pOriginalSize)
-    if pMatrix.shape[0] > orig or pMatrix.shape[1] > orig:
+    if isinstance(pOriginalSize, (tuple, list)):
+        orig = int(pOriginalSize[0])
+        left_pad = int(pOriginalSize[1]) if len(pOriginalSize) > 1 else int(pLeftPadBins)
+    else:
+        orig = int(pOriginalSize)
+        left_pad = int(pLeftPadBins)
+
+    if left_pad > 0 or pMatrix.shape[0] > orig or pMatrix.shape[1] > orig:
         old_shape = pMatrix.shape
+        start = max(0, left_pad)
+        stop = min(old_shape[0], start + orig)
         if sparse.isspmatrix(pMatrix):
-            pMatrix = pMatrix.tocsr()[:orig, :orig]
+            pMatrix = pMatrix.tocsr()[start:stop, start:stop]
         else:
-            pMatrix = pMatrix[:orig, :orig]
+            pMatrix = pMatrix[start:stop, start:stop]
+        right_removed = max(0, old_shape[0] - stop)
         msg = (
             f"[UNPADDING] Chromosome {pChrom if pChrom is not None else '?'}: "
-            f"cropped padded matrix from shape={old_shape} back to original_shape=({orig}, {orig}) "
-            f"(removed {old_shape[0] - orig} padded bins)"
+            f"cropped padded matrix from shape={old_shape} (slice [{start}:{stop}, {start}:{stop}], "
+            f"left_flank_pad={start}, right_pad={right_removed}) back to original_shape=({orig}, {orig})"
         )
         log.info(msg)
         print(msg, flush=True)
@@ -942,7 +951,7 @@ def rebuildMatrixGrid(pArrayOfWindows, pWindowCoords, pWindowSize, pMatrixSize, 
     mean_mat[mask] = sum_mat[mask] / cnt_mat[mask]
     del sum_mat, cnt_mat
 
-    if pOriginalMatrixSize is not None and int(pOriginalMatrixSize) < M:
+    if pOriginalMatrixSize is not None:
         mean_mat = unpadMatrix(mean_mat, pOriginalMatrixSize, pChrom=pChrom)
 
     # Enforce exact symmetry
