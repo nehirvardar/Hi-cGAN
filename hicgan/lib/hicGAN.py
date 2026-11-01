@@ -142,7 +142,7 @@ class HiCGAN():
         # result.add(BatchNormalization())
         result.add(GroupNormalization(groups=filters, axis=-1))
         if apply_dropout:
-            result.add(Dropout(0.5))
+            result.add(Dropout(0.10))
         result.add(ReLU())
         return result
 
@@ -170,8 +170,8 @@ class HiCGAN():
 
         up_stack = []
         for i, f in enumerate(up_filters):
-            # Disable heavy 50% dropout so spatial chromatin peaks are preserved accurately
-            apply_drop = False
+            # Light 10% dropout only in the deepest 2 bottleneck layers to reduce overfitting without hurting convergence
+            apply_drop = (i < 2)
             up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 
         initializer = tf.random_normal_initializer(0., 0.02)
@@ -228,8 +228,8 @@ class HiCGAN():
         with tf.GradientTape() as tape:
             predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
 
-            # Weight non-zero RNA interaction pixels higher so sparse contacts are not ignored
-            pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+            # 1-to-10 step ratio on non-zero pixels so zeros are cleaner while active contacts stay strongly weighted
+            pixel_weights = 1.0 + 10.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
             noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
 
             # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
@@ -237,7 +237,16 @@ class HiCGAN():
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
 
-            loss = noise_loss + x0_loss
+            # Window-level Pearson correlation loss (1 - r) to directly maximize spatial correlation and zero/peak contrast
+            y_mean = tf.reduce_mean(real_dna_matrix, axis=[1, 2, 3], keepdims=True)
+            p_mean = tf.reduce_mean(x0_pred, axis=[1, 2, 3], keepdims=True)
+            y_cent = real_dna_matrix - y_mean
+            p_cent = x0_pred - p_mean
+            cov = tf.reduce_sum(y_cent * p_cent, axis=[1, 2, 3])
+            denom = tf.sqrt(tf.reduce_sum(tf.square(y_cent), axis=[1, 2, 3]) * tf.reduce_sum(tf.square(p_cent), axis=[1, 2, 3]) + 1e-6)
+            pearson_loss = 0.25 * tf.reduce_mean(1.0 - (cov / denom))
+
+            loss = noise_loss + x0_loss + pearson_loss
 
             if self.mixed_precision:
                 scaled_loss = self.denoiser_optimizer.get_scaled_loss(loss)
@@ -268,12 +277,21 @@ class HiCGAN():
 
         #prediction
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
-        pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+        pixel_weights = 1.0 + 10.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
         noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
         x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
         x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
         x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
-        return noise_loss + x0_loss
+
+        y_mean = tf.reduce_mean(real_dna_matrix, axis=[1, 2, 3], keepdims=True)
+        p_mean = tf.reduce_mean(x0_pred, axis=[1, 2, 3], keepdims=True)
+        y_cent = real_dna_matrix - y_mean
+        p_cent = x0_pred - p_mean
+        cov = tf.reduce_sum(y_cent * p_cent, axis=[1, 2, 3])
+        denom = tf.sqrt(tf.reduce_sum(tf.square(y_cent), axis=[1, 2, 3]) * tf.reduce_sum(tf.square(p_cent), axis=[1, 2, 3]) + 1e-6)
+        pearson_loss = 0.25 * tf.reduce_mean(1.0 - (cov / denom))
+
+        return noise_loss + x0_loss + pearson_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
         rna_condition = tf.cast(test_input["factorData"][:1], tf.float32)
