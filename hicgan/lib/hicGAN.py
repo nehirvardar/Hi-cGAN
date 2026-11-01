@@ -218,10 +218,6 @@ class HiCGAN():
 
         noise = tf.random.normal(shape=tf.shape(real_dna_matrix))
 
-        # Add mild Gaussian jitter to chromatin condition during training to prevent memorizing exact window coordinates
-        cond_jitter = tf.random.normal(shape=tf.shape(rna_matrix), mean=0.0, stddev=0.02)
-        rna_cond_train = tf.clip_by_value(rna_matrix + cond_jitter, 0.0, 1.0)
-
         # FORWARD PROCESS
         alpha_bar_t = tf.gather(self.alphas_bar, t)
         alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
@@ -230,21 +226,18 @@ class HiCGAN():
         noisy_dna = tf.sqrt(alpha_bar_t) * real_dna_matrix + tf.sqrt(1.0 - alpha_bar_t) * noise
 
         with tf.GradientTape() as tape:
-            predicted_noise = self.denoiser([noisy_dna, rna_cond_train, tf.cast(t, tf.float32)], training=True)
+            predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
 
-            # Balanced proportional pixel weighting (1.0 on zeros up to 4.0 on strong peaks)
-            pixel_weights = 1.0 + 3.0 * real_dna_matrix
+            # Balanced positive weighting (7x to 15x on non-zero interactions vs 1x on background zeros)
+            pixel_weights = 1.0 + 6.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 8.0 * real_dna_matrix
             noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
 
-            # SNR-weighted (alpha_bar_t) x_0 reconstruction loss + L1 background sparsity penalty on true zero pixels
+            # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
             x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-            x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
+            x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
 
-            zero_mask = tf.cast(real_dna_matrix <= 1e-5, tf.float32)
-            zero_l1_loss = 0.3 * tf.reduce_mean(alpha_bar_t * zero_mask * tf.abs(x0_pred))
-
-            loss = noise_loss + x0_loss + zero_l1_loss
+            loss = noise_loss + x0_loss
 
             if self.mixed_precision:
                 scaled_loss = self.denoiser_optimizer.get_scaled_loss(loss)
@@ -275,14 +268,12 @@ class HiCGAN():
 
         #prediction
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
-        pixel_weights = 1.0 + 3.0 * real_dna_matrix
+        pixel_weights = 1.0 + 6.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 8.0 * real_dna_matrix
         noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
         x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
         x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-        x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
-        zero_mask = tf.cast(real_dna_matrix <= 1e-5, tf.float32)
-        zero_l1_loss = 0.3 * tf.reduce_mean(alpha_bar_t * zero_mask * tf.abs(x0_pred))
-        return noise_loss + x0_loss + zero_l1_loss
+        x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+        return noise_loss + x0_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
         rna_condition = tf.cast(test_input["factorData"][:1], tf.float32)
@@ -306,13 +297,8 @@ class HiCGAN():
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
-        # Final clean denoising step at t=1 and background floor so zero regions are noise-free
-        t_final = tf.ones([batch_size, 1], dtype=tf.float32)
-        alpha_bar_1 = self.alphas_bar[1]
-        pred_noise_1 = model([x_t, rna_condition, t_final], training=False)
-        x_t = (x_t - tf.sqrt(1.0 - alpha_bar_1) * pred_noise_1) / tf.sqrt(alpha_bar_1)
+        # Clip final denoised matrix x_0 to [0, 1] (do not transpose-average single off-diagonal 2D grid tiles)
         prediction = tf.clip_by_value(x_t, 0.0, 1.0)
-        prediction = tf.where(prediction < 0.03, tf.zeros_like(prediction), prediction)
         pred_mse = tf.reduce_mean(tf.square(real_dna[0] - prediction[0]))
 
         figname = "testpred_epoch_{:05d}.png".format(epoch)
@@ -750,13 +736,8 @@ class HiCGAN():
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
-        # Final clean denoising step at t=1 and background floor so zero regions are noise-free
-        t_final = tf.ones([batch_size, 1], dtype=tf.float32)
-        alpha_bar_1 = self.alphas_bar[1]
-        pred_noise_1 = self.denoiser([x_t, rna_condition, t_final], training=False)
-        x_t = (x_t - tf.sqrt(1.0 - alpha_bar_1) * pred_noise_1) / tf.sqrt(alpha_bar_1)
+        # Clip final denoised matrix x_0 to [0, 1] (keep off-diagonal 2D grid tiles un-transposed)
         x_t = tf.clip_by_value(x_t, 0.0, 1.0)
-        x_t = tf.where(x_t < 0.03, tf.zeros_like(x_t), x_t)
         return x_t
 
     # def load_denoiser(self, trainedModelPath: str):
