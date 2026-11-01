@@ -53,6 +53,9 @@ def parse_arguments(args=None):
     parser.add_argument("--epochs", "-ep", required=True,
                         type=int, default=10,
                         help="Number of epochs for training.")
+    parser.add_argument("--earlyStoppingPatience", "--patience", "-esp", required=False,
+                        type=int, default=5,
+                        help="Stop training if validation loss does not improve for this many consecutive epochs (default: 5; set 0 to disable).")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
                         help="Batch size for training.")
@@ -388,7 +391,8 @@ def training(pTfRecordFilenames,
              pResume=False,
              pMixedPrecision=False,
              pValidationSteps=0,
-             pTargetValueRange=None
+             pTargetValueRange=None,
+             pEarlyStoppingPatience=5
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -478,7 +482,8 @@ def training(pTfRecordFilenames,
         # fit function
         diffusionModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
                                steps_per_epoch=steps_per_epoch,
-                               validation_steps=pValidationSteps)
+                               validation_steps=pValidationSteps,
+                               early_stopping_patience=pEarlyStoppingPatience)
         log.info("Training finished at %s" % datetime.now())
             
 
@@ -714,7 +719,8 @@ def main(args=None):
                 pMixedPrecision=args.mixedPrecision,
                 pValidationSteps=args.validationSteps,
                 pTargetValueRange=resolvedTargetRange,
-                pTimesteps = args.timesteps
+                pTimesteps = args.timesteps,
+                pEarlyStoppingPatience=args.earlyStoppingPatience
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)

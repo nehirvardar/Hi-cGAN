@@ -257,8 +257,10 @@ class HiCGAN():
     def validationStep(self, rna_matrix, real_dna_matrix):
         batch_size = tf.shape(real_dna_matrix)[0]
 
-        t = tf.random.uniform(shape=[batch_size, 1], minval=1, maxval=self.timesteps + 1, dtype=tf.int32)
-        noise = tf.random.normal(shape=tf.shape(real_dna_matrix))
+        # Use deterministic stratified timesteps and stateless noise so validation loss is noise-free for Early Stopping
+        t_lin = tf.linspace(1.0, tf.cast(self.timesteps, tf.float32), batch_size)
+        t = tf.reshape(tf.cast(tf.round(t_lin), tf.int32), [batch_size, 1])
+        noise = tf.random.stateless_normal(shape=tf.shape(real_dna_matrix), seed=[42, 42])
 
         alpha_bar_t = tf.gather(self.alphas_bar, t)
         alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
@@ -318,15 +320,14 @@ class HiCGAN():
         del fig1, axs1
 
     def fit(self, train_ds, epochs, test_ds, steps_per_epoch: int,
-            validation_steps: int = 0):
+            validation_steps: int = 0, early_stopping_patience: int = 5):
         """validation_steps > 0 evaluates only that many validation batches.
 
         Validation runs the WHOLE validation set every epoch and, unlike the
         training step, is not distributed across replicas -- so its cost is
-        fixed while the training half gets faster with every GPU added. On the
-        chr21 pilot it was ~145 s against 94 s of actual training on two GPUs;
-        on eight it would dominate the epoch completely. A few hundred windows
-        track the loss curve just as well.
+        fixed while the training half gets faster with every replica added.
+        early_stopping_patience > 0 stops training when validation loss does not
+        improve for that many consecutive epochs and restores the best weights.
         """
         distributed_dataset = self.scope.experimental_distribute_dataset(train_ds)
         
@@ -353,6 +354,11 @@ class HiCGAN():
                 vis_sample_input = {k: v[:1] for k, v in test_in.items()}
                 vis_sample_target = {k: v[:1] for k, v in test_tar.items()}
 
+        best_val_loss = float("inf")
+        best_weights = None
+        epochs_without_improvement = 0
+        patience = int(early_stopping_patience) if early_stopping_patience is not None else 0
+
         for epoch in range(self.start_epoch, epochs):
             #generate sample output
             if epoch % self.example_plot_frequency == 0 and vis_sample_input is not None:
@@ -378,7 +384,8 @@ class HiCGAN():
                 self.__batch_counter += 1
 
             train_pbar.close()
-            self.__gen_train_loss_epochs.append(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
+            epoch_train_loss = float(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
+            self.__gen_train_loss_epochs.append(epoch_train_loss)
 
             # Validation
             validation_samples_in_epoch = 0
@@ -388,10 +395,28 @@ class HiCGAN():
                 self.__gen_val_loss_batches.append(val_loss)
                 validation_samples_in_epoch += 1
             if validation_samples_in_epoch > 0:
-                self.__gen_val_loss_epochs.append(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
+                current_val_loss = float(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
+                self.__gen_val_loss_epochs.append(current_val_loss)
+            else:
+                current_val_loss = epoch_train_loss
 
             #count the epoch
             self.__epoch_counter += 1
+
+            # Early stopping check and best model saving
+            if current_val_loss < best_val_loss - 1e-6:
+                best_val_loss = current_val_loss
+                epochs_without_improvement = 0
+                best_weights = self.denoiser.get_weights()
+                self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_best.keras"), save_format="keras")
+                print(f"  [Epoch {epoch+1:03d}] Train_Loss: {epoch_train_loss:.4f} | Val_Loss improved to {best_val_loss:.4f} (saved denoiser_best.keras)")
+            else:
+                epochs_without_improvement += 1
+                if patience > 0:
+                    print(f"  [Epoch {epoch+1:03d}] Train_Loss: {epoch_train_loss:.4f} | Val_Loss: {current_val_loss:.4f} "
+                          f"(no improvement vs best {best_val_loss:.4f} for {epochs_without_improvement}/{patience} epoch(s))")
+                else:
+                    print(f"  [Epoch {epoch+1:03d}] Train_Loss: {epoch_train_loss:.4f} | Val_Loss: {current_val_loss:.4f}")
 
             # saving the model periodically
             if (epoch + 1) % self.progress_plot_frequency == 0:
@@ -408,6 +433,15 @@ class HiCGAN():
                 self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_{:05d}.keras".format(epoch)), save_format="keras")
 
             self.checkpoint.save(file_prefix = self.checkpoint_prefix)
+
+            if patience > 0 and epochs_without_improvement >= patience:
+                print(f"\n[EarlyStopping] Validation loss did not improve for {patience} consecutive epochs. "
+                      f"Stopping early at epoch {epoch+1} and restoring best model weights (best Val_Loss: {best_val_loss:.4f}).")
+                break
+
+        # Restore best weights before final save so denoiser_final.keras holds the best validation model
+        if best_weights is not None:
+            self.denoiser.set_weights(best_weights)
 
         # Final save after training completes
         utils.plotLoss(pdenoiserLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
