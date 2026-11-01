@@ -142,7 +142,7 @@ class HiCGAN():
         # result.add(BatchNormalization())
         result.add(GroupNormalization(groups=filters, axis=-1))
         if apply_dropout:
-            result.add(Dropout(0.25))
+            result.add(Dropout(0.5))
         result.add(ReLU())
         return result
 
@@ -170,7 +170,7 @@ class HiCGAN():
 
         up_stack = []
         for i, f in enumerate(up_filters):
-            # Disable dropout in U-Net decoder so continuous noise predictions converge cleanly
+            # Disable heavy 50% dropout so spatial chromatin peaks are preserved accurately
             apply_drop = False
             up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 

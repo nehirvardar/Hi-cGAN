@@ -196,7 +196,7 @@ def padMatrixToGrid(pMatrix, pWindowSize, pStride=None):
 
 
 def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=250000):
-    """Load all .bigwig tracks for a chromosome and convert them to a 2D (N, N, K+1) chromatin + diagonal distance matrix."""
+    """Load all .bigwig tracks for a chromosome and convert them to a 2D (N, N, K) chromatin matrix."""
     bw_dir = resolveBigwigFolder(pBigwigFolder)
     if not bw_dir:
         raise FileNotFoundError(f"Could not find any .bigwig/.bw folder from {pBigwigFolder}")
@@ -213,12 +213,6 @@ def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=25
         mat_2d = 0.5 * np.sqrt(np.outer(v, v)) + 0.25 * (v[:, None] + v[None, :])
         mat_2d = normalizeLogMatrix(mat_2d, scale_factor=5.0, clip_percentile=99.5)
         channels.append(mat_2d.astype(np.float32))
-
-    # Add 2D relative genomic distance channel so the U-Net knows whether a 64x64 tile is on the diagonal or off-diagonal
-    idx = np.arange(pNumBins, dtype=np.float32)
-    dist_map = np.exp(-np.abs(idx[:, None] - idx[None, :]) / 16.0).astype(np.float32)
-    channels.append(dist_map)
-    factor_names.append("DiagDist")
 
     chromatin_3d = np.stack(channels, axis=-1)  # (N_bins, N_bins, nr_factors)
     return chromatin_3d, factor_names
