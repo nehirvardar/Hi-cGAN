@@ -500,33 +500,32 @@ class DataContainer():
             sat_val = np.cumsum(np.cumsum(sat_val, axis=0), axis=1)
             tile_sum = sat_val[r1, c1] - sat_val[r0, c1] - sat_val[r1, c0] + sat_val[r0, c0]
 
-            # Option A: Keep all diagonal windows (r0 == c0) and filter out completely empty (0) off-diagonal windows
+            # Option A: Keep all main-diagonal stride windows (r0 == c0) and balanced active off-diagonal windows
             is_diag = (r0 == c0)
-            min_cov = self.minTargetCoverage if useCoverage else 0.0
-            has_signal = (tile_nnz > 0) & (tile_cov >= min_cov)
+            min_cov = max(self.minTargetCoverage, 0.05) if not useCoverage else self.minTargetCoverage
+            has_strong_signal = (tile_nnz > 0) & (tile_cov >= min_cov)
 
             if stride < w:
-                # Always keep main diagonal at full stride + half-window grid with any signal + top active stride windows
-                half_w = max(stride, w // 2)
-                is_base_overlap = ((r0 % half_w) == 0) & ((c0 % half_w) == 0) & has_signal
-                keep = is_diag | is_base_overlap
+                # Keep all main-diagonal windows at full stride (8x8) + non-overlapping 64x64 off-diagonal hotspots
+                is_non_overlap_grid = ((r0 % w) == 0) & ((c0 % w) == 0)
+                keep = is_diag.copy()
 
-                # Add remaining overlapping stride windows that contain active RNA interactions (bounded so huge chroms stay fast)
-                candidate_mask = has_signal & (~keep)
+                candidate_mask = is_non_overlap_grid & (~is_diag) & has_strong_signal
                 candidate_idx = np.nonzero(candidate_mask)[0]
-                max_extra_stride_windows = 1500
-                if candidate_idx.size <= max_extra_stride_windows:
+                max_off_diag = max(16, int(np.sum(is_diag)))
+                if candidate_idx.size <= max_off_diag:
                     keep[candidate_idx] = True
                 else:
-                    top_order = np.argsort(tile_sum[candidate_idx])[::-1][:max_extra_stride_windows]
+                    top_order = np.argsort(tile_sum[candidate_idx])[::-1][:max_off_diag]
                     keep[candidate_idx[top_order]] = True
             else:
-                keep = is_diag | has_signal
+                keep = is_diag | has_strong_signal
 
             self.sampleIndices = np.nonzero(keep)[0]
-            nr_empty_dropped = int(nr_samples - len(self.sampleIndices))
-            print(f"[{self.chromosome}] Active 2D Grid Filter (stride={stride}): keeping {len(self.sampleIndices)} of {nr_samples} windows "
-                  f"(filtered {nr_empty_dropped} empty/redundant off-diagonal windows)")
+            nr_diag = int(np.sum(is_diag))
+            nr_off = int(len(self.sampleIndices) - nr_diag)
+            print(f"[{self.chromosome}] Active 2D Grid Filter (stride={stride}): keeping {len(self.sampleIndices)} windows "
+                  f"({nr_diag} diagonal + {nr_off} active off-diagonal, filtered {nr_samples - len(self.sampleIndices)} sparse/empty windows)")
             return
 
         if not useCoverage and excluded is None and included is None:

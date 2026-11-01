@@ -657,7 +657,8 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
     os.makedirs(output_folder, exist_ok=True)
     bw_dir = utils.resolveBigwigFolder(chromatin_folder)
     bw_files = utils.getBigwigFileList(bw_dir) if bw_dir else []
-    nr_factors = max(1, len(bw_files))
+    # Include the 2D diagonal distance channel appended by loadBigwigChromatinMatrix
+    nr_factors = max(1, len(bw_files)) + 1
 
     trained_GAN = hicGAN.HiCGAN(log_dir=output_folder, number_factors=nr_factors, input_size=window_size, scope=None)
     trained_GAN.load_denoiser(trainedModelPath=trained_model_path)

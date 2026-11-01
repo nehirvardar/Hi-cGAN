@@ -170,8 +170,8 @@ class HiCGAN():
 
         up_stack = []
         for i, f in enumerate(up_filters):
-            # Apply 25% dropout in the deepest bottleneck upsampling blocks to prevent memorizing training windows
-            apply_drop = (i < 2)
+            # Disable dropout in U-Net decoder so continuous noise predictions converge cleanly
+            apply_drop = False
             up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 
         initializer = tf.random_normal_initializer(0., 0.02)
@@ -228,8 +228,8 @@ class HiCGAN():
         with tf.GradientTape() as tape:
             predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
 
-            # Balanced positive weighting (7x to 15x on non-zero interactions vs 1x on background zeros)
-            pixel_weights = 1.0 + 6.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 8.0 * real_dna_matrix
+            # Weight non-zero RNA interaction pixels higher so sparse contacts are not ignored
+            pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
             noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
 
             # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
@@ -268,7 +268,7 @@ class HiCGAN():
 
         #prediction
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
-        pixel_weights = 1.0 + 6.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 8.0 * real_dna_matrix
+        pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
         noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
         x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
         x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
