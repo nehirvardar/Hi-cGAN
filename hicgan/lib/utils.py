@@ -204,13 +204,17 @@ def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=25
     if not bw_files:
         raise FileNotFoundError(f"No .bigwig/.bw files found in {bw_dir}")
 
+    # Genomic distance decay prior so 2D grid windows know their distance from the main diagonal
+    idx = np.arange(pNumBins, dtype=np.float32)
+    dist_decay = 1.0 / (1.0 + np.abs(idx[:, None] - idx[None, :]) / 24.0)
+
     channels = []
     factor_names = []
     for bw_path in bw_files:
         factor_names.append(os.path.splitext(os.path.basename(bw_path))[0])
         v = binBigwigPurePython(bw_path, pChromStr, pNumBins, pBinSizeInt=pBinSizeInt)
-        # Construct 2D pairwise interaction feature map combining anchor product and stripe sum
-        mat_2d = 0.5 * np.sqrt(np.outer(v, v)) + 0.25 * (v[:, None] + v[None, :])
+        # Construct 2D pairwise interaction feature map combining anchor product, stripe sum, and genomic distance decay
+        mat_2d = (0.5 * np.sqrt(np.outer(v, v)) + 0.25 * (v[:, None] + v[None, :])) * (0.35 + 0.65 * dist_decay)
         mat_2d = normalizeLogMatrix(mat_2d, scale_factor=5.0, clip_percentile=99.5)
         channels.append(mat_2d.astype(np.float32))
 
