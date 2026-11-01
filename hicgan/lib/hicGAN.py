@@ -127,7 +127,7 @@ class HiCGAN():
                                 kernel_initializer=initializer, use_bias=False))
         if apply_batchnorm:
             # result.add(BatchNormalization())
-            result.add(GroupNormalization(groups=min(8, filters), axis=-1))
+            result.add(GroupNormalization(groups=filters, axis=-1))
         result.add(LeakyReLU(negative_slope=0.2))
         return result
 
@@ -140,9 +140,9 @@ class HiCGAN():
                                             kernel_initializer=initializer,
                                             use_bias=False))
         # result.add(BatchNormalization())
-        result.add(GroupNormalization(groups=min(8, filters), axis=-1))
+        result.add(GroupNormalization(groups=filters, axis=-1))
         if apply_dropout:
-            result.add(Dropout(0.5))
+            result.add(Dropout(0.25))
         result.add(ReLU())
         return result
 
@@ -170,8 +170,8 @@ class HiCGAN():
 
         up_stack = []
         for i, f in enumerate(up_filters):
-            # Disable heavy 50% dropout so spatial chromatin peaks are preserved accurately
-            apply_drop = False
+            # Enable 25% dropout in decoder upsampling layers for regularization
+            apply_drop = True
             up_stack.append(HiCGAN.upsample(f, 4, apply_dropout=apply_drop))
 
         initializer = tf.random_normal_initializer(0., 0.02)
@@ -228,15 +228,14 @@ class HiCGAN():
         with tf.GradientTape() as tape:
             predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=True)
 
-            # Balanced noise_weights so the model learns to remove noise on both zero background and active pixels
-            noise_weights = 1.0 + 2.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 2.0 * real_dna_matrix
-            noise_loss = tf.reduce_mean(noise_weights * tf.square(noise - predicted_noise))
+            # Weight non-zero RNA interaction pixels higher so sparse contacts are not ignored
+            pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+            noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
 
-            # Strong pixel_weights on x_0 reconstruction so active RNA contacts are preserved without copying .bigwig
-            pixel_weights = 1.0 + 10.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+            # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
             x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-            x0_loss = 0.5 * tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+            x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
 
             loss = noise_loss + x0_loss
 
@@ -269,12 +268,11 @@ class HiCGAN():
 
         #prediction
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
-        noise_weights = 1.0 + 2.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 2.0 * real_dna_matrix
-        noise_loss = tf.reduce_mean(noise_weights * tf.square(noise - predicted_noise))
-        pixel_weights = 1.0 + 10.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+        pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
+        noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
         x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
         x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-        x0_loss = 0.5 * tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+        x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
         return noise_loss + x0_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
