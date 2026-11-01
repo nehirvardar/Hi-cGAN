@@ -155,6 +155,46 @@ def binBigwigPurePython(pBigwigFileName, pChromStr, pNumBins, pBinSizeInt=250000
     return v
 
 
+def normalizeLogMatrix(pMatrix, scale_factor=10.0, clip_percentile=99.0):
+    """Apply logarithmic normalization log1p(scale_factor * x) and percentile scaling onto [0, 1]."""
+    mat = np.nan_to_num(np.asarray(pMatrix, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    mat = np.maximum(mat, 0.0)
+    log_mat = np.log1p(mat * float(scale_factor)).astype(np.float32)
+    nz = log_mat[log_mat > 0]
+    if nz.size > 0:
+        hi = float(np.percentile(nz, clip_percentile)) if nz.size > 10 else float(nz.max())
+        if hi <= 0:
+            hi = float(nz.max())
+        if hi > 0:
+            log_mat = np.clip(log_mat / hi, 0.0, 1.0)
+    return log_mat
+
+
+def padMatrixToGrid(pMatrix, pWindowSize, pStride=None):
+    """Pad a 2D (N, N) or 3D (N, N, C) matrix on the bottom and right edges with 0.0 so a 2D grid of windows covers it completely."""
+    mat = np.asarray(pMatrix, dtype=np.float32)
+    n_bins = mat.shape[0]
+    w = int(pWindowSize)
+    stride = int(pStride) if pStride is not None else w
+
+    if n_bins <= w:
+        n_pad = w
+    else:
+        n_steps = int(np.ceil((n_bins - w) / float(stride))) + 1
+        n_pad = (n_steps - 1) * stride + w
+
+    pad_len = max(0, n_pad - n_bins)
+    if pad_len > 0:
+        if mat.ndim == 2:
+            mat = np.pad(mat, ((0, pad_len), (0, pad_len)), mode="constant", constant_values=0.0)
+        elif mat.ndim == 3:
+            mat = np.pad(mat, ((0, pad_len), (0, pad_len), (0, 0)), mode="constant", constant_values=0.0)
+
+    starts = list(range(0, n_pad - w + 1, stride))
+    grid_coords = [(r, c) for r in starts for c in starts]
+    return mat, grid_coords, n_bins
+
+
 def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=250000):
     """Load all .bigwig tracks for a chromosome and convert them to a 2D (N, N, K) chromatin matrix."""
     bw_dir = resolveBigwigFolder(pBigwigFolder)
@@ -169,11 +209,9 @@ def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=25
     for bw_path in bw_files:
         factor_names.append(os.path.splitext(os.path.basename(bw_path))[0])
         v = binBigwigPurePython(bw_path, pChromStr, pNumBins, pBinSizeInt=pBinSizeInt)
-        # Construct symmetric 2D pairwise interaction feature map combining anchor product and stripe sum
+        # Construct 2D pairwise interaction feature map combining anchor product and stripe sum
         mat_2d = 0.5 * np.sqrt(np.outer(v, v)) + 0.25 * (v[:, None] + v[None, :])
-        m_max = mat_2d.max()
-        if m_max > 0:
-            mat_2d = mat_2d / m_max
+        mat_2d = normalizeLogMatrix(mat_2d, scale_factor=5.0, clip_percentile=99.5)
         channels.append(mat_2d.astype(np.float32))
 
     chromatin_3d = np.stack(channels, axis=-1)  # (N_bins, N_bins, nr_factors)

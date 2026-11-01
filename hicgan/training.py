@@ -44,6 +44,9 @@ def parse_arguments(args=None):
     parser.add_argument("--windowSize", "-ws", required=True,
                         type=int, choices=[64, 128, 256, 512, 768, 1024],
                         help="window size for submatrices.")
+    parser.add_argument("--stride", "-st", required=False,
+                        type=int, default=8,
+                        help="Stride step size for 2D grid sliding windows (default: 8).")
     parser.add_argument("--outputFolder", "-o", required=True,
                         type=str,
                         help="Folder where trained model and diverse outputs will be stored.")
@@ -222,7 +225,8 @@ def create_data(pTrainingMatrices,
                 pThreads=4,
                 pMinTargetCoverage=0.0,
                 pExcludeRegions=None,
-                pScaleTargetToUnitRange=False):
+                pScaleTargetToUnitRange=False,
+                pStride=8):
     os.makedirs(pOutputFolder, exist_ok=True)
     #few constants
     # windowSize = int(windowSize)
@@ -294,7 +298,8 @@ def create_data(pTrainingMatrices,
                 "maximumDistance": None,
                 "minTargetCoverage": pMinTargetCoverage,
                 "excludedRegions": pExcludeRegions,
-                "targetValueRange": targetValueRange}
+                "targetValueRange": targetValueRange,
+                "gridStride": pStride}
     if pExcludeRegions:
         missing = [f for f in pExcludeRegions if not os.path.isfile(f)]
         if missing:
@@ -657,7 +662,8 @@ def main(args=None):
                         args.threads,
                         pMinTargetCoverage=args.minTargetCoverage,
                         pExcludeRegions=args.excludeRegions,
-                        pScaleTargetToUnitRange=args.scaleTargetToUnitRange)
+                        pScaleTargetToUnitRange=args.scaleTargetToUnitRange,
+                        pStride=args.stride)
             if args.createDataOnly:
                 meta = {
                     "tfRecordFilenames": tfRecordFilenames,

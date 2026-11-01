@@ -295,9 +295,8 @@ class HiCGAN():
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
-        # Enforce symmetry and valid [0, 1] range on the final denoised matrix x_0
-        prediction = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
-        prediction = tf.clip_by_value(prediction, 0.0, 1.0)
+        # Clip final denoised matrix x_0 to [0, 1] (do not transpose-average single off-diagonal 2D grid tiles)
+        prediction = tf.clip_by_value(x_t, 0.0, 1.0)
         pred_mse = tf.reduce_mean(tf.square(real_dna[0] - prediction[0]))
 
         figname = "testpred_epoch_{:05d}.png".format(epoch)
@@ -370,7 +369,8 @@ class HiCGAN():
                 gen_loss = self.distributed_train_step(distributed_input)
                 self.__gen_train_loss_batches.append(gen_loss)
 
-                train_bar_postfixDict = {"Loss (MSE)": "{:.4f}".format(self.__gen_train_loss_batches[-1])}
+                running_mean = float(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
+                train_bar_postfixDict = {"Loss (MSE)": "{:.4f}".format(running_mean)}
                 if len(self.__gen_val_loss_epochs) > 0:
                     train_bar_postfixDict["Val_Loss"] = "{:.3f}".format(self.__gen_val_loss_epochs[-1])
                 train_pbar.set_postfix(train_bar_postfixDict)
@@ -702,8 +702,7 @@ class HiCGAN():
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
 
-        # Enforce symmetry and [0, 1] bounds on the final denoised matrix x_0
-        x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        # Clip final denoised matrix x_0 to [0, 1] (keep off-diagonal 2D grid tiles un-transposed)
         x_t = tf.clip_by_value(x_t, 0.0, 1.0)
         return x_t
 

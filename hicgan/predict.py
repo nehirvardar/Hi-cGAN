@@ -64,6 +64,10 @@ def parse_arguments(args=None):
                         default=64,
                         choices=[64, 128, 256, 512, 768, 1024],
                         help="Window size for predicting; must be the same as in trained model. Supported values are 64, 128, and 256")
+    parser.add_argument("--stride", "-st", required=False,
+                        type=int,
+                        default=8,
+                        help="Stride step size for 2D grid sliding windows (default: 8)")
     parser.add_argument("--dataDir", "-d", required=False,
                         type=str,
                         help="Data directory containing rna_gt (or rna) and random_input folders")
@@ -142,7 +146,7 @@ def parse_arguments(args=None):
 
 def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSize, 
                         scalefactors, clampfactors, scalematrix, windowSize, flankingsize, maxdist, batchSize,
-                        includedRegions=None):
+                        includedRegions=None, pStride=8):
     
     containerCls = dataContainer.DataContainer
     testdataContainerList = []
@@ -157,7 +161,8 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
                   "windowSize": windowSize,
                   "flankingSize": flankingsize,
                   "maximumDistance": maxdist,
-                  "includedRegions": includedRegions}
+                  "includedRegions": includedRegions,
+                  "gridStride": pStride}
     if len(testdataContainerList) == 0:
         msg = "Exiting. No data found"
         print(msg)
@@ -643,7 +648,7 @@ def save_visual_results(chrom_list, matrix_files, chromatin_folder, output_folde
             print(f"  Saved visual plot: {fig_path} (MSE: {mse:.4f}, Pearson: {corr:.4f})")
 
 
-def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, output_folder, window_size, num_windows=5, sample_steps=25):
+def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, output_folder, window_size, num_windows=5, sample_steps=25, stride=8):
     """Directly predict and visualize windows using .bigwig chromatin factors without building full-chromosome TFRecords or .cool files."""
     import matplotlib
     matplotlib.use("Agg")
@@ -659,6 +664,7 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
 
     all_mses = []
     all_corrs = []
+    stride_step = max(1, int(stride)) if stride is not None else 8
 
     for chrom in chrom_list:
         c_clean = str(chrom).replace("chr", "")
@@ -670,10 +676,8 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
             print(f"Skipping chr{c_clean}: Ground Truth RNA file not found at {gt_path}")
             continue
 
-        gt_mat = sparse.load_npz(gt_path).toarray().astype(np.float32)
-        gt_mat = np.log1p(np.maximum(gt_mat, 0.0))
-        if gt_mat.max() > 0:
-            gt_mat = gt_mat / gt_mat.max()
+        gt_raw = sparse.load_npz(gt_path).toarray().astype(np.float32)
+        gt_mat = utils.normalizeLogMatrix(gt_raw, scale_factor=10.0, clip_percentile=99.0)
 
         n_bins = gt_mat.shape[0]
         if n_bins < window_size:
@@ -687,18 +691,39 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
             pBinSizeInt=250000
         )
 
-        # Select top non-overlapping/strided windows with highest Ground Truth RNA signal
-        max_start = max(1, n_bins - window_size)
-        stride = max(1, window_size // 2)
-        scored_windows = []
-        for s in range(0, max_start, stride):
-            score = float(np.sum(np.abs(gt_mat[s:s + window_size, s:s + window_size])))
-            scored_windows.append((score, s))
-        scored_windows.sort(reverse=True, key=lambda x: x[0])
-        selected_starts = [s for _, s in scored_windows[:num_windows]]
+        # Pad both RNA GT and Chromatin Input on bottom/right with 0.0 to cover the 2D sliding grid (stride_step)
+        gt_pad, grid_coords, orig_n = utils.padMatrixToGrid(gt_mat, pWindowSize=window_size, pStride=stride_step)
+        chrom_pad, _, _ = utils.padMatrixToGrid(chrom_3d, pWindowSize=window_size, pStride=stride_step)
 
-        # Batch all selected windows for this chromosome into a single GPU call: (B, W, W, nr_factors)
-        chrom_windows = np.stack([chrom_3d[s:s + window_size, s:s + window_size, :] for s in selected_starts], axis=0)
+        # Score all non-empty 2D grid tiles by Ground Truth RNA signal and select distinct hotspots
+        scored_windows = []
+        for r_s, c_s in grid_coords:
+            tile = gt_pad[r_s:r_s + window_size, c_s:c_s + window_size]
+            if np.count_nonzero(tile) == 0 and r_s != c_s:
+                continue
+            score = float(np.sum(np.abs(tile)))
+            scored_windows.append((score, (r_s, c_s)))
+        scored_windows.sort(reverse=True, key=lambda x: x[0])
+
+        selected_coords = []
+        min_sep = max(stride_step, window_size // 2)
+        for _, (r_s, c_s) in scored_windows:
+            if all(abs(r_s - sr) >= min_sep or abs(c_s - sc) >= min_sep for sr, sc in selected_coords):
+                selected_coords.append((r_s, c_s))
+                if len(selected_coords) >= num_windows:
+                    break
+        if len(selected_coords) < num_windows:
+            for _, rc in scored_windows:
+                if rc not in selected_coords:
+                    selected_coords.append(rc)
+                    if len(selected_coords) >= num_windows:
+                        break
+
+        # Batch all selected 2D grid windows for this chromosome into a single GPU call: (B, W, W, nr_factors)
+        chrom_windows = np.stack(
+            [chrom_pad[r_s:r_s + window_size, c_s:c_s + window_size, :] for r_s, c_s in selected_coords],
+            axis=0
+        )
         chrom_batch = tf.convert_to_tensor(chrom_windows, dtype=tf.float32)
 
         pred_batch = trained_GAN.predictionStep(chrom_batch, training=False, sample_steps=sample_steps).numpy()
@@ -708,10 +733,10 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
         chrom_mses = []
         chrom_corrs = []
         factor_label = "+".join(factor_names)
-        for w_idx, (s, p_win) in enumerate(zip(selected_starts, pred_batch), start=1):
-            e = s + window_size
-            c_win = np.mean(chrom_3d[s:e, s:e, :], axis=-1)
-            g_win = gt_mat[s:e, s:e]
+        for w_idx, ((r_s, c_s), p_win) in enumerate(zip(selected_coords, pred_batch), start=1):
+            r_e, c_e = r_s + window_size, c_s + window_size
+            c_win = np.mean(chrom_pad[r_s:r_e, c_s:c_e, :], axis=-1)
+            g_win = gt_pad[r_s:r_e, c_s:c_e]
 
             mse = float(np.mean((g_win - p_win) ** 2))
             mask = (g_win > 0) | (p_win > 0)
@@ -729,19 +754,19 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
 
             fig, axs = plt.subplots(1, 3, figsize=(15, 4.5))
             panels = [
-                (c_win, f"Chromatin ({factor_label}) chr{c_clean}\nBins {s}-{e}"),
-                (g_win, f"Ground Truth RNA (chr{c_clean})\nBins {s}-{e}"),
+                (c_win, f"Chromatin ({factor_label}) chr{c_clean}\nRows {r_s}-{r_e}, Cols {c_s}-{c_e}"),
+                (g_win, f"Log-Normalized RNA GT (chr{c_clean})\nRows {r_s}-{r_e}, Cols {c_s}-{c_e}"),
                 (p_win, f"Predicted RNA\nMSE: {mse:.4f} | Pearson: {corr:.4f}")
             ]
             for ax, (img, title) in zip(axs, panels):
-                im = ax.imshow(img, cmap="coolwarm")
+                im = ax.imshow(img, cmap="coolwarm", vmin=0.0, vmax=1.0)
                 ax.set_title(title)
                 fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             fig.tight_layout()
-            fig_path = os.path.join(output_folder, f"pred_chr{c_clean}_win_{w_idx}_bin_{s}.png")
+            fig_path = os.path.join(output_folder, f"pred_chr{c_clean}_win_{w_idx}_r{r_s}_c{c_s}.png")
             fig.savefig(fig_path, dpi=150)
             plt.close(fig)
-            print(f"  [chr{c_clean}] Window {w_idx} (bins {s}-{e}): MSE = {mse:.4f}, Pearson = {corr:.4f} -> {fig_path}")
+            print(f"  [chr{c_clean}] Grid Window {w_idx} (r:{r_s}-{r_e}, c:{c_s}-{c_e}): MSE = {mse:.4f}, Pearson = {corr:.4f} -> {fig_path}")
 
         print(f"chr{c_clean} Summary -> Mean MSE: {np.mean(chrom_mses):.4f} | Mean Pearson: {np.mean(chrom_corrs):.4f}")
 
@@ -802,7 +827,8 @@ def main(args=None):
             output_folder=args.outputFolder,
             window_size=args.windowSize,
             num_windows=args.numWindows,
-            sample_steps=args.steps
+            sample_steps=args.steps,
+            stride=args.stride
         )
         return
 

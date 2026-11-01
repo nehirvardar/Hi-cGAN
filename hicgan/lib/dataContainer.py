@@ -43,6 +43,9 @@ class DataContainer():
         self.includedRegions = None
         self.targetValueRange = None
         self.sampleIndices = None
+        self.gridCoordinates = None
+        self.gridStride = 8
+        self.originalBins = None
         self.data_loaded = False
 
     def __loadFactorData(self, ignoreChromLengths=False, scaleFeatures=False, clampFeatures=False):
@@ -76,13 +79,11 @@ class DataContainer():
             factor_matrix = sparse_mat.toarray().astype(np.float32)  # (N_rna, N_rna) 2D dense
 
             if scaleFeatures:
-                # Apply log1p before [0, 1] scaling so non-zero RNA interactions are not squashed by single outliers
-                factor_matrix = np.log1p(np.maximum(factor_matrix, 0.0))
-                m_max = factor_matrix.max()
-                if m_max > 0:
-                    factor_matrix /= m_max
+                # Apply logarithmic normalization log1p(scale * x) with percentile clipping onto [0, 1]
+                factor_matrix = utils.normalizeLogMatrix(factor_matrix, scale_factor=10.0, clip_percentile=99.0)
 
             self.FactorDataArray = factor_matrix
+            self.originalBins = int(factor_matrix.shape[0])
 
             if self.binSize is None:
                 self.binSize = 250000  # Default 250kb resolution for RNA matrices
@@ -100,7 +101,7 @@ class DataContainer():
             self.nr_factors = int(chromatin_3d.shape[-1])
             self.factorNames = factor_names
 
-            print(f"[{self.chromosome}] Loaded RNA GT {self.FactorDataArray.shape} and BigWig Chromatin Input {self.RandomInputArray.shape} ({', '.join(self.factorNames)})")
+            print(f"[{self.chromosome}] Loaded log-normalized RNA GT {self.FactorDataArray.shape} and BigWig Chromatin Input {self.RandomInputArray.shape} ({', '.join(self.factorNames)})")
 
         except Exception as e:
             raise IOError(f"Error while loading RNA data: {e}")
@@ -169,12 +170,15 @@ class DataContainer():
         self.flankingSize = None
         self.maximumDistance = None
         self.sampleIndices = None
+        self.gridCoordinates = None
+        self.gridStride = 8
+        self.originalBins = None
         self.excludedRegions = None
         self.includedRegions = None
         self.targetValueRange = None
         self.data_loaded = False
 
-    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None):
+    def loadData(self, windowSize, flankingSize=None, maximumDistance=None, scaleFeatures=False, clampFeatures=False, scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None, targetValueRange=None, gridStride=8):
         if not isinstance(windowSize, int):
             msg = "windowSize must be integer"
             raise TypeError(msg)
@@ -184,12 +188,30 @@ class DataContainer():
         # Load RNA matrix data directly (used as Ground Truth, no .cool Hi-C matrix needed)
         self.__loadFactorData(scaleFeatures=scaleFeatures, clampFeatures=clampFeatures)
         self.windowSize = windowSize
+        self.gridStride = max(1, int(gridStride)) if gridStride is not None else 8
         self.flankingSize = flankingSize if flankingSize is not None else 0
         self.maximumDistance = maximumDistance
         self.minTargetCoverage = float(minTargetCoverage)
         self.excludedRegions = excludedRegions
         self.includedRegions = includedRegions
         self.targetValueRange = targetValueRange
+
+        # Pad both RNA GT and Chromatin Input on bottom/right edges with 0.0 to fit the 2D sliding grid (windowSize with step gridStride)
+        if self.FactorDataArray is not None:
+            orig_n = self.FactorDataArray.shape[0]
+            self.FactorDataArray, self.gridCoordinates, self.originalBins = utils.padMatrixToGrid(
+                self.FactorDataArray, pWindowSize=self.windowSize, pStride=self.gridStride
+            )
+            if self.RandomInputArray is not None:
+                self.RandomInputArray, _, _ = utils.padMatrixToGrid(
+                    self.RandomInputArray, pWindowSize=self.windowSize, pStride=self.gridStride
+                )
+            n_pad = self.FactorDataArray.shape[0]
+            pad_len = n_pad - orig_n
+            n_steps = len(range(0, n_pad - self.windowSize + 1, self.gridStride))
+            print(f"[{self.chromosome}] 2D Grid Padding (stride={self.gridStride}): ({orig_n}, {orig_n}) -> ({n_pad}, {n_pad}) "
+                  f"(+{pad_len} zero-pad bins) | Raw Grid: {n_steps}x{n_steps} = {len(self.gridCoordinates)} windows")
+
         self.data_loaded = True
         self.__computeSampleIndices()
 
@@ -456,6 +478,57 @@ class DataContainer():
             msg = "minTargetCoverage is set but no target matrix is loaded; coverage filter ignored"
             log.warning(msg)
             useCoverage = False
+
+        if self.gridCoordinates is not None and self.FactorDataArray is not None:
+            nr_samples = self.__getNumberRawSamples()
+            if not nr_samples:
+                return
+            w = self.windowSize
+            stride = self.gridStride if self.gridStride is not None else w
+            coords = np.asarray(self.gridCoordinates, dtype=np.int32)
+            r0, c0 = coords[:, 0], coords[:, 1]
+            r1, c1 = r0 + w, c0 + w
+
+            # Fast 2D integral image (summed-area table) for non-zero count and signal sum
+            nz_mask = (self.FactorDataArray > 0).astype(np.int32)
+            sat_nnz = np.pad(nz_mask, ((1, 0), (1, 0)), mode="constant", constant_values=0)
+            sat_nnz = np.cumsum(np.cumsum(sat_nnz, axis=0), axis=1)
+            tile_nnz = sat_nnz[r1, c1] - sat_nnz[r0, c1] - sat_nnz[r1, c0] + sat_nnz[r0, c0]
+            tile_cov = tile_nnz / float(w * w)
+
+            sat_val = np.pad(self.FactorDataArray.astype(np.float64), ((1, 0), (1, 0)), mode="constant", constant_values=0.0)
+            sat_val = np.cumsum(np.cumsum(sat_val, axis=0), axis=1)
+            tile_sum = sat_val[r1, c1] - sat_val[r0, c1] - sat_val[r1, c0] + sat_val[r0, c0]
+
+            # Option A: Keep all diagonal windows (r0 == c0) and filter out completely empty (0) off-diagonal windows
+            is_diag = (r0 == c0)
+            min_cov = self.minTargetCoverage if useCoverage else 0.0
+            has_signal = (tile_nnz > 0) & (tile_cov >= min_cov)
+
+            if stride < w:
+                # Always keep main diagonal at full stride + half-window grid with any signal + top active stride windows
+                half_w = max(stride, w // 2)
+                is_base_overlap = ((r0 % half_w) == 0) & ((c0 % half_w) == 0) & has_signal
+                keep = is_diag | is_base_overlap
+
+                # Add remaining overlapping stride windows that contain active RNA interactions (bounded so huge chroms stay fast)
+                candidate_mask = has_signal & (~keep)
+                candidate_idx = np.nonzero(candidate_mask)[0]
+                max_extra_stride_windows = 1500
+                if candidate_idx.size <= max_extra_stride_windows:
+                    keep[candidate_idx] = True
+                else:
+                    top_order = np.argsort(tile_sum[candidate_idx])[::-1][:max_extra_stride_windows]
+                    keep[candidate_idx[top_order]] = True
+            else:
+                keep = is_diag | has_signal
+
+            self.sampleIndices = np.nonzero(keep)[0]
+            nr_empty_dropped = int(nr_samples - len(self.sampleIndices))
+            print(f"[{self.chromosome}] Active 2D Grid Filter (stride={stride}): keeping {len(self.sampleIndices)} of {nr_samples} windows "
+                  f"(filtered {nr_empty_dropped} empty/redundant off-diagonal windows)")
+            return
+
         if not useCoverage and excluded is None and included is None:
             return
         nr_samples = self.__getNumberRawSamples()
@@ -534,6 +607,10 @@ class DataContainer():
     def __getNumberRawSamples(self):
         if not self.data_loaded:
             return None
+        if self.gridCoordinates is not None:
+            nr_grid = len(self.gridCoordinates)
+            print(f"Number of 2D grid samples: {nr_grid}")
+            return nr_grid
         featureArrays = [self.FactorDataArray, self.sparseHiCMatrix, self.sequenceArray]
         cutouts = [self.windowSize+2*self.flankingSize, self.windowSize+2*self.flankingSize, (self.windowSize+2*self.flankingSize)*self.binSize]
         nr_samples_list = []
@@ -606,15 +683,15 @@ class DataContainer():
             raise RuntimeError(msg)
 
         windowSize = self.windowSize
-        flankingSize = self.flankingSize
-        if flankingSize is None:
-            flankingSize = 0
-            self.flankingSize = 0
+        if self.gridCoordinates is not None:
+            r_start, c_start = self.gridCoordinates[idx]
+            factorArray = self.FactorDataArray[r_start:r_start + windowSize, c_start:c_start + windowSize]
+        else:
+            flankingSize = self.flankingSize if self.flankingSize is not None else 0
+            startInd = idx + flankingSize
+            stopInd = startInd + windowSize
+            factorArray = self.FactorDataArray[startInd:stopInd, startInd:stopInd]
 
-        startInd = idx + flankingSize
-        stopInd = startInd + windowSize
-
-        factorArray = self.FactorDataArray[startInd:stopInd, startInd:stopInd]
         factorArray = np.nan_to_num(factorArray)
 
         if self.targetValueRange is not None:
@@ -628,12 +705,15 @@ class DataContainer():
         if self.RandomInputArray is None:
             return None
         windowSize = self.windowSize
-        flankingSize = self.flankingSize if self.flankingSize is not None else 0
-        startInd = idx + flankingSize
-        stopInd = startInd + windowSize
+        if self.gridCoordinates is not None:
+            r_start, c_start = self.gridCoordinates[idx]
+            chromWindow = self.RandomInputArray[r_start:r_start + windowSize, c_start:c_start + windowSize]
+        else:
+            flankingSize = self.flankingSize if self.flankingSize is not None else 0
+            startInd = idx + flankingSize
+            stopInd = startInd + windowSize
+            chromWindow = self.RandomInputArray[startInd:stopInd, startInd:stopInd]
 
-        # Slice the 2D multi-channel chromatin factor window (windowSize, windowSize, nr_factors)
-        chromWindow = self.RandomInputArray[startInd:stopInd, startInd:stopInd]
         if chromWindow.ndim == 2:
             chromWindow = np.expand_dims(chromWindow, axis=-1)
         return chromWindow
