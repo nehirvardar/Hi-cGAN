@@ -41,7 +41,8 @@ class HiCGAN():
                      input_size: int = 256,
                      plot_frequency: int = 20,
                      plot_type: str = "png",
-                     learning_rate: float = 1e-5,
+                     learning_rate: float = 2e-5,
+                     decay_steps: int = None,
                      adam_beta_1: float = 0.5,
                      pretrained_model_path: str = "",
                      scope=None,
@@ -69,8 +70,17 @@ class HiCGAN():
 
             self.alphas_bar = tf.math.cumprod(self.alphas)
 
+            if decay_steps is not None and decay_steps > 0:
+                opt_lr = keras.optimizers.schedules.CosineDecay(
+                    initial_learning_rate=learning_rate,
+                    decay_steps=decay_steps,
+                    alpha=0.05
+                )
+            else:
+                opt_lr = learning_rate
+
             self.denoiser_optimizer = keras.optimizers.Adam(
-                learning_rate=learning_rate, beta_1=adam_beta_1, name="Adam_UNet")
+                learning_rate=opt_lr, beta_1=adam_beta_1, name="Adam_UNet")
 
             if self.mixed_precision:
                 self.denoiser_optimizer = keras.mixed_precision.LossScaleOptimizer(self.denoiser_optimizer)
@@ -238,7 +248,11 @@ class HiCGAN():
             x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
             x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
 
-            loss = noise_loss + x0_loss
+            # Sparsity-inducing background penalty: drives faint mist/fog on true-zero pixels to exact 0.0
+            zero_mask = tf.cast(real_dna_matrix == 0.0, tf.float32)
+            bg_l1_loss = tf.reduce_mean(alpha_bar_t * zero_mask * tf.abs(x0_pred))
+
+            loss = noise_loss + x0_loss + 0.5 * bg_l1_loss
 
             if self.mixed_precision:
                 scaled_loss = self.denoiser_optimizer.get_scaled_loss(loss)
@@ -275,7 +289,9 @@ class HiCGAN():
         x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
         x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
         x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
-        return noise_loss + x0_loss
+        zero_mask = tf.cast(real_dna_matrix == 0.0, tf.float32)
+        bg_l1_loss = tf.reduce_mean(alpha_bar_t * zero_mask * tf.abs(x0_pred))
+        return noise_loss + x0_loss + 0.5 * bg_l1_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
         rna_condition = tf.cast(test_input["factorData"][:1], tf.float32)

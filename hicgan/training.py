@@ -54,7 +54,7 @@ def parse_arguments(args=None):
                         type=int, default=10,
                         help="Number of epochs for training.")
     parser.add_argument("--earlyStoppingPatience", "--earlyStop", "--patience", "-esp", "-es", required=False,
-                        type=int, default=5,
+                        type=int, default=10,
                         help="Stop training if validation loss does not improve for this many consecutive epochs (default: 5; set 0 to disable).")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
@@ -73,7 +73,7 @@ def parse_arguments(args=None):
                         help="Loss weight for Total-Variation-loss of denoiser.")
     parser.add_argument("--learningRatedenoiser", "--learningRate", "--lr", "-lrg", "-lr", required=False,
                         type=float,
-                        default=1e-5,
+                        default=2e-5,
                         help="Learning rate for Adam optimizer of denoiser (default: 1e-5).")
     parser.add_argument("--timesteps", "-T", required=False,
                         type=int, default=1000,
@@ -463,11 +463,13 @@ def training(pTfRecordFilenames,
         if pFlipSamples:
             steps_per_epoch *= 2
 
+        total_steps = steps_per_epoch * pEpochs
         diffusionModel = hicGAN.HiCGAN(
                 log_dir=pOutputFolder,
                 number_factors=pNumberOfFactors,
                 input_size=pWindowSize,
                 learning_rate=pLearningRatedenoiser,
+                decay_steps=total_steps,
                 timesteps=pTimesteps,
                 adam_beta_1=pBeta1,
                 plot_type=pFigureFileFormat,
@@ -479,7 +481,7 @@ def training(pTfRecordFilenames,
         diffusionModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
         log.info("Starting training at %s" % datetime.now())
-        print(f"Training Configuration -> Factors: {pNumberOfFactors} | LR: {pLearningRatedenoiser:g} | BatchSize: {pBatchSize} | EarlyStopPatience: {pEarlyStoppingPatience}")
+        print(f"Training Configuration -> Factors: {pNumberOfFactors} | LR: {pLearningRatedenoiser:g} (CosineDecay to {pLearningRatedenoiser*0.05:g}) | BatchSize: {pBatchSize} | EarlyStopPatience: {pEarlyStoppingPatience}")
         # fit function
         diffusionModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
                                steps_per_epoch=steps_per_epoch,
