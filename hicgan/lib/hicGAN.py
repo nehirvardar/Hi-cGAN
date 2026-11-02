@@ -37,7 +37,8 @@ class HiCGAN():
                     mixed_precision: bool = False,
                     restore_checkpoint: bool = False,
                     use_embedding: bool = True,
-                    enforce_symmetry: bool = True):
+                    enforce_symmetry: bool = True,
+                    use_pair_features: bool = False):
         super().__init__()
         # When True, optimizers are wrapped for loss scaling and the loss
         # functions cast their inputs to float32. The global mixed_float16
@@ -54,6 +55,7 @@ class HiCGAN():
         if input_size in [64,128,256, 512, 768, 1024]:
             self.input_size = input_size
         self.number_factors = number_factors
+        self.use_pair_features = bool(use_pair_features) and (self.number_factors > self.input_size)
         self.loss_weight_pixel = loss_weight_pixel
         self.loss_weight_discriminator = loss_weight_discriminator
         self.loss_weight_adversarial = loss_weight_adversarial
@@ -63,9 +65,9 @@ class HiCGAN():
 
         init_msg = (
             f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
-            f"use_embedding={self.use_embedding} ({'1D BigWig -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
-            f"enforce_symmetry={self.enforce_symmetry}, loss_type_pixel={self.loss_type_pixel}, "
-            f"foreground_loss_weight={self.foreground_loss_weight}, mixed_precision={self.mixed_precision}"
+            f"use_embedding={self.use_embedding} ({'1D -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
+            f"use_pair_features={self.use_pair_features}, enforce_symmetry={self.enforce_symmetry}, "
+            f"loss_type_pixel={self.loss_type_pixel}, foreground_loss_weight={self.foreground_loss_weight}, mixed_precision={self.mixed_precision}"
         )
         log.info(init_msg)
         print(init_msg)
@@ -165,13 +167,16 @@ class HiCGAN():
           4. Refines the 2D representation with Conv2D layers and outputs a (W, W, 16) 2D feature + distance tensor.
         """
         inputs = tf.keras.layers.Input(shape=(3*self.input_size, self.number_factors))
-        is_grid_mode = (not self.enforce_symmetry) and (self.number_factors >= 4) and (self.number_factors % 2 == 0)
-        n_chrom_factors = (self.number_factors // 2) - 1 if is_grid_mode else self.number_factors
+        has_pair_2d = bool(self.use_pair_features) and (self.number_factors > self.input_size)
+        n_1d_total = (self.number_factors - self.input_size) if has_pair_2d else self.number_factors
+        is_grid_mode = (not self.enforce_symmetry) and (n_1d_total >= 4) and (n_1d_total % 2 == 0)
+        n_chrom_factors = (n_1d_total // 2) - 1 if is_grid_mode else n_1d_total
 
-        f_row, f_col, pos_row, pos_col = SplitChromatinStreamsLayer(
+        f_row, f_col, pos_row, pos_col, pair_mat_2d = SplitChromatinStreamsLayer(
             window_size=self.input_size,
             number_factors=self.number_factors,
             is_grid_mode=is_grid_mode,
+            has_pair_2d=has_pair_2d,
             name="split_chromatin_streams"
         )(inputs)
 
@@ -214,14 +219,16 @@ class HiCGAN():
         pair_2d, dist_2d = Pairwise2DEmbeddingLayer(
             window_size=self.input_size,
             is_grid_mode=is_grid_mode,
+            has_pair_2d=has_pair_2d,
             name="pairwise_2d_embedding"
-        )([f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col])
+        )([f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col, pair_mat_2d])
 
         initializer = tf.random_normal_initializer(0., 0.02)
         z = Conv2D(64, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_1")(pair_2d)
         z = GroupNormalization(groups=8, axis=-1, name="emb_gn2d_1")(z)
         z = LeakyReLU(alpha=0.2, name="emb_act2d_1")(z)
-        z = Conv2D(12, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_2")(z)
+        n_emb_conv2 = 11 if has_pair_2d else 12
+        z = Conv2D(n_emb_conv2, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_2")(z)
         z = LeakyReLU(alpha=0.2, name="emb_act2d_2")(z)
 
         x = tf.keras.layers.Concatenate(axis=-1, name="emb_concat_dist")([z, dist_2d])
@@ -998,37 +1005,48 @@ class Symmetrize2DLayer(tf.keras.layers.Layer):
 @tf.keras.utils.register_keras_serializable(package="hicgan")
 class SplitChromatinStreamsLayer(tf.keras.layers.Layer):
     """
-    Split 1D factorData of shape (batch, 3*W, number_factors) into:
-      - f_row:   (batch, 3*W, n_chrom)
-      - f_col:   (batch, 3*W, n_chrom)
-      - pos_row: (batch, 3*W, 1)
-      - pos_col: (batch, 3*W, 1)
-    In 'grid' mode, input channels are [f_row (F), pos_row (1), f_col (F), pos_col (1)].
-    In 'diagonal' mode, input channels are [f_row (F)] with f_col = f_row and pos = 0.
+    Split 1D (+ optional packed 2D pair_features) factorData of shape (batch, 3*W, number_factors) into:
+      - f_row:       (batch, 3*W, n_chrom)
+      - f_col:       (batch, 3*W, n_chrom)
+      - pos_row:     (batch, 3*W, 1)
+      - pos_col:     (batch, 3*W, 1)
+      - pair_mat_2d: (batch, W, W, 1)
     """
-    def __init__(self, window_size: int, number_factors: int, is_grid_mode: bool = False, **kwargs):
+    def __init__(self, window_size: int, number_factors: int, is_grid_mode: bool = False, has_pair_2d: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.window_size = int(window_size)
         self.number_factors = int(number_factors)
         self.is_grid_mode = bool(is_grid_mode)
+        self.has_pair_2d = bool(has_pair_2d)
 
     def call(self, inputs):
         x = inputs
         if x.shape.rank == 4:
             x = tf.squeeze(x, axis=-1)
-        if self.is_grid_mode and self.number_factors >= 4 and (self.number_factors % 2 == 0):
-            half_ch = self.number_factors // 2
-            n_chrom = half_ch - 1
-            f_row = x[:, :, :n_chrom]
-            pos_row = x[:, :, n_chrom:half_ch]
-            f_col = x[:, :, half_ch : half_ch + n_chrom]
-            pos_col = x[:, :, half_ch + n_chrom : 2 * half_ch]
+        W = self.window_size
+        if self.has_pair_2d and self.number_factors > W:
+            c_1d = self.number_factors - W
+            x_1d = x[:, :, :c_1d]
+            pair_mat_2d = tf.expand_dims(x[:, W : 2 * W, c_1d:], axis=-1)
         else:
-            f_row = x
-            f_col = x
-            pos_row = tf.zeros_like(x[:, :, :1])
-            pos_col = tf.zeros_like(x[:, :, :1])
-        return f_row, f_col, pos_row, pos_col
+            c_1d = self.number_factors
+            x_1d = x
+            z_base = x[:, W : 2 * W, :1] * 0.0
+            pair_mat_2d = tf.expand_dims(z_base, axis=2) + tf.expand_dims(z_base, axis=1)
+
+        if self.is_grid_mode and c_1d >= 4 and (c_1d % 2 == 0):
+            half_ch = c_1d // 2
+            n_chrom = half_ch - 1
+            f_row = x_1d[:, :, :n_chrom]
+            pos_row = x_1d[:, :, n_chrom:half_ch]
+            f_col = x_1d[:, :, half_ch : half_ch + n_chrom]
+            pos_col = x_1d[:, :, half_ch + n_chrom : 2 * half_ch]
+        else:
+            f_row = x_1d
+            f_col = x_1d
+            pos_row = tf.zeros_like(x_1d[:, :, :1])
+            pos_col = tf.zeros_like(x_1d[:, :, :1])
+        return f_row, f_col, pos_row, pos_col, pair_mat_2d
 
     def get_config(self):
         cfg = super().get_config()
@@ -1036,6 +1054,7 @@ class SplitChromatinStreamsLayer(tf.keras.layers.Layer):
             "window_size": self.window_size,
             "number_factors": self.number_factors,
             "is_grid_mode": self.is_grid_mode,
+            "has_pair_2d": self.has_pair_2d,
         })
         return cfg
 
@@ -1043,24 +1062,19 @@ class SplitChromatinStreamsLayer(tf.keras.layers.Layer):
 @tf.keras.utils.register_keras_serializable(package="hicgan")
 class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
     """
-    Construct a 2D (batch, W, W, C_pair) pairwise chromatin + genomic distance representation:
-      1. Extracts the exact center window [W : 2*W] from the dilated 1D encoder outputs and raw tracks,
-         concatenating with the strided context features to form 1D bin embeddings e_row, e_col of shape (batch, W, C_1d).
-      2. Computes the exact 2D genomic bin distance d_ij = |(r0 + i) - (c0 + j)| for every (i, j) pixel
-         and encodes it into 4 multi-scale distance decay channels D(i, j).
-      3. Forms 2D pairwise combinations at (i, j):
-         [E_row * E_col, (E_row * E_col) * d_inv2, 0.5*(E_row + E_col), |E_row - E_col|, E_row, E_col, D(i, j)].
+    Construct a 2D (batch, W, W, C_pair) pairwise chromatin + genomic distance (+ optional 2D pair_features) representation.
     """
-    def __init__(self, window_size: int, is_grid_mode: bool = False, **kwargs):
+    def __init__(self, window_size: int, is_grid_mode: bool = False, has_pair_2d: bool = False, **kwargs):
         super().__init__(**kwargs)
         self.window_size = int(window_size)
         self.is_grid_mode = bool(is_grid_mode)
+        self.has_pair_2d = bool(has_pair_2d)
         idx = np.arange(self.window_size, dtype=np.float32)
         diag_dist_bins = np.abs(idx[:, None] - idx[None, :])[None, :, :, None]
         self._diag_dist_bins = tf.constant(diag_dist_bins, dtype=tf.float32)
 
     def call(self, inputs):
-        f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col = inputs
+        f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col, pair_mat_2d = inputs
         W = self.window_size
         compute_dtype = h_row_full.dtype
 
@@ -1091,7 +1105,7 @@ class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
         d_exp = tf.exp(-dist_norm)
         d_diag = tf.exp(-tf.square(dist_bins / 1.5))
 
-        dist_2d = tf.cast(tf.concat([d_inv1, d_inv2, d_exp, d_diag], axis=-1), compute_dtype)
+        dist_only = tf.cast(tf.concat([d_inv1, d_inv2, d_exp, d_diag], axis=-1), compute_dtype)
         d_gate = tf.cast(d_inv2, compute_dtype)
 
         E_prod = E_row * E_col
@@ -1099,7 +1113,14 @@ class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
         E_sum = 0.5 * (E_row + E_col)
         E_diff = tf.abs(E_row - E_col)
 
-        pair_2d = tf.concat([E_prod, E_prod_gated, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
+        if self.has_pair_2d:
+            pair_2d_feat = tf.cast(pair_mat_2d, compute_dtype)
+            E_prod_kmer = E_prod * pair_2d_feat
+            dist_2d = tf.concat([dist_only, pair_2d_feat], axis=-1)
+            pair_2d = tf.concat([E_prod, E_prod_gated, E_prod_kmer, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
+        else:
+            dist_2d = dist_only
+            pair_2d = tf.concat([E_prod, E_prod_gated, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
         return pair_2d, dist_2d
 
     def get_config(self):
@@ -1107,6 +1128,7 @@ class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
         cfg.update({
             "window_size": self.window_size,
             "is_grid_mode": self.is_grid_mode,
+            "has_pair_2d": self.has_pair_2d,
         })
         return cfg
 

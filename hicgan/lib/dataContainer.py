@@ -7,6 +7,7 @@ import concurrent.futures
 
 from . import utils
 from . import records
+from . import featurePack
 
 
 import logging
@@ -16,18 +17,26 @@ log = logging.getLogger(__name__)
 class DataContainer():
     def __init__(self, chromosome, matrixFilePath, chromatinFolder, binSize=None,
                  inputMode=None, numBins=None, randomSeed=None,
-                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
+                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None,
+                 featureSet="representative", usePairFeatures=True):
         self.chromosome = str(chromosome)
         self.matrixFilePath = matrixFilePath
         self.chromatinFolder = chromatinFolder
         if inputMode is None:
             if chromatinFolder is None or str(chromatinFolder).lower() in ("random", "random2d", "none", ""):
                 self.inputMode = "random2d"
+            elif featurePack.is_feature_pack_source(chromatinFolder):
+                self.inputMode = "feature_pack"
             else:
                 self.inputMode = "bigwig"
         else:
             self.inputMode = str(inputMode).lower()
+            if self.inputMode == "bigwig" and featurePack.is_feature_pack_source(chromatinFolder):
+                self.inputMode = "feature_pack"
+        self.featureSet = featureSet if featureSet is not None else "representative"
+        self.usePairFeatures = bool(usePairFeatures)
         self.FactorDataArray = None
+        self.SparsePairMatrix = None
         self.RandomMatrix2D = None
         self.nr_factors = None
         self.sparseHiCMatrix = None
@@ -93,6 +102,60 @@ class DataContainer():
             self.FactorDataArray = self.RandomMatrix2D
             self.factorNames = ["random2d"]
             self.nr_factors = 1
+            return
+
+        if self.inputMode == "feature_pack" or featurePack.is_feature_pack_source(self.chromatinFolder):
+            self.inputMode = "feature_pack"
+            if self.chromatinFolder is None:
+                raise ValueError("chromatinFolder must point to feature_paketi directory when inputMode=='feature_pack'")
+            if self.binSize is None:
+                self.binSize = utils.inferBinSizeFromPath(self.matrixFilePath or self.chromatinFolder, 250000)
+
+            target_bins = None
+            if self.sparseHiCMatrix is not None:
+                target_bins = int(self.sparseHiCMatrix.shape[0])
+            elif self.numBins is not None:
+                target_bins = int(self.numBins)
+
+            feat_arr, feat_names = featurePack.get_chrom_bin_features(
+                pPackDir=self.chromatinFolder,
+                pChrom=self.chromosome,
+                pFeatureSet=self.featureSet,
+                pNumBins=target_bins,
+            )
+            nr_bins = int(feat_arr.shape[0])
+            self.FactorDataArray = feat_arr
+            self.factorNames = list(feat_names)
+            base_factors = len(self.factorNames)
+            self.base_nr_factors = base_factors
+
+            if self.usePairFeatures:
+                self.SparsePairMatrix = featurePack.get_chrom_pair_matrix(
+                    pPackDir=self.chromatinFolder,
+                    pChrom=self.chromosome,
+                    pNumBins=nr_bins,
+                )
+            else:
+                self.SparsePairMatrix = None
+
+            nr_1d = (base_factors + 1) * 2 if self.windowMode == "grid" else base_factors
+            pair_ch = int(self.windowSize) if (self.SparsePairMatrix is not None and self.windowSize is not None) else 0
+            self.nr_factors = nr_1d + pair_ch
+            self.chromSize_factors = int(nr_bins * self.binSize)
+            if self.original_num_bins is None:
+                self.original_num_bins = nr_bins
+            self.numBins = nr_bins
+            pair_info = (
+                f"+ 2D kmer7_revcomp_cosine ({self.SparsePairMatrix.shape[0]}x{self.SparsePairMatrix.shape[1]}, nnz={self.SparsePairMatrix.nnz})"
+                if self.SparsePairMatrix is not None
+                else "(2D pair features disabled)"
+            )
+            msg = (
+                f"[FEATURE-PACK] Chromosome {self.chromosome}: loaded {base_factors} 1D bin features "
+                f"(featureSet='{self.featureSet}', bins={nr_bins}) {pair_info} -> total input channels={self.nr_factors}"
+            )
+            log.info(msg)
+            print(msg, flush=True)
             return
 
         #load chromatin factor data from bigwig files
@@ -273,6 +336,7 @@ class DataContainer():
     def __unloadFactorData(self):
         #unload chromatin factor data to save memory, but do not touch metadata 
         self.FactorDataArray = None
+        self.SparsePairMatrix = None
         self.RandomMatrix2D = None
         
     def __unloadMatrixData(self):
@@ -382,6 +446,22 @@ class DataContainer():
                 dtype=csr.dtype
             )
 
+        if self.SparsePairMatrix is not None:
+            csr_p = self.SparsePairMatrix.tocsr()
+            shifted_p_indices = csr_p.indices.copy() + left_pad if left_pad > 0 else csr_p.indices.copy()
+            indptr_p_parts = []
+            if left_pad > 0:
+                indptr_p_parts.append(np.zeros(left_pad, dtype=csr_p.indptr.dtype))
+            indptr_p_parts.append(csr_p.indptr)
+            if right_pad > 0:
+                indptr_p_parts.append(np.full(right_pad, csr_p.indptr[-1], dtype=csr_p.indptr.dtype))
+            padded_p_indptr = np.concatenate(indptr_p_parts)
+            self.SparsePairMatrix = csr_matrix(
+                (csr_p.data.copy(), shifted_p_indices, padded_p_indptr),
+                shape=(total_bins, total_bins),
+                dtype=csr_p.dtype
+            )
+
         if self.inputMode == "random2d" and self.RandomMatrix2D is not None:
             self.RandomMatrix2D = np.pad(
                 self.RandomMatrix2D,
@@ -454,12 +534,19 @@ class DataContainer():
                  scaleTargets=False, minTargetCoverage=0.0, excludedRegions=None, includedRegions=None,
                  targetValueRange=None, inputMode=None, windowMode="diagonal", gridStride=None,
                  padShortChromosomes=True, logTransformTarget=False, randomSeed=None,
-                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
+                 flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None,
+                 featureSet=None, usePairFeatures=None):
         if not isinstance(windowSize, int):
             msg = "windowSize must be integer"
             raise TypeError(msg)
         if inputMode is not None:
             self.inputMode = str(inputMode).lower()
+            if self.inputMode == "bigwig" and featurePack.is_feature_pack_source(self.chromatinFolder):
+                self.inputMode = "feature_pack"
+        if featureSet is not None:
+            self.featureSet = featureSet
+        if usePairFeatures is not None:
+            self.usePairFeatures = bool(usePairFeatures)
         if randomSeed is not None:
             self.randomSeed = randomSeed
         if flankPadChromosomes is not None:
@@ -516,10 +603,10 @@ class DataContainer():
         log.debug("Factors: {:s} -- Matrix: {:s} -- windowSize: {:s} -- flankingSize: {:s} -- maximumDistance: {:s}".format(str(factorsOK), str(matrixOK), str(windowSizeOK), str(flankingSizeOK), str(maximumDistanceOK)))
         log.debug("Chromatin folder: {:s} -- Nr. factors: {:s}".format(str(self.chromatinFolder), str(self.nr_factors)))
         log.debug("Chromatin folder: {:s} -- Nr. factors: {:s}".format(str(container.chromatinFolder), str(container.nr_factors)))
-        #sanity check loading of bigwig files
-        if self.inputMode == "bigwig" and self.chromatinFolder is not None and self.nr_factors is None:
+        #sanity check loading of bigwig / feature_pack files
+        if self.inputMode in ("bigwig", "feature_pack") and self.chromatinFolder is not None and self.nr_factors is None:
             return False
-        if container.inputMode == "bigwig" and container.chromatinFolder is not None and container.nr_factors is None:
+        if container.inputMode in ("bigwig", "feature_pack") and container.chromatinFolder is not None and container.nr_factors is None:
             return False
         #if chromatin factors are present, the numbers and names of chromatin factors must match
         factorsOK = factorsOK and (self.nr_factors == container.nr_factors)
@@ -858,7 +945,7 @@ class DataContainer():
         return trainmatrix
     
     def __getFactorData(self, idx):
-        if self.inputMode == "bigwig" and self.chromatinFolder is None:
+        if self.inputMode in ("bigwig", "feature_pack") and self.chromatinFolder is None:
             return None
         if not self.data_loaded:
             msg = "Error: Load data first"
@@ -882,19 +969,33 @@ class DataContainer():
             factorArray = np.expand_dims(factorArray, axis=-1)
             return factorArray
 
-        # 1D BigWig mode
+        # 1D BigWig / FeaturePack mode
+        span = 2 * flankingSize + windowSize
         if self.windowMode == "grid" and self.gridCoordinates is not None:
             r0, c0 = int(self.gridCoordinates[idx, 0]), int(self.gridCoordinates[idx, 1])
-            span = 2 * flankingSize + windowSize
             f_row = self.FactorDataArray[r0 : r0 + span]
             f_col = self.FactorDataArray[c0 : c0 + span]
             pos_row = (np.arange(r0, r0 + span, dtype=np.float32) / float(windowSize))[:, np.newaxis]
             pos_col = (np.arange(c0, c0 + span, dtype=np.float32) / float(windowSize))[:, np.newaxis]
             factorArray = np.concatenate([f_row, pos_row, f_col, pos_col], axis=-1)
+            if self.SparsePairMatrix is not None:
+                rStart, rStop = r0 + flankingSize, r0 + flankingSize + windowSize
+                cStart, cStop = c0 + flankingSize, c0 + flankingSize + windowSize
+                pair_sub = np.asarray(self.SparsePairMatrix[rStart:rStop, cStart:cStop].todense(), dtype=np.float32)
+                pair_block = np.zeros((span, windowSize), dtype=np.float32)
+                pair_block[flankingSize : flankingSize + windowSize, :] = pair_sub
+                factorArray = np.concatenate([factorArray, pair_block], axis=-1)
         else:
             startIdx = idx
-            endIdx = startIdx + 2 * flankingSize + windowSize
+            endIdx = startIdx + span
             factorArray = self.FactorDataArray[startIdx:endIdx]
+            if self.SparsePairMatrix is not None:
+                startInd = idx + flankingSize
+                stopInd = startInd + windowSize
+                pair_sub = np.asarray(self.SparsePairMatrix[startInd:stopInd, startInd:stopInd].todense(), dtype=np.float32)
+                pair_block = np.zeros((span, windowSize), dtype=np.float32)
+                pair_block[flankingSize : flankingSize + windowSize, :] = pair_sub
+                factorArray = np.concatenate([factorArray, pair_block], axis=-1)
         factorArray = np.expand_dims(factorArray, axis=-1)
         return factorArray
 

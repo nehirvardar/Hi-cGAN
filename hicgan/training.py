@@ -12,6 +12,7 @@ from .lib import hicGAN
 from .lib import dataContainer
 from .lib import records
 from .lib import utils
+from .lib import featurePack
 
 from hicgan._version import __version__
 
@@ -41,10 +42,22 @@ def parse_arguments(args=None):
                         default=None, type=str, nargs='+',
                         help="Path where chromatin factors for validation reside (bigwig files). Optional in 'random2d' inputMode.")
     parser.add_argument("--inputMode", "-im", required=False,
-                        type=str, choices=["bigwig", "random2d"], default=None,
-                        help="Input feature mode: 'bigwig' (1D chromatin BigWig tracks + cnn_embedding) or "
+                        type=str, choices=["bigwig", "feature_pack", "random2d"], default=None,
+                        help="Input feature mode: 'bigwig' (1D chromatin BigWig tracks + cnn_embedding), "
+                             "'feature_pack' (bin_features.xlsx + optional 2D pair_features.xlsx from feature_paketi), or "
                              "'random2d' (direct 2D symmetric random matrix input, bypassing cnn_embedding). "
-                             "Defaults to 'random2d' when -tcp is omitted, otherwise 'bigwig'.")
+                             "Auto-detected from -tcp when omitted.")
+    parser.add_argument("--featureSet", "-fset", required=False,
+                        type=str, default="representative",
+                        help="Feature subset preset or comma-separated sheet/column names when --inputMode is 'feature_pack': "
+                             "'representative' (default, 24 non-redundant cols + 3 indicators), 'direct', 'tier1_2', "
+                             "'gm12878', 'hela', or 'all' (all 80 cols + 3 indicators).")
+    parser.add_argument("--usePairFeatures", "-upf", dest="usePairFeatures",
+                        action="store_true", default=True,
+                        help="Include 2D kmer7_revcomp_cosine from pair_features.xlsx when --inputMode is 'feature_pack' (default: True).")
+    parser.add_argument("--noPairFeatures", "-npf", dest="usePairFeatures",
+                        action="store_false",
+                        help="Disable 2D pair_features.xlsx channel when --inputMode is 'feature_pack' (1D bin_features only).")
     parser.add_argument("--windowMode", "-wm", required=False,
                         type=str, choices=["diagonal", "grid"], default="diagonal",
                         help="Windowing mode: 'diagonal' (sliding windows along main diagonal [i:i+W, i:i+W]) or "
@@ -241,7 +254,8 @@ def parse_arguments(args=None):
     return parser
 
 def create_container(chrom, matrix, chromatinpath, binSize=None, inputMode="bigwig", randomSeed=42,
-                     flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
+                     flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None,
+                     featureSet="representative", usePairFeatures=True):
     container = dataContainer.DataContainer(chromosome=chrom,
                                             matrixFilePath=matrix,
                                             chromatinFolder=chromatinpath,
@@ -250,7 +264,9 @@ def create_container(chrom, matrix, chromatinpath, binSize=None, inputMode="bigw
                                             randomSeed=randomSeed,
                                             flankPadChromosomes=flankPadChromosomes,
                                             flankPadMaxBins=flankPadMaxBins,
-                                            flankPadMinRatio=flankPadMinRatio)
+                                            flankPadMinRatio=flankPadMinRatio,
+                                            featureSet=featureSet,
+                                            usePairFeatures=usePairFeatures)
     return container
 
 def create_data(pTrainingMatrices, 
@@ -279,7 +295,9 @@ def create_data(pTrainingMatrices,
                 pLogTransformTarget=False,
                 pFlankPadChromosomes=None,
                 pFlankPadMaxBins=None,
-                pFlankPadMinRatio=None):
+                pFlankPadMinRatio=None,
+                pFeatureSet="representative",
+                pUsePairFeatures=True):
     os.makedirs(pOutputFolder, exist_ok=True)
     debugstate = None
     paramDict = locals().copy()
@@ -299,7 +317,7 @@ def create_data(pTrainingMatrices,
             pvalidationChromatinFolders = [None] * len(pValidationMatrices)
     else:
         if not ptrainingChromatinFolders or not pvalidationChromatinFolders:
-            raise SystemExit("Aborting. --trainingChromatinFolders (-tcp) and --validationChromatinFolders (-vcp) are required when --inputMode is 'bigwig'.")
+            raise SystemExit(f"Aborting. --trainingChromatinFolders (-tcp) and --validationChromatinFolders (-vcp) are required when --inputMode is '{pInputMode}'.")
         if len(pTrainingMatrices) != len(ptrainingChromatinFolders):
             msg = "Number of train matrices and chromatin paths must match\n"
             msg += "Current numbers: Matrices: {:d}; Chromatin Paths: {:d}"
@@ -313,12 +331,12 @@ def create_data(pTrainingMatrices,
 
     log.info(
         "[CREATE-DATA] Preparing containers: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
-        "trainChroms=%s, valChroms=%s",
-        pInputMode, pWindowMode, str(pGridStride), pWindowSize, trainChromNameList, valChromNameList
+        "featureSet=%s, usePairFeatures=%s, trainChroms=%s, valChroms=%s",
+        pInputMode, pWindowMode, str(pGridStride), pWindowSize, pFeatureSet, str(pUsePairFeatures), trainChromNameList, valChromNameList
     )
     print(
         f"[CREATE-DATA] Preparing containers: inputMode={pInputMode}, windowMode={pWindowMode}, "
-        f"gridStride={pGridStride}, windowSize={pWindowSize}, "
+        f"gridStride={pGridStride}, windowSize={pWindowSize}, featureSet={pFeatureSet}, usePairFeatures={pUsePairFeatures}, "
         f"trainChroms={trainChromNameList}, valChroms={valChromNameList}",
         flush=True
     )
@@ -329,7 +347,8 @@ def create_data(pTrainingMatrices,
             traindataContainerList.append(
                 create_container(
                     chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
-                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                    featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures
                 )
             )
 
@@ -339,7 +358,8 @@ def create_data(pTrainingMatrices,
             valdataContainerList.append(
                 create_container(
                     chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
-                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                    featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures
                 )
             )
 
@@ -391,6 +411,8 @@ def create_data(pTrainingMatrices,
         "flankPadChromosomes": pFlankPadChromosomes,
         "flankPadMaxBins": pFlankPadMaxBins,
         "flankPadMinRatio": pFlankPadMinRatio,
+        "featureSet": pFeatureSet,
+        "usePairFeatures": pUsePairFeatures,
     }
     if pExcludeRegions:
         missing = [f for f in pExcludeRegions if not os.path.isfile(f)]
@@ -497,7 +519,8 @@ def training(pTfRecordFilenames,
              pInputMode="random2d",
              pWindowMode="diagonal",
              pLogTransformTarget=False,
-             pForegroundLossWeight=10.0
+             pForegroundLossWeight=10.0,
+             pUsePairFeatures=False
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -548,7 +571,8 @@ def training(pTfRecordFilenames,
         if pFlipSamples:
             is_2d_inp = (pInputMode == "random2d")
             is_grid_m = (pWindowMode == "grid")
-            flippedDs = trainDs.map(lambda a,b: records.mirror_function(a["factorData"], b["out_matrixData"], is_2d_input=is_2d_inp, is_grid_mode=is_grid_m))
+            has_pair = bool(pUsePairFeatures) and (pInputMode == "feature_pack")
+            flippedDs = trainDs.map(lambda a,b: records.mirror_function(a["factorData"], b["out_matrixData"], is_2d_input=is_2d_inp, is_grid_mode=is_grid_m, has_pair_2d=has_pair))
             trainDs = trainDs.concatenate(flippedDs)
         trainDs = trainDs.shuffle(buffer_size=shuffleBufferSize, reshuffle_each_iteration=True)
         trainDs = trainDs.batch(pBatchSize, drop_remainder=True)
@@ -568,7 +592,7 @@ def training(pTfRecordFilenames,
         if pFlipSamples:
             steps_per_epoch *= 2
 
-        use_embedding = (pInputMode == "bigwig")
+        use_embedding = (pInputMode in ("bigwig", "feature_pack"))
         enforce_symmetry = (pWindowMode == "diagonal")
         if use_embedding and isinstance(pStoredFeaturesDict, dict) and "factorData" in pStoredFeaturesDict:
             stored_shape = pStoredFeaturesDict["factorData"].get("shape")
@@ -593,7 +617,8 @@ def training(pTfRecordFilenames,
                                         mixed_precision=pMixedPrecision,
                                         restore_checkpoint=pResume,
                                         use_embedding=use_embedding,
-                                        enforce_symmetry=enforce_symmetry)
+                                        enforce_symmetry=enforce_symmetry,
+                                        use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
         
         hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
@@ -619,15 +644,24 @@ def main(args=None):
 
     inputMode = args.inputMode
     if inputMode is None:
-        inputMode = "random2d" if not args.trainingChromatinFolders else "bigwig"
+        if not args.trainingChromatinFolders:
+            inputMode = "random2d"
+        elif any(featurePack.is_feature_pack_source(p) for p in args.trainingChromatinFolders):
+            inputMode = "feature_pack"
+        else:
+            inputMode = "bigwig"
+    elif inputMode == "bigwig" and args.trainingChromatinFolders and any(featurePack.is_feature_pack_source(p) for p in args.trainingChromatinFolders):
+        inputMode = "feature_pack"
     windowMode = args.windowMode
+    featureSet = args.featureSet
+    usePairFeatures = bool(args.usePairFeatures) and (inputMode == "feature_pack")
     randomSeed = args.seed if args.seed is not None else 42
 
     log.info(
         "[MAIN] Starting hicTraining: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
-        "binSize=%d, logTransformTarget=%s, seed=%s",
+        "featureSet=%s, usePairFeatures=%s, binSize=%d, logTransformTarget=%s, seed=%s",
         inputMode, windowMode, str(args.gridStride), args.windowSize,
-        args.binSize, str(args.logTransformTarget), str(args.seed)
+        featureSet, str(usePairFeatures), args.binSize, str(args.logTransformTarget), str(args.seed)
     )
 
     #seed every generator that can affect a run: weight initialisation, the
@@ -761,7 +795,9 @@ def main(args=None):
                 pLogTransformTarget=args.logTransformTarget,
                 pFlankPadChromosomes=args.flankPadChromosomes,
                 pFlankPadMaxBins=args.flankPadMaxBins,
-                pFlankPadMinRatio=args.flankPadMinRatio
+                pFlankPadMinRatio=args.flankPadMinRatio,
+                pFeatureSet=featureSet,
+                pUsePairFeatures=usePairFeatures
             )
             meta = {
                 "tfRecordFilenames": tfRecordFilenames,
@@ -778,6 +814,8 @@ def main(args=None):
                 "flankPadChromosomes": args.flankPadChromosomes,
                 "flankPadMaxBins": args.flankPadMaxBins,
                 "flankPadMinRatio": args.flankPadMinRatio,
+                "featureSet": featureSet,
+                "usePairFeatures": usePairFeatures,
                 "seed": randomSeed,
                 "created_at": datetime.utcnow().isoformat()
             }
@@ -801,6 +839,8 @@ def main(args=None):
                 nr_factors = meta["nr_factors"]
                 inputMode = meta.get("inputMode", inputMode)
                 windowMode = meta.get("windowMode", windowMode)
+                featureSet = meta.get("featureSet", featureSet)
+                usePairFeatures = meta.get("usePairFeatures", usePairFeatures)
             training(
                 pTfRecordFilenames=tfRecordFilenames,
                 pLengthTrainDataContainerList=traindataContainerListLength,
@@ -831,7 +871,8 @@ def main(args=None):
                 pInputMode=inputMode,
                 pWindowMode=windowMode,
                 pLogTransformTarget=args.logTransformTarget,
-                pForegroundLossWeight=args.foregroundLossWeight
+                pForegroundLossWeight=args.foregroundLossWeight,
+                pUsePairFeatures=usePairFeatures
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)

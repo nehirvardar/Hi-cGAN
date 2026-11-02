@@ -9,6 +9,7 @@ from .lib import dataContainer
 from .lib import records
 from .lib import hicGAN
 from .lib import utils
+from .lib import featurePack
 import logging
 from hicgan._version import __version__
 import pickle
@@ -27,9 +28,20 @@ def parse_arguments(args=None):
                         type=str, default=None,
                         help="Path to chrom_index.csv, .npz directory, or .npz file to determine chromosome bin counts in 'random2d' mode")
     parser.add_argument("--inputMode", "-im", required=False,
-                        type=str, choices=["bigwig", "random2d"], default=None,
-                        help="Input feature mode: 'bigwig' (1D chromatin BigWig files) or 'random2d' (direct 2D symmetric random matrix). "
-                             "Defaults to 'random2d' when -tcp is omitted or points to .npz/chrom_index.csv.")
+                        type=str, choices=["bigwig", "feature_pack", "random2d"], default=None,
+                        help="Input feature mode: 'bigwig' (1D chromatin BigWig files), "
+                             "'feature_pack' (bin_features.xlsx + optional 2D pair_features.xlsx), or "
+                             "'random2d' (direct 2D symmetric random matrix). Auto-detected from -tcp / metadata when omitted.")
+    parser.add_argument("--featureSet", "-fset", required=False,
+                        type=str, default=None,
+                        help="Feature subset preset or comma-separated sheet/column names when --inputMode is 'feature_pack' "
+                             "(defaults to the featureSet stored in hicgan_metadata.pkl, or 'representative').")
+    parser.add_argument("--usePairFeatures", "-upf", dest="usePairFeatures",
+                        action="store_true", default=None,
+                        help="Include 2D kmer7_revcomp_cosine from pair_features.xlsx when --inputMode is 'feature_pack'.")
+    parser.add_argument("--noPairFeatures", "-npf", dest="usePairFeatures",
+                        action="store_false",
+                        help="Disable 2D pair_features.xlsx channel when --inputMode is 'feature_pack'.")
     parser.add_argument("--windowMode", "-wm", required=False,
                         type=str, choices=["diagonal", "grid"], default="diagonal",
                         help="Windowing mode: 'diagonal' (sliding windows along main diagonal) or 'grid' (2D grid over upper triangle [i:i+W, j:j+W]).")
@@ -130,7 +142,8 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
                         scalefactors, clampfactors, scalematrix, windowSize, flankingsize, maxdist, batchSize,
                         includedRegions=None, inputMode="random2d", windowMode="diagonal", gridStride=None,
                         chromSizesPath=None, randomSeed=42,
-                        flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None):
+                        flankPadChromosomes=None, flankPadMaxBins=None, flankPadMinRatio=None,
+                        featureSet="representative", usePairFeatures=True):
     
     containerCls = dataContainer.DataContainer
     testdataContainerList = []
@@ -154,21 +167,23 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         elif chromSizesPath is not None and os.path.exists(chromSizesPath):
             try:
                 numBinsChrom = utils.getChromBinsFromNpzSource(chromSizesPath, chrom, pBinSize=pBinSize)
-                log.info("[PREDICT-DATA] Resolved target n_bins=%d for chr%s from %s (bigwig mode)", numBinsChrom, str(chrom), str(chromSizesPath))
+                log.info("[PREDICT-DATA] Resolved target n_bins=%d for chr%s from %s (%s mode)", numBinsChrom, str(chrom), str(chromSizesPath), inputMode)
             except Exception:
                 numBinsChrom = None
         testdataContainerList.append(
             containerCls(
                 chromosome=chrom,
                 matrixFilePath=None,
-                chromatinFolder=pChromatinFolder if inputMode == "bigwig" else None,
+                chromatinFolder=pChromatinFolder if inputMode in ("bigwig", "feature_pack") else None,
                 binSize=pBinSize,
                 inputMode=inputMode,
                 numBins=numBinsChrom,
                 randomSeed=randomSeed,
                 flankPadChromosomes=flankPadChromosomes,
                 flankPadMaxBins=flankPadMaxBins,
-                flankPadMinRatio=flankPadMinRatio
+                flankPadMinRatio=flankPadMinRatio,
+                featureSet=featureSet,
+                usePairFeatures=usePairFeatures,
             )
         )
     effectiveFlanking = 0 if inputMode == "random2d" else flankingsize
@@ -185,6 +200,8 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         "flankPadChromosomes": flankPadChromosomes,
         "flankPadMaxBins": flankPadMaxBins,
         "flankPadMinRatio": flankPadMinRatio,
+        "featureSet": featureSet,
+        "usePairFeatures": usePairFeatures,
     }
     if len(testdataContainerList) == 0:
         msg = "Exiting. No data found"
@@ -255,7 +272,7 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         windowCoordsList,
     )
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="diagonal", pGridStride=None, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="diagonal", pGridStride=None, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None, pFeatureSet=None, pUsePairFeatures=None):
     trainedmodel = pTrainedModel
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
@@ -272,30 +289,48 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
     if inputMode is None:
         if not predictionChromosomesFolders or utils.isNpzMatrixSource(predictionChromosomesFolders) or str(predictionChromosomesFolders).endswith(".csv"):
             inputMode = "random2d"
+        elif featurePack.is_feature_pack_source(predictionChromosomesFolders):
+            inputMode = "feature_pack"
         else:
             inputMode = "bigwig"
+    elif inputMode == "bigwig" and featurePack.is_feature_pack_source(predictionChromosomesFolders):
+        inputMode = "feature_pack"
     windowMode = pWindowMode or "diagonal"
     logTransformTarget = bool(pLogTransformTarget)
+    featureSet = pFeatureSet
+    usePairFeatures = pUsePairFeatures
 
-    # Auto-detect flank padding settings from hicgan_metadata.pkl next to trainedModel if none were explicitly specified
-    if trainedmodel and pFlankPadChromosomes is None and pFlankPadMaxBins is None and pFlankPadMinRatio is None:
+    # Auto-detect flank padding & feature_pack settings from hicgan_metadata.pkl next to trainedModel
+    if trainedmodel:
         candidateMeta = os.path.join(os.path.dirname(os.path.abspath(trainedmodel)), "hicgan_metadata.pkl")
         if os.path.exists(candidateMeta):
             try:
                 with open(candidateMeta, "rb") as mf:
                     meta_obj = pickle.load(mf)
                 if isinstance(meta_obj, dict):
-                    pFlankPadChromosomes = meta_obj.get("flankPadChromosomes")
-                    pFlankPadMaxBins = meta_obj.get("flankPadMaxBins")
-                    pFlankPadMinRatio = meta_obj.get("flankPadMinRatio")
-                    if any(x is not None for x in (pFlankPadChromosomes, pFlankPadMaxBins, pFlankPadMinRatio)):
-                        log.info(
-                            "[PREDICT-FLANK-PAD] Auto-loaded flank padding config from %s: "
-                            "flankPadChromosomes=%s, flankPadMaxBins=%s, flankPadMinRatio=%s",
-                            candidateMeta, str(pFlankPadChromosomes), str(pFlankPadMaxBins), str(pFlankPadMinRatio)
-                        )
+                    if pFlankPadChromosomes is None and pFlankPadMaxBins is None and pFlankPadMinRatio is None:
+                        pFlankPadChromosomes = meta_obj.get("flankPadChromosomes")
+                        pFlankPadMaxBins = meta_obj.get("flankPadMaxBins")
+                        pFlankPadMinRatio = meta_obj.get("flankPadMinRatio")
+                        if any(x is not None for x in (pFlankPadChromosomes, pFlankPadMaxBins, pFlankPadMinRatio)):
+                            log.info(
+                                "[PREDICT-FLANK-PAD] Auto-loaded flank padding config from %s: "
+                                "flankPadChromosomes=%s, flankPadMaxBins=%s, flankPadMinRatio=%s",
+                                candidateMeta, str(pFlankPadChromosomes), str(pFlankPadMaxBins), str(pFlankPadMinRatio)
+                            )
+                    if featureSet is None and meta_obj.get("featureSet") is not None:
+                        featureSet = meta_obj.get("featureSet")
+                    if usePairFeatures is None and meta_obj.get("usePairFeatures") is not None:
+                        usePairFeatures = bool(meta_obj.get("usePairFeatures"))
             except Exception as exc:
-                log.debug("Could not read flank padding metadata from %s: %s", candidateMeta, str(exc))
+                log.debug("Could not read metadata from %s: %s", candidateMeta, str(exc))
+
+    if featureSet is None:
+        featureSet = "representative"
+    if usePairFeatures is None:
+        usePairFeatures = (inputMode == "feature_pack")
+    else:
+        usePairFeatures = bool(usePairFeatures) and (inputMode == "feature_pack")
 
     # Auto-detect target_value_range.json next to trainedModel if not explicitly passed
     if not pTargetValueRange and trainedmodel:
@@ -339,8 +374,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
 
     log.info(
         "[PREDICT-SETUP] inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, flankingSize=%d, "
-        "binSize=%d, mode=%s, seed=%d",
-        inputMode, windowMode, str(pGridStride), windowSize, flankingsize, binSize, pMode, pSeed
+        "featureSet=%s, usePairFeatures=%s, binSize=%d, mode=%s, seed=%d",
+        inputMode, windowMode, str(pGridStride), windowSize, flankingsize, featureSet, str(usePairFeatures), binSize, pMode, pSeed
     )
 
     paramDict = locals().copy()
@@ -385,6 +420,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             flankPadChromosomes=pFlankPadChromosomes,
             flankPadMaxBins=pFlankPadMaxBins,
             flankPadMinRatio=pFlankPadMinRatio,
+            featureSet=featureSet,
+            usePairFeatures=usePairFeatures,
         )
         if pMode == "create-data":
             save_vars = {
@@ -399,6 +436,8 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                 "windowCoordsList": windowCoordsList,
                 "inputMode": inputMode,
                 "windowMode": windowMode,
+                "featureSet": featureSet,
+                "usePairFeatures": usePairFeatures,
             }
 
             pickle_path = os.path.join(outputFolder, "prediction_vars.pkl")
@@ -427,9 +466,11 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         windowCoordsList = loaded_vars.get("windowCoordsList", [None] * len(testdataContainerList))
         inputMode = loaded_vars.get("inputMode", inputMode)
         windowMode = loaded_vars.get("windowMode", windowMode)
+        featureSet = loaded_vars.get("featureSet", featureSet)
+        usePairFeatures = loaded_vars.get("usePairFeatures", usePairFeatures)
 
     if pMode in ["predict", "all"]:
-        use_embedding = (inputMode == "bigwig")
+        use_embedding = (inputMode in ("bigwig", "feature_pack"))
         enforce_symmetry = (windowMode == "diagonal")
         if use_embedding and testdataContainerList and isinstance(testdataContainerList[0].storedFeatures, dict):
             sf_dict = testdataContainerList[0].storedFeatures
@@ -444,6 +485,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             scope=pScope,
             use_embedding=use_embedding,
             enforce_symmetry=enforce_symmetry,
+            use_pair_features=bool(usePairFeatures) and (inputMode == "feature_pack"),
         )
         trained_GAN.loadGenerator(trainedModelPath=trainedmodel)
         predictionFiles = []
@@ -879,4 +921,6 @@ def main(args=None):
         pNpzOutputFolder=args.npzOutputFolder,
         pFlankPadChromosomes=args.flankPadChromosomes,
         pFlankPadMaxBins=args.flankPadMaxBins,
-        pFlankPadMinRatio=args.flankPadMinRatio)
+        pFlankPadMinRatio=args.flankPadMinRatio,
+        pFeatureSet=args.featureSet,
+        pUsePairFeatures=args.usePairFeatures)
