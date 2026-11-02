@@ -704,10 +704,6 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
         pred_sum = np.zeros((n_pad, n_pad), dtype=np.float32)
         pred_count = np.zeros((n_pad, n_pad), dtype=np.float32)
 
-        # 2D Hanning/tapered window mask to eliminate boundary seams and give center pixels higher weight
-        hann_1d = np.sin(np.pi * (np.arange(window_size) + 0.5) / float(window_size)) ** 2
-        taper_mask = np.maximum(np.outer(hann_1d, hann_1d).astype(np.float32), 0.05)
-
         eval_batch_size = 64
         print(f"[chr{c_clean}] Reconstructing full ({n_bins}x{n_bins}) chromosome matrix from {len(upper_coords)} upper-triangular windows (stride={recon_stride})...")
         for b_start in range(0, len(upper_coords), eval_batch_size):
@@ -723,24 +719,17 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
 
             for (r_s, c_s), p_win in zip(b_coords, b_preds):
                 r_e, c_e = r_s + window_size, c_s + window_size
-                # Peak-preserving weight: higher weight for strong interaction predictions so peaks are not averaged down
-                p_clamped = np.clip(p_win, 0.0, 1.0)
-                eff_weight = taper_mask * (1.0 + 2.0 * p_clamped)
-
                 if r_s == c_s:
                     p_sym = 0.5 * (p_win + p_win.T)
-                    w_sym = 0.5 * (eff_weight + eff_weight.T)
-                    pred_sum[r_s:r_e, c_s:c_e] += p_sym * w_sym
-                    pred_count[r_s:r_e, c_s:c_e] += w_sym
+                    pred_sum[r_s:r_e, c_s:c_e] += p_sym
+                    pred_count[r_s:r_e, c_s:c_e] += 1.0
                 else:
-                    weighted_p = p_win * eff_weight
-                    pred_sum[r_s:r_e, c_s:c_e] += weighted_p
-                    pred_count[r_s:r_e, c_s:c_e] += eff_weight
-                    pred_sum[c_s:c_e, r_s:r_e] += weighted_p.T
-                    pred_count[c_s:c_e, r_s:r_e] += eff_weight.T
+                    pred_sum[r_s:r_e, c_s:c_e] += p_win
+                    pred_count[r_s:r_e, c_s:c_e] += 1.0
+                    pred_sum[c_s:c_e, r_s:r_e] += p_win.T
+                    pred_count[c_s:c_e, r_s:r_e] += 1.0
 
-        pred_full_pad = pred_sum / np.maximum(pred_count, 1e-6)
-        pred_full_pad = np.clip(pred_full_pad, 0.0, 1.0)
+        pred_full_pad = pred_sum / np.maximum(pred_count, 1.0)
         pred_full_pad = 0.5 * (pred_full_pad + pred_full_pad.T)
         # Crop bottom/right padding back to original chromosome dimensions (n_bins, n_bins)
         pred_full = pred_full_pad[:n_bins, :n_bins]
