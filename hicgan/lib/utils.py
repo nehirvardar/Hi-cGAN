@@ -199,13 +199,12 @@ _FEATURE_BINS_CACHE = {}
 
 
 def resolveFeatureBinsCsv(pChromatinFolder=None):
-    """Locate feature_bins.csv (or bin_features.csv) given a data or RNA GT folder."""
-    csv_names = ("feature_bins.csv", "bin_features.csv")
+    """Locate all feature CSV files (e.g., feature_bins.csv and indirect_control.csv) given a data or RNA GT folder."""
     search_dirs = []
     if pChromatinFolder:
         norm_path = os.path.normpath(pChromatinFolder)
         if os.path.isfile(norm_path) and norm_path.lower().endswith((".csv", ".tsv")):
-            return norm_path
+            return (os.path.abspath(norm_path),)
         if os.path.isdir(norm_path):
             search_dirs.append(norm_path)
             parent_dir = os.path.dirname(norm_path)
@@ -216,53 +215,88 @@ def resolveFeatureBinsCsv(pChromatinFolder=None):
     if pkg_data_dir not in search_dirs:
         search_dirs.append(pkg_data_dir)
 
+    candidate_dirs = []
     for d in search_dirs:
         if not d or not os.path.isdir(d):
             continue
-        for name in csv_names:
-            cand = os.path.join(d, name)
-            if os.path.isfile(cand):
-                return cand
+        gene_feat_sub = os.path.join(d, "gene_features")
+        if os.path.isdir(gene_feat_sub) and gene_feat_sub not in candidate_dirs:
+            candidate_dirs.append(gene_feat_sub)
+        if d not in candidate_dirs:
+            candidate_dirs.append(d)
+
+    for d in candidate_dirs:
+        csv_files = sorted(
+            os.path.abspath(os.path.join(d, f))
+            for f in os.listdir(d)
+            if f.lower().endswith((".csv", ".tsv")) and os.path.isfile(os.path.join(d, f))
+        )
+        if csv_files:
+            return tuple(csv_files)
     return None
 
 
-def _getParsedFeatureBins(pCsvPath):
-    """Parse and globally normalize 1D bin features from feature_bins.csv once per process."""
-    abs_path = os.path.abspath(pCsvPath)
-    if abs_path in _FEATURE_BINS_CACHE:
-        return _FEATURE_BINS_CACHE[abs_path]
+def _getParsedFeatureBins(pCsvPaths):
+    """Parse, merge, and globally normalize 1D bin features from one or more CSV files once per process."""
+    if isinstance(pCsvPaths, str):
+        csv_paths = (os.path.abspath(pCsvPaths),)
+    else:
+        csv_paths = tuple(os.path.abspath(p) for p in pCsvPaths)
+
+    if csv_paths in _FEATURE_BINS_CACHE:
+        return _FEATURE_BINS_CACHE[csv_paths]
 
     import csv
-    with open(abs_path, mode="r", encoding="utf-8-sig", newline="") as f:
-        first_line = f.readline()
-        delimiter = ";" if ";" in first_line else ("\t" if "\t" in first_line else ",")
-        f.seek(0)
-        reader = csv.reader(f, delimiter=delimiter)
-        rows = [r for r in reader if r and any(cell.strip() for cell in r)]
+    feature_names = []
+    per_file_offsets = []
 
-    if len(rows) < 2:
-        raise ValueError(f"Feature CSV {abs_path} is empty or missing data rows.")
+    for path in csv_paths:
+        with open(path, mode="r", encoding="utf-8-sig", newline="") as f:
+            first_line = f.readline()
+            delimiter = ";" if ";" in first_line else ("\t" if "\t" in first_line else ",")
+            f.seek(0)
+            reader = csv.reader(f, delimiter=delimiter)
+            header_row = next(reader, None)
+            if not header_row or len(header_row) <= 5:
+                continue
+            f_names = [h.strip() for h in header_row[5:]]
+            per_file_offsets.append((path, delimiter, len(feature_names), len(f_names)))
+            feature_names.extend(f_names)
 
-    header = [h.strip() for h in rows[0]]
-    feature_names = header[5:]
     n_feats = len(feature_names)
+    if n_feats == 0:
+        raise ValueError(f"No feature columns found in {csv_paths}")
 
-    raw_records = []
-    raw_vals_list = []
-    for r in rows[1:]:
-        chrom_str = r[0].strip().replace("chr", "")
-        bin_idx = int(r[4].strip()) if len(r) > 4 and r[4].strip() != "" else int(r[3].strip())
-        # Non-empty pc_exonic column (col 8) indicates active protein-coding exonic transcription in this bin
-        has_exon = 1.0 if (len(r) > 8 and r[8].strip() != "") else 0.15
-        vals = []
-        for k in range(n_feats):
-            col_idx = 5 + k
-            cell = r[col_idx].strip() if col_idx < len(r) else ""
-            vals.append(float(cell.replace(",", ".")) if cell != "" else 0.0)
-        raw_records.append((chrom_str, bin_idx, has_exon))
-        raw_vals_list.append(vals)
+    merged_bins = {}
+    exon_flags = {}
 
-    all_vals = np.nan_to_num(np.asarray(raw_vals_list, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    for path, delimiter, col_offset, col_count in per_file_offsets:
+        with open(path, mode="r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            header_row = [h.strip() for h in next(reader)]
+            for r in reader:
+                if not r or not any(cell.strip() for cell in r):
+                    continue
+                chrom_str = r[0].strip().replace("chr", "")
+                bin_idx = int(r[4].strip()) if len(r) > 4 and r[4].strip() != "" else int(r[3].strip())
+                key = (chrom_str, bin_idx)
+                vec = merged_bins.get(key)
+                if vec is None:
+                    vec = np.zeros(n_feats, dtype=np.float32)
+                    merged_bins[key] = vec
+                # Track whether bin has exonic LCR data in feature_bins.csv
+                if "rmsk_lcr_pc_exonic_fraction" in header_row:
+                    ex_col = header_row.index("rmsk_lcr_pc_exonic_fraction")
+                    if ex_col < len(r) and r[ex_col].strip() != "":
+                        exon_flags[key] = True
+                for k in range(col_count):
+                    c_idx = 5 + k
+                    cell = r[c_idx].strip() if c_idx < len(r) else ""
+                    vec[col_offset + k] = float(cell.replace(",", ".")) if cell != "" else 0.0
+
+    keys_sorted = sorted(merged_bins.keys(), key=lambda x: (x[0], x[1]))
+    all_vals = np.stack([merged_bins[k] for k in keys_sorted], axis=0)
+    all_vals = np.nan_to_num(all_vals, nan=0.0, posinf=0.0, neginf=0.0)
     all_vals = np.maximum(all_vals, 0.0)
 
     # Globally normalize each feature across all chromosomes onto [0, 1] using log1p scaling
@@ -273,31 +307,43 @@ def _getParsedFeatureBins(pCsvPath):
             p99[k] = max(float(np.percentile(nz, 99.0)), 1e-8)
     scaled_vals = np.clip(np.log1p(all_vals / (p99[None, :] / 5.0)) / np.log1p(5.0), 0.0, 1.0).astype(np.float32)
 
+    # Identify transcriptionally active bins (coding exons, coding genes, lncRNAs, or miRNAs)
+    active_col_names = {
+        "rmsk_lcr_pc_exonic_fraction", "gencode_protein_coding_count",
+        "rmsk_pc_exonic_bp", "gencode_transcripts_with_cds",
+        "gencode_lncRNA_count", "mirna_mature_count", "pc_genes_with_3utr"
+    }
+    active_col_indices = [i for i, name in enumerate(feature_names) if name in active_col_names]
+
     by_chrom = {}
-    for idx, (chrom_str, bin_idx, has_exon) in enumerate(raw_records):
-        by_chrom.setdefault(chrom_str, []).append((bin_idx, has_exon, scaled_vals[idx]))
+    for idx, key in enumerate(keys_sorted):
+        chrom_str, bin_idx = key
+        v = scaled_vals[idx]
+        is_active = exon_flags.get(key, False) or any(v[c_i] > 0.0 for c_i in active_col_indices)
+        act_weight = 1.0 if is_active else 0.0
+        by_chrom.setdefault(chrom_str, []).append((bin_idx, act_weight, v))
 
     chrom_arrays = {}
     for chrom_str, items in by_chrom.items():
         max_idx = max(b for b, _, _ in items) + 1
         feat_arr = np.zeros((max_idx, n_feats), dtype=np.float32)
-        exon_arr = np.full((max_idx,), 0.15, dtype=np.float32)
-        for b, ex, v in items:
+        act_arr = np.zeros((max_idx,), dtype=np.float32)
+        for b, act_w, v in items:
             if 0 <= b < max_idx:
                 feat_arr[b] = v
-                exon_arr[b] = ex
-        chrom_arrays[chrom_str] = (feat_arr, exon_arr)
+                act_arr[b] = act_w
+        chrom_arrays[chrom_str] = (feat_arr, act_arr)
 
     parsed = (feature_names, chrom_arrays)
-    _FEATURE_BINS_CACHE[abs_path] = parsed
+    _FEATURE_BINS_CACHE[csv_paths] = parsed
     return parsed
 
 
 def getNumberChromatinFactors(pChromatinFolder):
-    """Return the number of conditioning feature channels from feature_bins.csv or .bigwig files."""
-    csv_path = resolveFeatureBinsCsv(pChromatinFolder)
-    if csv_path:
-        feature_names, _ = _getParsedFeatureBins(csv_path)
+    """Return the number of conditioning feature channels from feature CSV files or .bigwig files."""
+    csv_paths = resolveFeatureBinsCsv(pChromatinFolder)
+    if csv_paths:
+        feature_names, _ = _getParsedFeatureBins(csv_paths)
         return max(1, len(feature_names))
     bw_dir = resolveBigwigFolder(pChromatinFolder)
     bw_files = getBigwigFileList(bw_dir) if bw_dir else []
@@ -305,28 +351,54 @@ def getNumberChromatinFactors(pChromatinFolder):
 
 
 def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=250000):
-    """Load 2D (N, N, K) conditioning features from feature_bins.csv (preferred) or .bigwig tracks."""
-    csv_path = resolveFeatureBinsCsv(pBigwigFolder)
-    if csv_path:
-        feature_names, chrom_arrays = _getParsedFeatureBins(csv_path)
+    """Load 2D (N, N, K) conditioning features from CSV files in gene_features (preferred) or .bigwig tracks."""
+    csv_paths = resolveFeatureBinsCsv(pBigwigFolder)
+    if csv_paths:
+        feature_names, chrom_arrays = _getParsedFeatureBins(csv_paths)
         c_clean = str(pChromStr).replace("chr", "")
         if c_clean not in chrom_arrays:
-            raise KeyError(f"Chromosome {c_clean} not found in {csv_path}")
-        feat_1d, exon_1d = chrom_arrays[c_clean]
+            raise KeyError(f"Chromosome {c_clean} not found in {csv_paths}")
+        feat_1d, act_1d = chrom_arrays[c_clean]
         n_bins = int(pNumBins)
         if feat_1d.shape[0] < n_bins:
             pad_n = n_bins - feat_1d.shape[0]
             feat_1d = np.pad(feat_1d, ((0, pad_n), (0, 0)), mode="constant", constant_values=0.0)
-            exon_1d = np.pad(exon_1d, (0, pad_n), mode="constant", constant_values=0.15)
+            act_1d = np.pad(act_1d, (0, pad_n), mode="constant", constant_values=0.0)
         elif feat_1d.shape[0] > n_bins:
             feat_1d = feat_1d[:n_bins]
-            exon_1d = exon_1d[:n_bins]
+            act_1d = act_1d[:n_bins]
 
-        exon_gate = np.outer(exon_1d, exon_1d).astype(np.float32)
+        name_to_idx = {name: i for i, name in enumerate(feature_names)}
+        complementary_partner = {
+            "lcr_rna_G_rich_pc_exonic_fraction": "lcr_rna_C_rich_pc_exonic_fraction",
+            "lcr_rna_C_rich_pc_exonic_fraction": "lcr_rna_G_rich_pc_exonic_fraction",
+            "lcr_rna_GA_rich_pc_exonic_fraction": "lcr_rna_UC_rich_pc_exonic_fraction",
+            "lcr_rna_UC_rich_pc_exonic_fraction": "lcr_rna_GA_rich_pc_exonic_fraction",
+            "alu_3utr_sense_count": "alu_3utr_antisense_count",
+            "alu_3utr_antisense_count": "alu_3utr_sense_count",
+            "mirna_mature_count": "pc_genes_with_3utr",
+            "gencode_lncRNA_count": "gencode_transcripts_with_cds",
+        }
+        genomic_repeat_cols = {
+            "rmsk_lcr_genomic_fraction",
+            "rmsk_simple_repeat_genomic_fraction",
+            "rmsk_low_complexity_genomic_fraction",
+        }
+
+        act_gate = np.outer(act_1d, act_1d).astype(np.float32)
         channels = []
-        for k in range(len(feature_names)):
+        for k, f_name in enumerate(feature_names):
             v = feat_1d[:, k]
-            mat_2d = (0.65 * np.sqrt(np.outer(v, v)) + 0.175 * (v[:, None] + v[None, :])) * exon_gate
+            if f_name in genomic_repeat_cols:
+                v = v * act_1d
+            self_pair = np.sqrt(np.outer(v, v))
+            partner_name = complementary_partner.get(f_name)
+            if partner_name and partner_name in name_to_idx:
+                u = feat_1d[:, name_to_idx[partner_name]]
+                cross_pair = np.sqrt(0.5 * (np.outer(v, u) + np.outer(u, v)))
+                mat_2d = (0.5 * self_pair + 0.5 * cross_pair) * act_gate
+            else:
+                mat_2d = self_pair * act_gate
             channels.append(np.clip(mat_2d, 0.0, 1.0).astype(np.float32))
         chromatin_3d = np.stack(channels, axis=-1)
         return chromatin_3d, list(feature_names)
