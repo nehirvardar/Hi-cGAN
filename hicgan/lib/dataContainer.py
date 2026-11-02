@@ -88,7 +88,7 @@ class DataContainer():
             if self.binSize is None:
                 self.binSize = 250000  # Default 250kb resolution for RNA matrices
 
-            # Load .bigwig chromatin factors for this chromosome and build 2D pairwise input channels
+            # Load conditioning features (from feature_bins.csv or .bigwig fallback) and build 2D pairwise input channels
             chromatin_3d, factor_names = utils.loadBigwigChromatinMatrix(
                 pBigwigFolder=self.chromatinFolder,
                 pChromStr=c_clean,
@@ -101,7 +101,7 @@ class DataContainer():
             self.nr_factors = int(chromatin_3d.shape[-1])
             self.factorNames = factor_names
 
-            print(f"[{self.chromosome}] Loaded log-normalized RNA GT {self.FactorDataArray.shape} and BigWig Chromatin Input {self.RandomInputArray.shape} ({', '.join(self.factorNames)})")
+            print(f"[{self.chromosome}] Loaded log-normalized RNA GT {self.FactorDataArray.shape} and Feature Bins Input {self.RandomInputArray.shape} ({self.nr_factors} features)")
 
         except Exception as e:
             raise IOError(f"Error while loading RNA data: {e}")

@@ -655,9 +655,7 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
     import matplotlib.pyplot as plt
 
     os.makedirs(output_folder, exist_ok=True)
-    bw_dir = utils.resolveBigwigFolder(chromatin_folder)
-    bw_files = utils.getBigwigFileList(bw_dir) if bw_dir else []
-    nr_factors = max(1, len(bw_files))
+    nr_factors = utils.getNumberChromatinFactors(chromatin_folder)
 
     trained_GAN = hicGAN.HiCGAN(log_dir=output_folder, number_factors=nr_factors, input_size=window_size, scope=None)
     trained_GAN.load_denoiser(trainedModelPath=trained_model_path)
@@ -750,11 +748,11 @@ def evaluate_chromosomes_fast(trained_model_path, chrom_list, chromatin_folder, 
         else:
             full_corr = 0.0
 
-        factor_label = "+".join(factor_names)
+        factor_label = f"{len(factor_names)} Bin Features" if len(factor_names) > 3 else "+".join(factor_names)
         chrom_full_mean = np.mean(chrom_3d, axis=-1)
         fig_full, axs_full = plt.subplots(1, 3, figsize=(18, 5.5))
         full_panels = [
-            (chrom_full_mean, f"Chromatin ({factor_label}) Full chr{c_clean}\nShape: {n_bins}x{n_bins}"),
+            (chrom_full_mean, f"Input ({factor_label}) Full chr{c_clean}\nShape: {n_bins}x{n_bins}"),
             (gt_mat, f"Log-Normalized RNA GT Full chr{c_clean}\nShape: {n_bins}x{n_bins}"),
             (pred_full, f"Predicted Full RNA chr{c_clean}\nMSE: {full_mse:.4f} | Pearson: {full_corr:.4f}")
         ]

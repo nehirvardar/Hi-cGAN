@@ -195,11 +195,145 @@ def padMatrixToGrid(pMatrix, pWindowSize, pStride=None):
     return mat, grid_coords, n_bins
 
 
+_FEATURE_BINS_CACHE = {}
+
+
+def resolveFeatureBinsCsv(pChromatinFolder=None):
+    """Locate feature_bins.csv (or bin_features.csv) given a data or RNA GT folder."""
+    csv_names = ("feature_bins.csv", "bin_features.csv")
+    search_dirs = []
+    if pChromatinFolder:
+        norm_path = os.path.normpath(pChromatinFolder)
+        if os.path.isfile(norm_path) and norm_path.lower().endswith((".csv", ".tsv")):
+            return norm_path
+        if os.path.isdir(norm_path):
+            search_dirs.append(norm_path)
+            parent_dir = os.path.dirname(norm_path)
+            if parent_dir and parent_dir not in search_dirs:
+                search_dirs.append(parent_dir)
+
+    pkg_data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    if pkg_data_dir not in search_dirs:
+        search_dirs.append(pkg_data_dir)
+
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for name in csv_names:
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _getParsedFeatureBins(pCsvPath):
+    """Parse and globally normalize 1D bin features from feature_bins.csv once per process."""
+    abs_path = os.path.abspath(pCsvPath)
+    if abs_path in _FEATURE_BINS_CACHE:
+        return _FEATURE_BINS_CACHE[abs_path]
+
+    import csv
+    with open(abs_path, mode="r", encoding="utf-8-sig", newline="") as f:
+        first_line = f.readline()
+        delimiter = ";" if ";" in first_line else ("\t" if "\t" in first_line else ",")
+        f.seek(0)
+        reader = csv.reader(f, delimiter=delimiter)
+        rows = [r for r in reader if r and any(cell.strip() for cell in r)]
+
+    if len(rows) < 2:
+        raise ValueError(f"Feature CSV {abs_path} is empty or missing data rows.")
+
+    header = [h.strip() for h in rows[0]]
+    feature_names = header[5:]
+    n_feats = len(feature_names)
+
+    raw_records = []
+    raw_vals_list = []
+    for r in rows[1:]:
+        chrom_str = r[0].strip().replace("chr", "")
+        bin_idx = int(r[4].strip()) if len(r) > 4 and r[4].strip() != "" else int(r[3].strip())
+        # Non-empty pc_exonic column (col 8) indicates active protein-coding exonic transcription in this bin
+        has_exon = 1.0 if (len(r) > 8 and r[8].strip() != "") else 0.15
+        vals = []
+        for k in range(n_feats):
+            col_idx = 5 + k
+            cell = r[col_idx].strip() if col_idx < len(r) else ""
+            vals.append(float(cell.replace(",", ".")) if cell != "" else 0.0)
+        raw_records.append((chrom_str, bin_idx, has_exon))
+        raw_vals_list.append(vals)
+
+    all_vals = np.nan_to_num(np.asarray(raw_vals_list, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    all_vals = np.maximum(all_vals, 0.0)
+
+    # Globally normalize each feature across all chromosomes onto [0, 1] using log1p scaling
+    p99 = np.ones(n_feats, dtype=np.float32)
+    for k in range(n_feats):
+        nz = all_vals[all_vals[:, k] > 0, k]
+        if nz.size > 0:
+            p99[k] = max(float(np.percentile(nz, 99.0)), 1e-8)
+    scaled_vals = np.clip(np.log1p(all_vals / (p99[None, :] / 5.0)) / np.log1p(5.0), 0.0, 1.0).astype(np.float32)
+
+    by_chrom = {}
+    for idx, (chrom_str, bin_idx, has_exon) in enumerate(raw_records):
+        by_chrom.setdefault(chrom_str, []).append((bin_idx, has_exon, scaled_vals[idx]))
+
+    chrom_arrays = {}
+    for chrom_str, items in by_chrom.items():
+        max_idx = max(b for b, _, _ in items) + 1
+        feat_arr = np.zeros((max_idx, n_feats), dtype=np.float32)
+        exon_arr = np.full((max_idx,), 0.15, dtype=np.float32)
+        for b, ex, v in items:
+            if 0 <= b < max_idx:
+                feat_arr[b] = v
+                exon_arr[b] = ex
+        chrom_arrays[chrom_str] = (feat_arr, exon_arr)
+
+    parsed = (feature_names, chrom_arrays)
+    _FEATURE_BINS_CACHE[abs_path] = parsed
+    return parsed
+
+
+def getNumberChromatinFactors(pChromatinFolder):
+    """Return the number of conditioning feature channels from feature_bins.csv or .bigwig files."""
+    csv_path = resolveFeatureBinsCsv(pChromatinFolder)
+    if csv_path:
+        feature_names, _ = _getParsedFeatureBins(csv_path)
+        return max(1, len(feature_names))
+    bw_dir = resolveBigwigFolder(pChromatinFolder)
+    bw_files = getBigwigFileList(bw_dir) if bw_dir else []
+    return max(1, len(bw_files))
+
+
 def loadBigwigChromatinMatrix(pBigwigFolder, pChromStr, pNumBins, pBinSizeInt=250000):
-    """Load all .bigwig tracks for a chromosome and convert them to a 2D (N, N, K) chromatin matrix."""
+    """Load 2D (N, N, K) conditioning features from feature_bins.csv (preferred) or .bigwig tracks."""
+    csv_path = resolveFeatureBinsCsv(pBigwigFolder)
+    if csv_path:
+        feature_names, chrom_arrays = _getParsedFeatureBins(csv_path)
+        c_clean = str(pChromStr).replace("chr", "")
+        if c_clean not in chrom_arrays:
+            raise KeyError(f"Chromosome {c_clean} not found in {csv_path}")
+        feat_1d, exon_1d = chrom_arrays[c_clean]
+        n_bins = int(pNumBins)
+        if feat_1d.shape[0] < n_bins:
+            pad_n = n_bins - feat_1d.shape[0]
+            feat_1d = np.pad(feat_1d, ((0, pad_n), (0, 0)), mode="constant", constant_values=0.0)
+            exon_1d = np.pad(exon_1d, (0, pad_n), mode="constant", constant_values=0.15)
+        elif feat_1d.shape[0] > n_bins:
+            feat_1d = feat_1d[:n_bins]
+            exon_1d = exon_1d[:n_bins]
+
+        exon_gate = np.outer(exon_1d, exon_1d).astype(np.float32)
+        channels = []
+        for k in range(len(feature_names)):
+            v = feat_1d[:, k]
+            mat_2d = (0.65 * np.sqrt(np.outer(v, v)) + 0.175 * (v[:, None] + v[None, :])) * exon_gate
+            channels.append(np.clip(mat_2d, 0.0, 1.0).astype(np.float32))
+        chromatin_3d = np.stack(channels, axis=-1)
+        return chromatin_3d, list(feature_names)
+
     bw_dir = resolveBigwigFolder(pBigwigFolder)
     if not bw_dir:
-        raise FileNotFoundError(f"Could not find any .bigwig/.bw folder from {pBigwigFolder}")
+        raise FileNotFoundError(f"Could not find feature_bins.csv or any .bigwig/.bw folder from {pBigwigFolder}")
     bw_files = getBigwigFileList(bw_dir)
     if not bw_files:
         raise FileNotFoundError(f"No .bigwig/.bw files found in {bw_dir}")
