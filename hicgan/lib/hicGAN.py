@@ -236,7 +236,10 @@ class HiCGAN():
             x0_pred_raw = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
             x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
-            x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
+
+            # Asymmetric under-prediction penalty: extra weight when model underestimates real interaction peaks (real > pred)
+            underpred_penalty = tf.where(real_dna_matrix > x0_pred, 1.35, 1.0)
+            x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * underpred_penalty * tf.square(real_dna_matrix - x0_pred))
 
             loss = noise_loss + x0_loss
 
@@ -274,7 +277,8 @@ class HiCGAN():
         x0_pred_raw = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
         x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
         x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
-        x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
+        underpred_penalty = tf.where(real_dna_matrix > x0_pred, 1.35, 1.0)
+        x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * underpred_penalty * tf.square(real_dna_matrix - x0_pred))
         return noise_loss + x0_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
