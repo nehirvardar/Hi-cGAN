@@ -925,7 +925,12 @@ def rebuildMatrixGrid(pArrayOfWindows, pWindowCoords, pWindowSize, pMatrixSize, 
         str(pChrom), n_win, W, M, str(pOriginalMatrixSize)
     )
     sum_mat = np.zeros((M, M), dtype=np.float32)
-    cnt_mat = np.zeros((M, M), dtype=np.int32)
+    w_mat = np.zeros((M, M), dtype=np.float32)
+
+    # 2D raised-cosine spatial confidence window in [0.20, 1.0] so tile borders
+    # blend seamlessly while peak-preserving weights prevent overlap dilution.
+    t_1d = 0.20 + 0.80 * np.sin(np.pi * (np.arange(W, dtype=np.float32) + 0.5) / float(W))
+    spatial_w_full = np.outer(t_1d, t_1d).astype(np.float32)
 
     for idx in range(n_win):
         r0, c0 = int(coords[idx, 0]), int(coords[idx, 1])
@@ -935,21 +940,24 @@ def rebuildMatrixGrid(pArrayOfWindows, pWindowCoords, pWindowSize, pMatrixSize, 
         r1 = min(r0 + W, M)
         c1 = min(c0 + W, M)
         h, w = r1 - r0, c1 - c0
-        sub = win[:h, :w]
+        sub = np.clip(win[:h, :w], 0.0, None)
+        sw = spatial_w_full[:h, :w]
         if r0 == c0 and h == w:
             sub = 0.5 * (sub + sub.T)
-            sum_mat[r0:r1, c0:c1] += sub
-            cnt_mat[r0:r1, c0:c1] += 1
+            pw = sw * (1.0 + 2.0 * sub)
+            sum_mat[r0:r1, c0:c1] += pw * sub
+            w_mat[r0:r1, c0:c1] += pw
         else:
-            sum_mat[r0:r1, c0:c1] += sub
-            cnt_mat[r0:r1, c0:c1] += 1
-            sum_mat[c0:c1, r0:r1] += sub.T
-            cnt_mat[c0:c1, r0:r1] += 1
+            pw = sw * (1.0 + 2.0 * sub)
+            sum_mat[r0:r1, c0:c1] += pw * sub
+            w_mat[r0:r1, c0:c1] += pw
+            sum_mat[c0:c1, r0:r1] += (pw * sub).T
+            w_mat[c0:c1, r0:r1] += pw.T
 
-    mask = cnt_mat > 0
+    mask = w_mat > 0.0
     mean_mat = np.zeros((M, M), dtype=np.float32)
-    mean_mat[mask] = sum_mat[mask] / cnt_mat[mask]
-    del sum_mat, cnt_mat
+    mean_mat[mask] = sum_mat[mask] / w_mat[mask]
+    del sum_mat, w_mat
 
     if pOriginalMatrixSize is not None:
         mean_mat = unpadMatrix(mean_mat, pOriginalMatrixSize, pChrom=pChrom)

@@ -25,6 +25,7 @@ class HiCGAN():
                     loss_weight_discriminator: float = 0.5, #factor for disc loss, like Isola et al. 2017
                     loss_weight_tv: float = 1e-10, #factor for TV loss
                     loss_type_pixel: str = "L1", #type of per-pixel error (L1, L2)
+                    foreground_loss_weight: float = 10.0, #extra weight for non-zero foreground contacts (target > 0)
                     input_size: int = 256,
                     plot_frequency: int = 20,
                     plot_type: str = "png",
@@ -48,6 +49,7 @@ class HiCGAN():
 
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
+        self.EMBEDDING_CHANNELS = 16
         self.input_size = 256
         if input_size in [64,128,256, 512, 768, 1024]:
             self.input_size = input_size
@@ -57,12 +59,13 @@ class HiCGAN():
         self.loss_weight_adversarial = loss_weight_adversarial
         self.loss_weight_tv = loss_weight_tv
         self.loss_type_pixel = loss_type_pixel
+        self.foreground_loss_weight = float(foreground_loss_weight)
 
         init_msg = (
             f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
-            f"use_embedding={self.use_embedding} ({'1D BigWig -> cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
+            f"use_embedding={self.use_embedding} ({'1D BigWig -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
             f"enforce_symmetry={self.enforce_symmetry}, loss_type_pixel={self.loss_type_pixel}, "
-            f"mixed_precision={self.mixed_precision}"
+            f"foreground_loss_weight={self.foreground_loss_weight}, mixed_precision={self.mixed_precision}"
         )
         log.info(init_msg)
         print(init_msg)
@@ -150,42 +153,82 @@ class HiCGAN():
 
         self.scope = scope
 
-    def cnn_embedding(self, nr_filters_list=[1024,512,512,256,256,128,128,64], kernel_width_list=[4,4,4,4,4,4,4,4], apply_dropout: bool = False):  
+    def cnn_embedding(self, nr_filters_list=[128, 128, 64, 32], kernel_width_list=[5, 5, 5, 5], apply_dropout: bool = False):
+        """
+        Pairwise 1D-to-2D Chromatin Embedding with 2D Genomic Distance Encoding:
+          1. Splits 1D input into row and column chromatin streams (+ genomic coordinate channels in 'grid' mode).
+          2. Encodes row and column 1D spans (length 3*W) with a shared multi-scale dilated Conv1D trunk.
+          3. Extracts the exact center window [W : 2*W] aligned 1-to-1 with the WxW target bins alongside
+             global strided context, and forms a 2D pairwise interaction tensor at every (i, j) pixel:
+               [E_row * E_col, (E_row * E_col) * d_inv, 0.5*(E_row + E_col), |E_row - E_col|, E_row, E_col, D(i, j)]
+             where D(i, j) encodes the exact genomic distance |(r0 + i) - (c0 + j)| via 4 multi-scale decay maps.
+          4. Refines the 2D representation with Conv2D layers and outputs a (W, W, 16) 2D feature + distance tensor.
+        """
         inputs = tf.keras.layers.Input(shape=(3*self.input_size, self.number_factors))
-        #add 1D convolutions
-        x = inputs
-        for i, (nr_filters, kernelWidth) in enumerate(zip(nr_filters_list, kernel_width_list)):
-            convParamDict = dict()
-            convParamDict["name"] = "conv1D_" + str(i + 1)
-            convParamDict["filters"] = nr_filters
-            convParamDict["kernel_size"] = kernelWidth
-            convParamDict["data_format"]="channels_last"
-            convParamDict["kernel_regularizer"]=tf.keras.regularizers.l2(0.01)
-            if kernelWidth > 1:
-                convParamDict["padding"] = "same"
-            x = Conv1D(**convParamDict)(x)
-            # x = BatchNormalization()(x)
-            x = GroupNormalization(groups=nr_filters, axis=-1)(x)
+        is_grid_mode = (not self.enforce_symmetry) and (self.number_factors >= 4) and (self.number_factors % 2 == 0)
+        n_chrom_factors = (self.number_factors // 2) - 1 if is_grid_mode else self.number_factors
+
+        f_row, f_col, pos_row, pos_col = SplitChromatinStreamsLayer(
+            window_size=self.input_size,
+            number_factors=self.number_factors,
+            is_grid_mode=is_grid_mode,
+            name="split_chromatin_streams"
+        )(inputs)
+
+        # Shared Siamese 1D multi-scale dilated encoder for 1D chromatin tracks
+        seq_in = tf.keras.layers.Input(shape=(3 * self.input_size, n_chrom_factors), name="chrom_1d_in")
+        h = seq_in
+        dilation_rates = [1, 2, 4, 8]
+        for i, (nr_filters, kernelWidth, dil) in enumerate(zip(nr_filters_list, kernel_width_list, dilation_rates)):
+            h = Conv1D(
+                filters=nr_filters,
+                kernel_size=kernelWidth,
+                dilation_rate=dil,
+                padding="same",
+                data_format="channels_last",
+                name=f"conv1D_{i + 1}"
+            )(h)
+            n_groups = min(8, max(1, nr_filters // 4))
+            h = GroupNormalization(groups=n_groups, axis=-1, name=f"gn1D_{i + 1}")(h)
             if apply_dropout:
-                x = Dropout(0.5)(x)
-            x = tf.keras.layers.LeakyReLU(alpha=0.2)(x)
-        #make the shape of a square matrix
-        x = Conv1D(filters=self.input_size, 
-                    strides=3, 
-                    kernel_size=4, 
-                    data_format="channels_last", 
-                    activation="sigmoid", 
-                    padding="same", name="conv1D_final")(x)
-        #ensure the matrix is symmetric, i.e. x = transpose(x)
+                h = Dropout(0.3, name=f"drop1D_{i + 1}")(h)
+            h = LeakyReLU(alpha=0.2, name=f"act1D_{i + 1}")(h)
+
+        h_stride = Conv1D(
+            filters=16,
+            strides=3,
+            kernel_size=5,
+            padding="same",
+            data_format="channels_last",
+            name="conv1D_stride_context"
+        )(h)
+        h_stride = LeakyReLU(alpha=0.2, name="act1D_stride_context")(h_stride)
+        chrom_1d_encoder = tf.keras.Model(inputs=seq_in, outputs=[h, h_stride], name="Chromatin1DEncoder")
+
+        h_row_full, h_row_stride = chrom_1d_encoder(f_row)
+        if is_grid_mode:
+            h_col_full, h_col_stride = chrom_1d_encoder(f_col)
+        else:
+            h_col_full, h_col_stride = h_row_full, h_row_stride
+
+        pair_2d, dist_2d = Pairwise2DEmbeddingLayer(
+            window_size=self.input_size,
+            is_grid_mode=is_grid_mode,
+            name="pairwise_2d_embedding"
+        )([f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col])
+
+        initializer = tf.random_normal_initializer(0., 0.02)
+        z = Conv2D(64, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_1")(pair_2d)
+        z = GroupNormalization(groups=8, axis=-1, name="emb_gn2d_1")(z)
+        z = LeakyReLU(alpha=0.2, name="emb_act2d_1")(z)
+        z = Conv2D(12, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_2")(z)
+        z = LeakyReLU(alpha=0.2, name="emb_act2d_2")(z)
+
+        x = tf.keras.layers.Concatenate(axis=-1, name="emb_concat_dist")([z, dist_2d])
         if self.enforce_symmetry:
-            x_T = tf.keras.layers.Permute((2,1))(x) #this is the matrix transpose
-            x = tf.keras.layers.Add()([x, x_T])
-            x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x) #add transpose and divide by 2
-        #reshape the matrix into a 2D grayscale image
-        x = tf.keras.layers.Reshape((self.input_size,self.input_size,self.INPUT_CHANNELS))(x)
+            x = Symmetrize2DLayer(name="emb_symmetrize")(x)
+
         model = tf.keras.Model(inputs=inputs, outputs=x, name="CNN-embedding")
-        #model.build(input_shape=(3*self.INPUT_SIZE, self.NR_FACTORS))
-        #model.summary()
         return model
 
 
@@ -196,8 +239,8 @@ class HiCGAN():
         result.add(Conv2D(filters, size, strides=2, padding='same',
                                 kernel_initializer=initializer, use_bias=False))
         if apply_batchnorm:
-            # result.add(BatchNormalization())
-            result.add(GroupNormalization(groups=filters, axis=-1))
+            n_groups = min(32, max(1, filters // 8))
+            result.add(GroupNormalization(groups=n_groups, axis=-1))
         result.add(LeakyReLU(alpha=0.2))
         return result
 
@@ -209,8 +252,8 @@ class HiCGAN():
                                             padding='same',
                                             kernel_initializer=initializer,
                                             use_bias=False))
-        # result.add(BatchNormalization())
-        result.add(GroupNormalization(groups=filters, axis=-1))
+        n_groups = min(32, max(1, filters // 8))
+        result.add(GroupNormalization(groups=n_groups, axis=-1))
         if apply_dropout:
             result.add(Dropout(0.5))
         result.add(ReLU())
@@ -220,10 +263,11 @@ class HiCGAN():
     def Generator(self):
         if self.use_embedding:
             inputs = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name="factorData")
-            x = self.generator_embedding(inputs)
+            x_emb = self.generator_embedding(inputs)
         else:
             inputs = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name="factorData")
-            x = inputs
+            x_emb = inputs
+        x = x_emb
 
         #the downsampling part of the network, defined for 256x256 images
         down_stack = [
@@ -272,13 +316,19 @@ class HiCGAN():
         for up, skip in zip(up_stack, skips):
             x = up(x)
             x = tf.keras.layers.Concatenate()([x, skip])
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4, strides=2, padding='same', kernel_initializer=initializer) 
-        x = last(x)
+
+        # Upsample to full (W, W) resolution and fuse with full-resolution pairwise & distance embedding x_emb
+        x = tf.keras.layers.Conv2DTranspose(32, 4, strides=2, padding='same', kernel_initializer=initializer, use_bias=False)(x)
+        x = GroupNormalization(groups=8, axis=-1)(x)
+        x = LeakyReLU(alpha=0.2)(x)
+        x = tf.keras.layers.Concatenate()([x, x_emb])
+        x = Conv2D(32, 3, strides=1, padding='same', kernel_initializer=initializer)(x)
+        x = LeakyReLU(alpha=0.2)(x)
+        x = Conv2D(self.OUTPUT_CHANNELS, 1, strides=1, padding='same', kernel_initializer=initializer)(x)
+
         #enforce symmetry only in diagonal window mode
         if self.enforce_symmetry:
-            x_T = tf.keras.layers.Permute((2,1,3))(x)
-            x = tf.keras.layers.Add()([x, x_T])
-            x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x)
+            x = Symmetrize2DLayer(name="gen_symmetrize")(x)
         x = tf.keras.layers.Activation("sigmoid")(x)
 
         return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
@@ -291,11 +341,25 @@ class HiCGAN():
         gen_output = tf.cast(gen_output, tf.float32)
         target = tf.cast(target, tf.float32)
         advers_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_generated_output), logits=disc_generated_output) )
-        # mean squared error or mean absolute error
+        # Per-pixel error (L1 or L2) with Foreground-Weighted + Peak-Proportional + Under-Prediction Penalty
         if self.loss_type_pixel == "L1":
-            pixel_loss = tf.reduce_mean(tf.abs(target - gen_output))
+            per_pixel_err = tf.abs(target - gen_output)
         else: 
-            pixel_loss = tf.reduce_mean(tf.square(target - gen_output))
+            per_pixel_err = tf.square(target - gen_output)
+
+        if self.foreground_loss_weight > 0.0:
+            fg_mask = tf.cast(target > 1e-5, tf.float32)
+            # Active contacts (target > 0) receive (1 + foreground_loss_weight * (1 + 2 * target)) weight
+            # so sparse peaks in log1p space (values 1..5) are not squashed toward 0..1.
+            pixel_weights = 1.0 + float(self.foreground_loss_weight) * fg_mask * (
+                1.0 + 2.0 * tf.clip_by_value(target, 0.0, 1.0)
+            )
+            # Penalize under-predicting active contacts (gen_output < target) 1.5x more than over-predicting
+            underpred_boost = 1.0 + 0.5 * fg_mask * tf.cast(gen_output < target, tf.float32)
+            pixel_loss = tf.reduce_mean(pixel_weights * underpred_boost * per_pixel_err)
+        else:
+            pixel_loss = tf.reduce_mean(per_pixel_err)
+
         tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
         total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
         return total_gen_loss, advers_loss, pixel_loss, tv_loss
@@ -307,9 +371,7 @@ class HiCGAN():
         def _maybe_symmetrize(tensor):
             if not self.enforce_symmetry:
                 return tensor
-            t_T = tf.keras.layers.Permute((2, 1, 3))(tensor)
-            t = tf.keras.layers.Add()([tensor, t_T])
-            return tf.keras.layers.Lambda(lambda z: 0.5 * z)(t)
+            return Symmetrize2DLayer()(tensor)
 
         if self.use_embedding:
             inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
@@ -872,6 +934,9 @@ class HiCGAN():
             # 1. Define custom layers
             custom_layers = {
                 "CustomReshapeLayer": CustomReshapeLayer,
+                "SplitChromatinStreamsLayer": SplitChromatinStreamsLayer,
+                "Pairwise2DEmbeddingLayer": Pairwise2DEmbeddingLayer,
+                "Symmetrize2DLayer": Symmetrize2DLayer,
             }
             
             # 2. Add GroupNormalization
@@ -914,7 +979,138 @@ class HiCGAN():
         except Exception as e:
             msg = f"Failed to load generator.\nDetail: {str(e)}"
             raise ValueError(msg)
-        
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class Symmetrize2DLayer(tf.keras.layers.Layer):
+    """Symmetrize a 4D (batch, H, W, C) tensor along its spatial axes: 0.5 * (X + X^T)."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        x_T = tf.transpose(inputs, perm=[0, 2, 1, 3])
+        return 0.5 * (inputs + x_T)
+
+    def get_config(self):
+        return super().get_config()
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class SplitChromatinStreamsLayer(tf.keras.layers.Layer):
+    """
+    Split 1D factorData of shape (batch, 3*W, number_factors) into:
+      - f_row:   (batch, 3*W, n_chrom)
+      - f_col:   (batch, 3*W, n_chrom)
+      - pos_row: (batch, 3*W, 1)
+      - pos_col: (batch, 3*W, 1)
+    In 'grid' mode, input channels are [f_row (F), pos_row (1), f_col (F), pos_col (1)].
+    In 'diagonal' mode, input channels are [f_row (F)] with f_col = f_row and pos = 0.
+    """
+    def __init__(self, window_size: int, number_factors: int, is_grid_mode: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.window_size = int(window_size)
+        self.number_factors = int(number_factors)
+        self.is_grid_mode = bool(is_grid_mode)
+
+    def call(self, inputs):
+        x = inputs
+        if x.shape.rank == 4:
+            x = tf.squeeze(x, axis=-1)
+        if self.is_grid_mode and self.number_factors >= 4 and (self.number_factors % 2 == 0):
+            half_ch = self.number_factors // 2
+            n_chrom = half_ch - 1
+            f_row = x[:, :, :n_chrom]
+            pos_row = x[:, :, n_chrom:half_ch]
+            f_col = x[:, :, half_ch : half_ch + n_chrom]
+            pos_col = x[:, :, half_ch + n_chrom : 2 * half_ch]
+        else:
+            f_row = x
+            f_col = x
+            pos_row = tf.zeros_like(x[:, :, :1])
+            pos_col = tf.zeros_like(x[:, :, :1])
+        return f_row, f_col, pos_row, pos_col
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "window_size": self.window_size,
+            "number_factors": self.number_factors,
+            "is_grid_mode": self.is_grid_mode,
+        })
+        return cfg
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
+    """
+    Construct a 2D (batch, W, W, C_pair) pairwise chromatin + genomic distance representation:
+      1. Extracts the exact center window [W : 2*W] from the dilated 1D encoder outputs and raw tracks,
+         concatenating with the strided context features to form 1D bin embeddings e_row, e_col of shape (batch, W, C_1d).
+      2. Computes the exact 2D genomic bin distance d_ij = |(r0 + i) - (c0 + j)| for every (i, j) pixel
+         and encodes it into 4 multi-scale distance decay channels D(i, j).
+      3. Forms 2D pairwise combinations at (i, j):
+         [E_row * E_col, (E_row * E_col) * d_inv2, 0.5*(E_row + E_col), |E_row - E_col|, E_row, E_col, D(i, j)].
+    """
+    def __init__(self, window_size: int, is_grid_mode: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.window_size = int(window_size)
+        self.is_grid_mode = bool(is_grid_mode)
+        idx = np.arange(self.window_size, dtype=np.float32)
+        diag_dist_bins = np.abs(idx[:, None] - idx[None, :])[None, :, :, None]
+        self._diag_dist_bins = tf.constant(diag_dist_bins, dtype=tf.float32)
+
+    def call(self, inputs):
+        f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col = inputs
+        W = self.window_size
+        compute_dtype = h_row_full.dtype
+
+        f_row_c = tf.cast(f_row[:, W : 2 * W, :], compute_dtype)
+        f_col_c = tf.cast(f_col[:, W : 2 * W, :], compute_dtype)
+        h_row_c = h_row_full[:, W : 2 * W, :]
+        h_col_c = h_col_full[:, W : 2 * W, :]
+
+        e_row = tf.concat([h_row_c, h_row_stride, f_row_c], axis=-1)
+        e_col = tf.concat([h_col_c, h_col_stride, f_col_c], axis=-1)
+
+        E_row = tf.tile(tf.expand_dims(e_row, axis=2), [1, 1, W, 1])
+        E_col = tf.tile(tf.expand_dims(e_col, axis=1), [1, W, 1, 1])
+
+        if self.is_grid_mode:
+            p_row = tf.cast(pos_row[:, W : 2 * W, 0], tf.float32)
+            p_col = tf.cast(pos_col[:, W : 2 * W, 0], tf.float32)
+            dist_norm = tf.abs(tf.expand_dims(p_col, axis=1) - tf.expand_dims(p_row, axis=2))
+            dist_norm = tf.expand_dims(dist_norm, axis=-1)
+            dist_bins = dist_norm * float(W)
+        else:
+            batch_sz = tf.shape(f_row)[0]
+            dist_bins = tf.tile(self._diag_dist_bins, [batch_sz, 1, 1, 1])
+            dist_norm = dist_bins / float(W)
+
+        d_inv1 = 1.0 / (1.0 + dist_bins / 2.0)
+        d_inv2 = 1.0 / (1.0 + dist_bins / 8.0)
+        d_exp = tf.exp(-dist_norm)
+        d_diag = tf.exp(-tf.square(dist_bins / 1.5))
+
+        dist_2d = tf.cast(tf.concat([d_inv1, d_inv2, d_exp, d_diag], axis=-1), compute_dtype)
+        d_gate = tf.cast(d_inv2, compute_dtype)
+
+        E_prod = E_row * E_col
+        E_prod_gated = E_prod * d_gate
+        E_sum = 0.5 * (E_row + E_col)
+        E_diff = tf.abs(E_row - E_col)
+
+        pair_2d = tf.concat([E_prod, E_prod_gated, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
+        return pair_2d, dist_2d
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "window_size": self.window_size,
+            "is_grid_mode": self.is_grid_mode,
+        })
+        return cfg
+
+
 class CustomReshapeLayer(tf.keras.layers.Layer):
     '''
     reshape a 1D tensor such that it represents 

@@ -95,6 +95,11 @@ def parse_arguments(args=None):
                         type=str, choices=["L1", "L2"],
                         default="L1",
                         help="Type of per-pixel loss to use for the generator.")
+    parser.add_argument("--foregroundLossWeight", "-flw", required=False,
+                        type=float,
+                        default=10.0,
+                        help="Extra loss multiplier for non-zero foreground contacts (target > 0) in pixel loss "
+                             "to prevent sparse matrices from collapsing predictions into [0, 1]. Set 0 for unweighted L1/L2.")
     parser.add_argument("--lossWeightTV", "-lwt", required=False,
                         type=float,
                         default=1e-10,
@@ -491,7 +496,8 @@ def training(pTfRecordFilenames,
              pTargetValueRange=None,
              pInputMode="random2d",
              pWindowMode="diagonal",
-             pLogTransformTarget=False
+             pLogTransformTarget=False,
+             pForegroundLossWeight=10.0
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -574,7 +580,8 @@ def training(pTfRecordFilenames,
                                         loss_weight_pixel=pLossWeightPixel,
                                         loss_weight_adversarial=pLossWeightAdversarial,
                                         loss_weight_discriminator=pLossWeightDiscriminator, 
-                                        loss_type_pixel=pLossTypePixel, 
+                                        loss_type_pixel=pLossTypePixel,
+                                        foreground_loss_weight=pForegroundLossWeight,
                                         loss_weight_tv=pLossWeightTV, 
                                         input_size=pWindowSize,
                                         learning_rate_generator=pLearningRateGenerator,
@@ -823,7 +830,8 @@ def main(args=None):
                 pTargetValueRange=resolvedTargetRange,
                 pInputMode=inputMode,
                 pWindowMode=windowMode,
-                pLogTransformTarget=args.logTransformTarget
+                pLogTransformTarget=args.logTransformTarget,
+                pForegroundLossWeight=args.foregroundLossWeight
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)

@@ -142,12 +142,13 @@ class DataContainer():
         #load the data into memory now
         self.factorNames = [os.path.splitext(os.path.basename(name))[0] for name in bigwigFileList]
         base_factors = len(self.factorNames)
-        self.nr_factors = base_factors * 2 if self.windowMode == "grid" else base_factors
+        self.base_nr_factors = base_factors
+        self.nr_factors = (base_factors + 1) * 2 if self.windowMode == "grid" else base_factors
         self.prefixDict_factors = prefixDict_factors
         self.chromSize_factors = chromSize_factors
         self.FactorDataArray = np.empty(shape=(len(bigwigFileList),nr_bins))
         if self.windowMode == "grid":
-            msg = "Loaded {:d} chromatin features (x2 for grid row/col pairs = {:d} input channels) from folder {:s}\n"
+            msg = "Loaded {:d} chromatin features (+1 genomic coord per axis -> x2 for grid row/col pairs = {:d} input channels) from folder {:s}\n"
             msg = msg.format(base_factors, self.nr_factors, self.chromatinFolder)
         else:
             msg = "Loaded {:d} chromatin features from folder {:s}\n"
@@ -887,7 +888,9 @@ class DataContainer():
             span = 2 * flankingSize + windowSize
             f_row = self.FactorDataArray[r0 : r0 + span]
             f_col = self.FactorDataArray[c0 : c0 + span]
-            factorArray = np.concatenate([f_row, f_col], axis=-1)
+            pos_row = (np.arange(r0, r0 + span, dtype=np.float32) / float(windowSize))[:, np.newaxis]
+            pos_col = (np.arange(c0, c0 + span, dtype=np.float32) / float(windowSize))[:, np.newaxis]
+            factorArray = np.concatenate([f_row, pos_row, f_col, pos_col], axis=-1)
         else:
             startIdx = idx
             endIdx = startIdx + 2 * flankingSize + windowSize
@@ -916,6 +919,10 @@ class DataContainer():
             raise ValueError(msg)
         if isinstance(idx, int):
             factorArray = self.__getFactorData(idx)
+            if factorArray.ndim == 3 and factorArray.shape[-1] == 1:
+                factorArray = factorArray[:, :, 0]
+            if self.factorNames and factorArray.shape[-1] > len(self.factorNames):
+                factorArray = factorArray[:, :len(self.factorNames)]
             startBin = idx
         else:
             factorArray = self.FactorDataArray 
