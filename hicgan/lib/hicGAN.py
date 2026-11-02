@@ -41,7 +41,7 @@ class HiCGAN():
                      input_size: int = 256,
                      plot_frequency: int = 20,
                      plot_type: str = "png",
-                     learning_rate: float = 2e-5,
+                     learning_rate: float = 1e-5,
                      adam_beta_1: float = 0.5,
                      pretrained_model_path: str = "",
                      scope=None,
@@ -232,10 +232,11 @@ class HiCGAN():
             pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
             noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
 
-            # Direct x_0 reconstruction loss term to align training objective with test matrix MSE
-            x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
-            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-            x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+            # Direct x_0 reconstruction loss with leaky clipping (no dead gradients outside [0, 1]) weighted by alpha_bar_t
+            x0_pred_raw = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+            x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
+            x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
+            x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
 
             loss = noise_loss + x0_loss
 
@@ -270,9 +271,10 @@ class HiCGAN():
         predicted_noise = self.denoiser([noisy_dna, rna_matrix, tf.cast(t, tf.float32)], training=False)
         pixel_weights = 1.0 + 15.0 * tf.cast(real_dna_matrix > 0.0, tf.float32) + 10.0 * real_dna_matrix
         noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
-        x0_pred = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
-        x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-        x0_loss = tf.reduce_mean(pixel_weights * tf.square(real_dna_matrix - x0_pred))
+        x0_pred_raw = (noisy_dna - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
+        x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
+        x0_pred = x0_pred_clipped + 0.25 * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
+        x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(real_dna_matrix - x0_pred))
         return noise_loss + x0_loss
 
     def generate_images(self, model, test_input, tar, epoch: int, sample_steps: int = 25):
@@ -292,10 +294,11 @@ class HiCGAN():
             alpha_bar_t = self.alphas_bar[t_step]
             alpha_bar_prev = self.alphas_bar[t_prev]
 
-            # Deterministic DDIM update to t_prev with clipped x_0 prediction
+            # Deterministic DDIM update to t_prev with clipped x_0 prediction and recomputed effective noise
             x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
+            pred_eps = (x_t - tf.sqrt(alpha_bar_t) * x0_pred) / tf.sqrt(1.0 - alpha_bar_t)
+            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * pred_eps
 
         # Clip final denoised matrix x_0 to [0, 1] (do not transpose-average single off-diagonal 2D grid tiles)
         prediction = tf.clip_by_value(x_t, 0.0, 1.0)
@@ -731,10 +734,11 @@ class HiCGAN():
             alpha_bar_t = self.alphas_bar[t_step]
             alpha_bar_prev = self.alphas_bar[t_prev]
 
-            # Deterministic DDIM step using the fixed random input trajectory
+            # Deterministic DDIM step using clipped x_0 and recomputed effective noise
             x0_pred = (x_t - tf.sqrt(1.0 - alpha_bar_t) * predicted_noise) / tf.sqrt(alpha_bar_t)
             x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
-            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * predicted_noise
+            pred_eps = (x_t - tf.sqrt(alpha_bar_t) * x0_pred) / tf.sqrt(1.0 - alpha_bar_t)
+            x_t = tf.sqrt(alpha_bar_prev) * x0_pred + tf.sqrt(1.0 - alpha_bar_prev) * pred_eps
 
         # Clip final denoised matrix x_0 to [0, 1] (keep off-diagonal 2D grid tiles un-transposed)
         x_t = tf.clip_by_value(x_t, 0.0, 1.0)

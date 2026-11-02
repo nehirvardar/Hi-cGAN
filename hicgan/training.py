@@ -71,10 +71,10 @@ def parse_arguments(args=None):
                         type=float,
                         default=1e-10,
                         help="Loss weight for Total-Variation-loss of denoiser.")
-    parser.add_argument("--learningRatedenoiser", "-lrg", required=False,
+    parser.add_argument("--learningRatedenoiser", "--learningRate", "--lr", "-lrg", "-lr", required=False,
                         type=float,
-                        default=2e-5,
-                        help="Learning rate for Adam optimizer of denoiser.")
+                        default=1e-5,
+                        help="Learning rate for Adam optimizer of denoiser (default: 1e-5).")
     parser.add_argument("--timesteps", "-T", required=False,
                         type=int, default=1000,
                         help="Total noise step for diffusion model.")
@@ -479,6 +479,7 @@ def training(pTfRecordFilenames,
         diffusionModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
         log.info("Starting training at %s" % datetime.now())
+        print(f"Training Configuration -> Factors: {pNumberOfFactors} | LR: {pLearningRatedenoiser:g} | BatchSize: {pBatchSize} | EarlyStopPatience: {pEarlyStoppingPatience}")
         # fit function
         diffusionModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
                                steps_per_epoch=steps_per_epoch,
