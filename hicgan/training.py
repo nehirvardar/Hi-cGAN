@@ -1087,3 +1087,7 @@ def main(args=None):
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)
+
+
+if __name__ == "__main__":
+    main()

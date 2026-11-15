@@ -1085,3 +1085,7 @@ def main(args=None):
         pBlendMode=args.blendMode,
         pRunEval=args.runEval,
         pGtDir=args.gtDir)
+
+
+if __name__ == "__main__":
+    main()
