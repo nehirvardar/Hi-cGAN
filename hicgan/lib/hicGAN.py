@@ -689,8 +689,7 @@ class HiCGAN():
                 _save_loss_files(epoch)
                 self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
                 self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
-
-            self.checkpoint.save(file_prefix = self.checkpoint_prefix)
+                self.checkpoint.save(file_prefix=self.checkpoint_prefix)
 
             if early_stopping_patience is not None and early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
                 stop_msg = (

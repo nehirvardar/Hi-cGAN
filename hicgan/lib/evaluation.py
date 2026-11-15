@@ -6,6 +6,8 @@ import logging
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats, ndimage
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 log = logging.getLogger(__name__)
@@ -1147,13 +1149,19 @@ def evaluate_predictions_dir(
     df_scorecard.to_csv(scorecard_csv, index=False)
 
     if make_plots:
-        try:
-            plot_model_vs_baseline_radar(df_metrics_full, eval_out_dir, run_name=run_name)
-            plot_contact_decay_and_stratified_corr(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)
-            plot_marginal_1d_profiles(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)
-            plot_value_distribution_hexbin_and_hist(chrom_data_dict, eval_out_dir, run_name=run_name)
-        except Exception as exc:
-            log.warning("Could not generate evaluation plots: %s", str(exc))
+        plot_calls = [
+            ("triple_heatmaps", lambda: plot_triple_heatmaps(chrom_data_dict, eval_out_dir, run_name=run_name)),
+            ("model_vs_baseline_radar", lambda: plot_model_vs_baseline_radar(df_metrics_full, eval_out_dir, run_name=run_name)),
+            ("contact_decay_and_stratified_corr", lambda: plot_contact_decay_and_stratified_corr(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)),
+            ("marginal_1d_profiles", lambda: plot_marginal_1d_profiles(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)),
+            ("value_distribution_hexbin_and_hist", lambda: plot_value_distribution_hexbin_and_hist(chrom_data_dict, eval_out_dir, run_name=run_name)),
+        ]
+        for plot_name, fn in plot_calls:
+            try:
+                fn()
+            except Exception as exc:
+                log.warning("Could not generate evaluation plot '%s': %s", plot_name, str(exc))
+                print(f"[EVAL-PLOT-WARN] {plot_name}: {exc}", flush=True)
 
     return df_scorecard, df_metrics_full
 

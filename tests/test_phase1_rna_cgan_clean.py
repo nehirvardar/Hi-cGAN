@@ -3,6 +3,8 @@ import os
 import shutil
 import tempfile
 import unittest
+import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import scipy.sparse as sp
 import tensorflow as tf
@@ -300,8 +302,10 @@ def test_end_to_end_smoke_train_predict_and_eval():
 
         pred_npz = os.path.join(pred_out, "npz_matrices", "chr22.npz")
         scorecard_csv = os.path.join(pred_out, "evaluation", "core_metrics_scorecard.csv")
+        triple_png = os.path.join(pred_out, "evaluation", "heatmap_triple_chr22.png")
         assert os.path.exists(pred_npz)
         assert os.path.exists(scorecard_csv)
+        assert os.path.exists(triple_png)
 
         mat = sp.load_npz(pred_npz).toarray()
         assert mat.shape == (204, 204)
