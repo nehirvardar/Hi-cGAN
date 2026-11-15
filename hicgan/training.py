@@ -637,17 +637,37 @@ def training(pTfRecordFilenames,
         #--noScaleNorm hold the raw values, so one affine step at read time makes
         #them usable without rewriting hundreds of GB.
         def _toUnitRange(x, y):
-            lo, hi = float(pTargetValueRange[0]), float(pTargetValueRange[1])
-            raw_t = y["out_matrixData"]
-            if pLogTransformTarget:
-                raw_t = tf.math.log1p(tf.maximum(raw_t, 0.0))
-            t = tf.clip_by_value((raw_t - lo) / (hi - lo), 0.0, 1.0)
+            raw_t = tf.cast(y["out_matrixData"], tf.float32)
+            if isinstance(pTargetValueRange, dict) and str(pTargetValueRange.get("method", "")).lower().startswith("p99"):
+                hi = float(pTargetValueRange.get("hi", pTargetValueRange.get("max", 1.0)))
+                sf = float(pTargetValueRange.get("scale_factor", 10.0))
+                t = tf.clip_by_value(tf.math.log1p(tf.maximum(raw_t, 0.0) * sf) / max(hi, 1e-12), 0.0, 1.0)
+            else:
+                if isinstance(pTargetValueRange, dict):
+                    lo = float(pTargetValueRange.get("min", 0.0))
+                    hi = float(pTargetValueRange.get("max", pTargetValueRange.get("hi", 1.0)))
+                    eff_log = bool(pTargetValueRange.get("log_transform", pLogTransformTarget))
+                else:
+                    lo, hi = float(pTargetValueRange[0]), float(pTargetValueRange[1])
+                    eff_log = bool(pTargetValueRange[2]) if len(pTargetValueRange) > 2 else bool(pLogTransformTarget)
+                if eff_log:
+                    raw_t = tf.math.log1p(tf.maximum(raw_t, 0.0))
+                t = tf.clip_by_value((raw_t - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
             out = dict(y); out["out_matrixData"] = t
             return x, out
 
         if pTargetValueRange is not None:
-            print("mapping the target onto [0, 1] at read time using "
-                  "[{:.4f}, {:.4f}]".format(*pTargetValueRange))
+            if isinstance(pTargetValueRange, dict) and str(pTargetValueRange.get("method", "")).lower().startswith("p99"):
+                print("mapping the target onto [0, 1] at read time using P99 ln(1+10x) "
+                      "(hi={:.6f}, scale_factor={:.1f})".format(
+                          float(pTargetValueRange.get("hi", 1.0)),
+                          float(pTargetValueRange.get("scale_factor", 10.0))))
+            elif isinstance(pTargetValueRange, dict):
+                print("mapping the target onto [0, 1] at read time using "
+                      "[{:.4f}, {:.4f}]".format(float(pTargetValueRange.get("min", 0.0)), float(pTargetValueRange.get("max", 1.0))))
+            else:
+                print("mapping the target onto [0, 1] at read time using "
+                      "[{:.4f}, {:.4f}]".format(float(pTargetValueRange[0]), float(pTargetValueRange[1])))
             trainDs = trainDs.map(_toUnitRange,
                                   num_parallel_calls=tf.data.experimental.AUTOTUNE)
         if pFlipSamples:
@@ -729,8 +749,24 @@ def main(args=None):
     os.makedirs(args.outputFolder, exist_ok=True)
     utils.configureLogging(os.path.join(args.outputFolder, "training.log"))
 
+    # Reject mutually exclusive flags: both cannot be true at the same time
+    if args.createDataOnly and args.trainOnly:
+        print("Exiting. Flags --createDataOnly and --trainOnly are mutually exclusive; choose only one or neither.")
+        return
+
+    loaded_meta = None
+    if args.trainOnly:
+        meta_file = os.path.join(args.outputFolder, "hicgan_metadata.pkl")
+        if not os.path.exists(meta_file):
+            print(f"Metadata file not found: {meta_file}. Cannot proceed with training.")
+            return
+        with open(meta_file, "rb") as f:
+            loaded_meta = pickle.load(f)
+
+    need_raw_sources = (not args.trainOnly) or (args.targetValueRange and str(args.targetValueRange).lower() == "auto")
+
     # Resolve splitFile for trainingChromosomes and validationChromosomes when omitted
-    if args.trainingChromosomes is None or args.validationChromosomes is None:
+    if need_raw_sources and (args.trainingChromosomes is None or args.validationChromosomes is None):
         split_candidates = [args.splitFile] if args.splitFile else ["hicgan/data/splits.txt", "data/splits.txt"]
         resolved_split = next((p for p in split_candidates if p and os.path.exists(p)), None)
         if resolved_split is None:
@@ -746,7 +782,7 @@ def main(args=None):
         log.info("[MAIN] Loaded chromosome splits from %s: train=%s, val=%s", resolved_split, args.trainingChromosomes, args.validationChromosomes)
 
     # Resolve dataDir for trainingMatrices and validationMatrices when omitted
-    if args.trainingMatrices is None or args.validationMatrices is None:
+    if need_raw_sources and (args.trainingMatrices is None or args.validationMatrices is None):
         data_candidates = [args.dataDir] if args.dataDir else [
             "hicgan/data/rna_gt",
             "data/chrom_npz_homo_sapiens_GRCh38_250kb_tss_count",
@@ -763,7 +799,7 @@ def main(args=None):
             args.validationMatrices = [resolved_data]
 
     # Auto-resolve feature_pack directory when chromatin folders are omitted and inputMode is not random2d
-    if args.inputMode != "random2d" and (not args.trainingChromatinFolders or not args.validationChromatinFolders):
+    if (not args.trainOnly) and args.inputMode != "random2d" and (not args.trainingChromatinFolders or not args.validationChromatinFolders):
         fp_candidates = ["data/feature_paketi_20261029", "data/feature_pack"]
         resolved_fp = next((p for p in fp_candidates if os.path.exists(p) and featurePack.is_feature_pack_source(p)), None)
         if resolved_fp is not None:
@@ -774,7 +810,9 @@ def main(args=None):
 
     inputMode = args.inputMode
     if inputMode is None:
-        if not args.trainingChromatinFolders:
+        if loaded_meta is not None and loaded_meta.get("inputMode") is not None:
+            inputMode = loaded_meta["inputMode"]
+        elif not args.trainingChromatinFolders:
             inputMode = "random2d"
         elif any(featurePack.is_feature_pack_source(p) for p in args.trainingChromatinFolders):
             inputMode = "feature_pack"
@@ -785,7 +823,7 @@ def main(args=None):
     windowMode = args.windowMode
     featureSet = args.featureSet
     usePairFeatures = bool(args.usePairFeatures) and (inputMode == "feature_pack")
-    randomSeed = args.seed if args.seed is not None else 42
+    randomSeed = args.seed if args.seed is not None else (loaded_meta.get("seed", 42) if loaded_meta else 42)
 
     log.info(
         "[MAIN] Starting hicTraining: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
@@ -807,8 +845,8 @@ def main(args=None):
         tf.random.set_seed(args.seed)
         print("random seed set to %d" % args.seed)
 
-    # Resolve --targetValueRange once, here, so the training path gets a plain
-    # (min, max) tuple or None.
+    # Resolve --targetValueRange once, here, so the training path gets a config dict,
+    # a (min, max) tuple, or None.
     resolvedTargetRange = None
     if args.targetValueRange:
         if args.scaleTargetToUnitRange:
@@ -816,46 +854,67 @@ def main(args=None):
                   "--scaleTargetToUnitRange at WRITE time; using both would apply "
                   "the mapping twice. Choose one.")
             return
-        if args.targetValueRange.lower() == "auto":
-            resolvedTargetRange = utils.observedValueRange(
-                args.trainingMatrices,
-                [c.lstrip("chr") for c in args.trainingChromosomes],
-                pLogTransform=args.logTransformTarget)
-            os.makedirs(args.outputFolder, exist_ok=True)
-            utils.saveValueRange(
-                os.path.join(args.outputFolder, "target_value_range.json"),
-                *resolvedTargetRange,
-                pLogTransform=args.logTransformTarget)
-        elif os.path.exists(args.targetValueRange):
-            resolvedTargetRange = utils.loadValueRange(args.targetValueRange)
+        if loaded_meta is not None and loaded_meta.get("targetsScaledAtWriteTime", False):
+            msg_dup = (
+                "[WARNING] Existing TFRecords in {:s} already had target scaling applied at write time "
+                "(targetNorm={:s}). Skipping read-time --targetValueRange mapping to prevent double-scaling."
+            ).format(args.outputFolder, str(loaded_meta.get("targetNorm")))
+            log.warning(msg_dup)
+            print(msg_dup, flush=True)
         else:
-            try:
-                lo, hi = (float(x) for x in args.targetValueRange.split(","))
-                resolvedTargetRange = (lo, hi)
-            except Exception:
-                print("Exiting. --targetValueRange must be 'auto', a path to "
-                      "target_value_range.json, or 'min,max'; got "
-                      f"{args.targetValueRange!r}")
+            if args.targetValueRange.lower() == "auto":
+                range_json_out = os.path.join(args.outputFolder, "target_value_range.json")
+                os.makedirs(args.outputFolder, exist_ok=True)
+                if args.targetNorm == "p99_log10" and not args.logTransformTarget:
+                    resolvedTargetRange = utils.computeGlobalP99TargetRange(
+                        args.trainingMatrices,
+                        [c.lstrip("chr") for c in args.trainingChromosomes],
+                        scale_factor=10.0,
+                        clip_percentile=99.0,
+                        pSavePath=range_json_out,
+                    )
+                else:
+                    eff_log = bool(args.logTransformTarget or (args.targetNorm == "minmax_log1p"))
+                    lo, hi = utils.observedValueRange(
+                        args.trainingMatrices,
+                        [c.lstrip("chr") for c in args.trainingChromosomes],
+                        pLogTransform=eff_log)
+                    resolvedTargetRange = (lo, hi, eff_log)
+                    utils.saveValueRange(range_json_out, lo, hi, pLogTransform=eff_log)
+            elif os.path.exists(args.targetValueRange):
+                cfg_loaded = utils.loadTargetRangeConfig(args.targetValueRange)
+                if str(cfg_loaded.get("method", "")).lower().startswith("p99"):
+                    resolvedTargetRange = cfg_loaded
+                else:
+                    resolvedTargetRange = (float(cfg_loaded["min"]), float(cfg_loaded["max"]), bool(cfg_loaded.get("log_transform", args.logTransformTarget)))
+            else:
+                try:
+                    lo, hi = (float(x) for x in args.targetValueRange.split(","))
+                    resolvedTargetRange = (lo, hi)
+                except Exception:
+                    print("Exiting. --targetValueRange must be 'auto', a path to "
+                          "target_value_range.json, or 'min,max'; got "
+                          f"{args.targetValueRange!r}")
+                    return
+            if isinstance(resolvedTargetRange, dict):
+                print("target value range for the read-time P99 mapping: hi={:.6f}, scale_factor={:.1f}".format(
+                    float(resolvedTargetRange["hi"]), float(resolvedTargetRange.get("scale_factor", 10.0))))
+            else:
+                print("target value range for the read-time mapping: "
+                      "[{:.4f}, {:.4f}]".format(float(resolvedTargetRange[0]), float(resolvedTargetRange[1])))
+
+    if not args.trainOnly:
+        for matrix in (args.trainingMatrices or []) + (args.validationMatrices or []):
+            if not os.path.exists(matrix):
+                msg = "Exiting. Matrix file or folder not found: {:s}".format(matrix)
+                print(msg)
+                log.error(msg)
                 return
-        print("target value range for the read-time mapping: "
-              "[{:.4f}, {:.4f}]".format(*resolvedTargetRange))
-
-    # Reject mutually exclusive flags: both cannot be true at the same time
-    if args.createDataOnly and args.trainOnly:
-        print("Exiting. Flags --createDataOnly and --trainOnly are mutually exclusive; choose only one or neither.")
-        return
-
-    for matrix in args.trainingMatrices + args.validationMatrices:
-        if not os.path.exists(matrix):
-            msg = "Exiting. Matrix file or folder not found: {:s}".format(matrix)
-            print(msg)
-            log.error(msg)
-            return
-        if not (matrix.endswith(".cool") or utils.isNpzMatrixSource(matrix)):
-            msg = "Exiting. Only .cool files, .npz files, or directories of .npz files are supported: {:s}".format(matrix)
-            print(msg)
-            log.error(msg)
-            return
+            if not (matrix.endswith(".cool") or utils.isNpzMatrixSource(matrix)):
+                msg = "Exiting. Only .cool files, .npz files, or directories of .npz files are supported: {:s}".format(matrix)
+                print(msg)
+                log.error(msg)
+                return
 
     if (args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
         physical_gpus = tf.config.list_physical_devices('GPU')
@@ -901,6 +960,9 @@ def main(args=None):
     with strategy.scope() as scope: 
 
         if (not args.trainOnly and args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
+            writeTargetNorm = "none" if resolvedTargetRange is not None else args.targetNorm
+            writeScaleNorm = False if resolvedTargetRange is not None else args.noScaleNorm
+            writeLogTransform = False if resolvedTargetRange is not None else args.logTransformTarget
             tfRecordFilenames, traindataContainerListLength, nr_samples_list, storedFeatures, nr_factors = create_data(
                 args.trainingMatrices, 
                 args.trainingChromosomes, 
@@ -914,7 +976,7 @@ def main(args=None):
                 args.flipSamples,
                 args.figureFileFormat,
                 args.recordSize,
-                args.noScaleNorm,
+                writeScaleNorm,
                 args.saveMemory,
                 args.threads,
                 pMinTargetCoverage=args.minTargetCoverage,
@@ -925,14 +987,20 @@ def main(args=None):
                 pGridStride=args.gridStride,
                 pBinSize=args.binSize,
                 pRandomSeed=randomSeed,
-                pLogTransformTarget=args.logTransformTarget,
-                pTargetNorm=args.targetNorm,
+                pLogTransformTarget=writeLogTransform,
+                pTargetNorm=writeTargetNorm,
                 pFlankPadChromosomes=args.flankPadChromosomes,
                 pFlankPadMaxBins=args.flankPadMaxBins,
                 pFlankPadMinRatio=args.flankPadMinRatio,
                 pFeatureSet=featureSet,
                 pUsePairFeatures=usePairFeatures,
                 pFilterEmptyWindows=args.filterEmptyWindows
+            )
+            targetsScaledAtWriteTime = bool(
+                writeTargetNorm != "none"
+                or args.scaleTargetToUnitRange
+                or writeLogTransform
+                or writeScaleNorm
             )
             meta = {
                 "tfRecordFilenames": tfRecordFilenames,
@@ -945,7 +1013,8 @@ def main(args=None):
                 "gridStride": args.gridStride,
                 "binSize": args.binSize,
                 "windowSize": args.windowSize,
-                "targetNorm": args.targetNorm,
+                "targetNorm": writeTargetNorm,
+                "targetsScaledAtWriteTime": targetsScaledAtWriteTime,
                 "logTransformTarget": args.logTransformTarget,
                 "flankPadChromosomes": args.flankPadChromosomes,
                 "flankPadMaxBins": args.flankPadMaxBins,
@@ -966,12 +1035,7 @@ def main(args=None):
             print(f"Saved metadata to {outfile}")
         if (args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
             if args.trainOnly:
-                meta_file = os.path.join(args.outputFolder, "hicgan_metadata.pkl")
-                if not os.path.exists(meta_file):
-                    print(f"Metadata file not found: {meta_file}. Cannot proceed with training.")
-                    return
-                with open(meta_file, "rb") as f:
-                    meta = pickle.load(f)
+                meta = loaded_meta
                 tfRecordFilenames = meta["tfRecordFilenames"]
                 traindataContainerListLength = meta["traindataContainerListLength"]
                 nr_samples_list = meta["nr_samples_list"]
@@ -981,6 +1045,10 @@ def main(args=None):
                 windowMode = meta.get("windowMode", windowMode)
                 featureSet = meta.get("featureSet", featureSet)
                 usePairFeatures = meta.get("usePairFeatures", usePairFeatures)
+                if "windowSize" in meta and meta["windowSize"] is not None:
+                    args.windowSize = int(meta["windowSize"])
+                if not args.logTransformTarget and meta.get("logTransformTarget"):
+                    args.logTransformTarget = bool(meta["logTransformTarget"])
             training(
                 pTfRecordFilenames=tfRecordFilenames,
                 pLengthTrainDataContainerList=traindataContainerListLength,

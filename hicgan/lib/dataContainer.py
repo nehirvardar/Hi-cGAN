@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 from tensorflow import dtypes as tfdtypes
 from scipy.sparse import save_npz, csr_matrix
@@ -656,7 +657,7 @@ class DataContainer():
         sample_indices = [sum(samples_per_file[0:i]) for i in range(len(samples_per_file)+1)] 
         #write the single files
         rawFolder = self.chromatinFolder if self.chromatinFolder else f"{self.inputMode}_{self.windowMode}"
-        folderName = str(rawFolder).strip("/").replace("/","_")
+        folderName = re.sub(r'[\\/:*?"<>|]+', "_", str(rawFolder).strip("/\\"))
         recordfiles = [os.path.join(pOutputFolder, "{:s}_{:s}_{:03d}.tfrecord".format(folderName, str(self.chromosome), i + 1)) for i in range(nr_files)]
         log.info(
             "[TFRECORD] Writing %d samples for chr%s across %d file(s) (inputMode=%s, windowMode=%s)",
@@ -1054,7 +1055,7 @@ class DataContainer():
                                         pFeatureNameList=self.factorNames,
                                         pChromatinFolder=self.chromatinFolder,
                                         pChrom=self.chromosome,
-                                        pbinSize=self.binSize,
+                                        pBinsize=self.binSize,
                                         pStartbin=startBin,
                                         pOutputPath=outpath,
                                         pPlotType=plotType,
@@ -1099,7 +1100,8 @@ class DataContainer():
             sparseMatrix = csr_matrix(tmpMat)
         else:
             sparseMatrix = self.sparseHiCMatrix
-        folderName = self.chromatinFolder.rstrip("/").replace("/","-")
+        rawFolder = self.chromatinFolder if self.chromatinFolder else f"{self.inputMode}_{self.windowMode}"
+        folderName = re.sub(r'[\\/:*?"<>|]+', "-", str(rawFolder).strip("/\\"))
         filename = "matrix_{:s}_chr{:s}_{:s}".format(folderName, str(self.chromosome), str(index))
         filename = os.path.join(outputpath, filename)
         save_npz(file=filename, matrix=sparseMatrix)

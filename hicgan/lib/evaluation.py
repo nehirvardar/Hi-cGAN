@@ -1178,15 +1178,30 @@ def compare_runs_leaderboard(
 
     chrom_filter = {str(c).lstrip("chr") for c in chroms} if chroms else None
 
+    def _resolve_npz_and_train_dirs(d):
+        for cand_npz in (
+            os.path.join(d, "predict_run", "npz_matrices"),
+            os.path.join(d, "npz_matrices"),
+            d,
+        ):
+            files = sorted(glob.glob(os.path.join(cand_npz, "chr*.npz")))
+            if files:
+                t_dir = os.path.join(d, "train_run") if os.path.isdir(os.path.join(d, "train_run")) else d
+                return cand_npz, t_dir, files
+        return None, None, []
+
     run_dirs = []
     seen_real = set()
     for root in search_root_dirs:
         if not root or not os.path.exists(root):
             continue
-        if os.path.isdir(os.path.join(root, "predict_run")) or os.path.isdir(os.path.join(root, "train_run")):
+        _, _, direct_files = _resolve_npz_and_train_dirs(root)
+        if direct_files or os.path.isdir(os.path.join(root, "predict_run")) or os.path.isdir(os.path.join(root, "train_run")):
             candidates = [root]
         else:
             candidates = sorted(glob.glob(os.path.join(root, "run_*")))
+            if not candidates and os.path.isdir(root):
+                candidates = [os.path.join(root, sub) for sub in sorted(os.listdir(root)) if os.path.isdir(os.path.join(root, sub))]
         for cdir in candidates:
             rp = os.path.realpath(cdir)
             if rp not in seen_real and os.path.isdir(cdir):
@@ -1196,22 +1211,52 @@ def compare_runs_leaderboard(
     leaderboard_rows = []
     for rdir in run_dirs:
         rname = os.path.basename(os.path.normpath(rdir))
-        pred_npz_dir = os.path.join(rdir, "predict_run", "npz_matrices")
-        train_dir = os.path.join(rdir, "train_run")
-        npz_files = sorted(glob.glob(os.path.join(pred_npz_dir, "chr*.npz")))
+        if rname == "npz_matrices":
+            rname = os.path.basename(os.path.dirname(os.path.normpath(rdir))) or rname
+        pred_npz_dir, train_dir, npz_files = _resolve_npz_and_train_dirs(rdir)
         if not npz_files:
             continue
 
-        # Parse run metadata from directory name or hicgan_metadata.pkl
+        # Parse run metadata from directory name, hicgan_metadata.pkl, or predictions.pkl
         m_name = re.match(r"run_\d+_\d+_([^_]+)_([^_]+)_ws(\d+)_ep(\d+)", rname)
         input_mode = m_name.group(1) if m_name else "?"
         window_mode = m_name.group(2) if m_name else "?"
         ws = int(m_name.group(3)) if m_name else 64
         ep = int(m_name.group(4)) if m_name else 0
 
+        import pickle
+        for meta_cand in (
+            os.path.join(train_dir, "hicgan_metadata.pkl"),
+            os.path.join(rdir, "hicgan_metadata.pkl"),
+            os.path.join(rdir, "predictions.pkl"),
+        ):
+            if os.path.exists(meta_cand):
+                try:
+                    with open(meta_cand, "rb") as mf:
+                        mobj = pickle.load(mf)
+                    if isinstance(mobj, dict):
+                        if input_mode == "?" and mobj.get("inputMode"):
+                            input_mode = str(mobj["inputMode"])
+                        if window_mode == "?" and mobj.get("windowMode"):
+                            window_mode = str(mobj["windowMode"])
+                        if mobj.get("windowSize") is not None:
+                            ws = int(mobj["windowSize"])
+                except Exception:
+                    pass
+
         # Check best val loss from training history if available
         df_loss = parse_training_losses(train_dir)
-        best_val_loss = float(df_loss["val_gen_total"].min()) if (not df_loss.empty and "val_gen_total" in df_loss) else np.nan
+        if not df_loss.empty:
+            if ep == 0:
+                ep = int(len(df_loss))
+            if "val_pixel" in df_loss and not df_loss["val_pixel"].isna().all():
+                best_val_loss = float(df_loss["val_pixel"].min())
+            elif "val_gen_total" in df_loss and not df_loss["val_gen_total"].isna().all():
+                best_val_loss = float(df_loss["val_gen_total"].min())
+            else:
+                best_val_loss = np.nan
+        else:
+            best_val_loss = np.nan
 
         chrom_rows = []
         chrom_names = []

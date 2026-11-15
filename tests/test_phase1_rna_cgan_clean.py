@@ -308,6 +308,104 @@ def test_end_to_end_smoke_train_predict_and_eval():
         assert not np.any(np.isnan(mat))
         assert np.allclose(mat, mat.T, atol=1e-5)
 
+        # Verify compare_runs_leaderboard works directly on hicPredict outputFolder
+        df_lb = evaluation.compare_runs_leaderboard(
+            search_root_dirs=[pred_out],
+            npz_data_dir="hicgan/data/rna_gt",
+            chroms=["22"],
+            eval_out_dir=os.path.join(pred_out, "leaderboard"),
+        )
+        assert not df_lb.empty
+        assert os.path.exists(os.path.join(pred_out, "leaderboard", "multi_run_leaderboard.csv"))
+
+
+def test_phased_cdo_trainonly_and_phased_predict_and_windows_paths():
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        train_out = os.path.join(tmpdir, "phased_train")
+        pred_out = os.path.join(tmpdir, "phased_pred")
+
+        # Use an absolute Windows path with backslashes/drive-letter for -tcp to verify
+        # writeTFRecord sanitizes folderName and writes into pOutputFolder
+        abs_fp_win = os.path.abspath("data/feature_pack").replace("/", "\\")
+
+        # Phase 1A: --createDataOnly (-cdo)
+        hic_training.main([
+            "-tm", "hicgan/data/rna_gt",
+            "-vm", "hicgan/data/rna_gt",
+            "-tchroms", "21",
+            "-vchroms", "22",
+            "-tcp", abs_fp_win,
+            "-vcp", abs_fp_win,
+            "-im", "feature_pack",
+            "-fset", "direct",
+            "-npf",
+            "-wm", "grid",
+            "-gs", "64",
+            "-ws", "64",
+            "-cdo",
+            "-o", train_out,
+            "-seed", "42",
+        ])
+        assert os.path.exists(os.path.join(train_out, "hicgan_metadata.pkl"))
+        assert os.path.exists(os.path.join(train_out, "target_value_range.json"))
+        # Verify TFRecords were written inside train_out (not discarded by Windows drive path)
+        tfrecs = [f for f in os.listdir(train_out) if f.endswith(".tfrecord")]
+        assert len(tfrecs) >= 2
+
+        # Phase 1B: --trainOnly (-to), passing --targetValueRange to verify double-scaling is prevented
+        # and omitting -tm/-vm/-tcp/-vcp/-tchroms/-vchroms so they are loaded from metadata
+        hic_training.main([
+            "-to",
+            "-tvr", os.path.join(train_out, "target_value_range.json"),
+            "-ep", "1",
+            "-bs", "16",
+            "-k",
+            "-o", train_out,
+            "-seed", "42",
+        ])
+        assert os.path.exists(os.path.join(train_out, "generator_best.keras"))
+
+        # Phase 2A: predict.py --mode create-data with blendMode='uniform'
+        hic_predict.main([
+            "--mode", "create-data",
+            "-trm", train_out,
+            "-tcp", abs_fp_win,
+            "-csp", "hicgan/data/rna_gt",
+            "-wm", "grid",
+            "-gs", "64",
+            "-ws", "64",
+            "-bm", "uniform",
+            "-pc", "21",
+            "-o", pred_out,
+        ])
+        assert os.path.exists(os.path.join(pred_out, "prediction_vars.pkl"))
+
+        # Phase 2B: predict.py --mode predict (without repeating -pc or -bm)
+        hic_predict.main([
+            "--mode", "predict",
+            "-trm", train_out,
+            "-o", pred_out,
+        ])
+        assert os.path.exists(os.path.join(pred_out, "predictions.pkl"))
+
+        # Phase 2C: predict.py --mode make-matrix (CPU-only, without -trm, -pc, -tvr, or -bm)
+        hic_predict.main([
+            "--mode", "make-matrix",
+            "-o", pred_out,
+        ])
+        pred_chr21 = os.path.join(pred_out, "npz_matrices", "chr21.npz")
+        assert os.path.exists(pred_chr21)
+        mat21 = sp.load_npz(pred_chr21).toarray()
+        assert mat21.shape == (187, 187)
+        assert np.allclose(mat21, mat21.T, atol=1e-5)
+
+        with open(os.path.join(pred_out, "predictions.pkl"), "rb") as pf:
+            import pickle
+            saved_p = pickle.load(pf)
+        assert saved_p["blendMode"] == "uniform"
+        assert isinstance(saved_p["targetValueRange"], dict)
+        assert saved_p["targetValueRange"]["method"] == "p99_log10"
+
 
 def test_blend_modes_and_splitfile_cli():
     rng = np.random.default_rng(7)
@@ -347,6 +445,9 @@ class TestPhase1RnaCganClean(unittest.TestCase):
 
     def test_06_blend_modes_and_splitfile_cli(self):
         test_blend_modes_and_splitfile_cli()
+
+    def test_07_phased_cdo_trainonly_and_phased_predict_and_windows_paths(self):
+        test_phased_cdo_trainonly_and_phased_predict_and_windows_paths()
 
 
 if __name__ == "__main__":

@@ -1669,10 +1669,12 @@ def distanceNormalize(pSparseCsrMatrix, pWindowSize_bins):
     return distNormalizedMatrix
 
 def plotChromatinFactors(pFactorArray, pFeatureNameList, 
-                            pChromatinFolder, pChrom, pBinsize, pStartbin,
-                            pOutputPath, pPlotType, pFigureType="png"):
+                            pChromatinFolder, pChrom, pBinsize=None, pStartbin=None,
+                            pOutputPath=None, pPlotType="box", pFigureType="png", pbinSize=None):
     #plot box- or line plots of the chromatin factors stored in pFactorDict
     #the matrices are required to determine the binsize for the line plots
+    if pBinsize is None and pbinSize is not None:
+        pBinsize = pbinSize
     if pPlotType == "box":
         plotFn = plotChromatinFactors_boxplots
     elif pPlotType == "line":
@@ -1680,9 +1682,10 @@ def plotChromatinFactors(pFactorArray, pFeatureNameList,
     else:
         return
  
-    filename = "chromFactors_{:s}_{:s}_{:s}.{:s}".format(pPlotType, pChromatinFolder.rstrip("/").replace("/","-"), str(pChrom), pFigureType)
+    safeFolder = re.sub(r'[\\/:*?"<>|]+', "-", str(pChromatinFolder or "chromatin").strip("/\\"))
+    filename = "chromFactors_{:s}_{:s}_{:s}.{:s}".format(pPlotType, safeFolder, str(pChrom), pFigureType)
     filename = os.path.join(pOutputPath,filename)
-    plotTitle = "Chromosome {:s} | Dir. {:s}".format(str(pChrom),pChromatinFolder)
+    plotTitle = "Chromosome {:s} | Dir. {:s}".format(str(pChrom),str(pChromatinFolder))
     plotFn(pChromFactorArray=pFactorArray,
                     pFilename=filename, 
                     pBinSize=pBinsize,

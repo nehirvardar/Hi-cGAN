@@ -59,7 +59,7 @@ def parse_arguments(args=None):
                         type=int, default=16,
                         help="Stride in bins for 'grid' windowMode (default: 16).")
     parser.add_argument("--blendMode", "-bm", required=False,
-                        type=str, choices=["raised_cosine_peak", "uniform"], default="raised_cosine_peak",
+                        type=str, choices=["raised_cosine_peak", "uniform"], default=None,
                         help="Overlap blending mode when rebuilding chromosome matrices in 'grid' windowMode: "
                              "'raised_cosine_peak' (default, 0.20 + 0.80*sin window + 1 + 2*sub peak weight) or 'uniform'.")
     parser.add_argument("--runEval", "-eval", required=False,
@@ -292,14 +292,8 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         windowCoordsList,
     )
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="grid", pGridStride=16, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None, pFeatureSet=None, pUsePairFeatures=None, pDataDir=None, pSplitFile=None, pSplit="test", pBlendMode="raised_cosine_peak", pRunEval=False, pGtDir=None):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="grid", pGridStride=16, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None, pFeatureSet=None, pUsePairFeatures=None, pDataDir=None, pSplitFile=None, pSplit="test", pBlendMode=None, pRunEval=False, pGtDir=None):
     trainedmodel = pTrainedModel
-    if trainedmodel and os.path.isdir(trainedmodel):
-        for cand_name in ("generator_best.keras", "generator_final.keras"):
-            cand_p = os.path.join(trainedmodel, cand_name)
-            if os.path.exists(cand_p):
-                trainedmodel = cand_p
-                break
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
     outputFolder = pOutputFolder
@@ -311,21 +305,61 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
     os.makedirs(outputFolder, exist_ok=True)
     utils.configureLogging(os.path.join(outputFolder, "predict.log"))
 
+    # Pre-load saved state when running phased --mode predict or --mode make-matrix
+    preloaded_vars = None
+    if pMode == "predict":
+        cand_pkl = os.path.join(outputFolder, "prediction_vars.pkl")
+        if os.path.exists(cand_pkl):
+            with open(cand_pkl, "rb") as fh:
+                preloaded_vars = pickle.load(fh)
+    elif pMode == "make-matrix":
+        cand_pkl = os.path.join(outputFolder, "predictions.pkl")
+        if os.path.exists(cand_pkl):
+            with open(cand_pkl, "rb") as fh:
+                preloaded_vars = pickle.load(fh)
+
+    if isinstance(preloaded_vars, dict):
+        if not trainedmodel and preloaded_vars.get("trainedmodel"):
+            trainedmodel = preloaded_vars.get("trainedmodel")
+        if not predictionChromosomes and preloaded_vars.get("chromNameList"):
+            predictionChromosomes = list(preloaded_vars.get("chromNameList"))
+        if pBlendMode is None and preloaded_vars.get("blendMode"):
+            pBlendMode = preloaded_vars.get("blendMode")
+        if not pLogTransformTarget and preloaded_vars.get("logTransformTarget"):
+            pLogTransformTarget = bool(preloaded_vars.get("logTransformTarget"))
+        if preloaded_vars.get("binSize") is not None and pBinSize is None:
+            binSize = int(preloaded_vars["binSize"])
+        if preloaded_vars.get("windowSize") is not None and pWindowSize is None:
+            windowSize = int(preloaded_vars["windowSize"])
+
+    if trainedmodel and os.path.isdir(trainedmodel):
+        for cand_name in ("generator_best.keras", "generator_final.keras"):
+            cand_p = os.path.join(trainedmodel, cand_name)
+            if os.path.exists(cand_p):
+                trainedmodel = cand_p
+                break
+
+    blendMode = pBlendMode or "raised_cosine_peak"
+
     # Resolve predictionChromosomes from splitFile when omitted
     if not predictionChromosomes:
         split_candidates = [pSplitFile] if pSplitFile else ["hicgan/data/splits.txt", "data/splits.txt"]
         resolved_split = next((p for p in split_candidates if p and os.path.exists(p)), None)
         if resolved_split is None:
-            raise SystemExit(
-                "Aborting. Provide --predictionChromosomes (-pc) or --splitFile (-sf) pointing to splits.txt."
-            )
-        splits_map = utils.parseSplitFile(resolved_split)
-        split_key = (pSplit or "test").lower()
-        if split_key == "all":
-            predictionChromosomes = splits_map["train"] + splits_map["val"] + splits_map["test"]
+            if pMode in ("predict", "make-matrix"):
+                predictionChromosomes = []
+            else:
+                raise SystemExit(
+                    "Aborting. Provide --predictionChromosomes (-pc) or --splitFile (-sf) pointing to splits.txt."
+                )
         else:
-            predictionChromosomes = splits_map.get(split_key, splits_map["test"])
-        log.info("[PREDICT-SPLIT] Loaded %s chromosomes from %s: %s", split_key, resolved_split, predictionChromosomes)
+            splits_map = utils.parseSplitFile(resolved_split)
+            split_key = (pSplit or "test").lower()
+            if split_key == "all":
+                predictionChromosomes = splits_map["train"] + splits_map["val"] + splits_map["test"]
+            else:
+                predictionChromosomes = splits_map.get(split_key, splits_map["test"])
+            log.info("[PREDICT-SPLIT] Loaded %s chromosomes from %s: %s", split_key, resolved_split, predictionChromosomes)
 
     # Resolve chromSizesPath / dataDir
     if pChromSizesPath is None:
@@ -424,6 +458,9 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     "or \"min,max\"; got {!r}".format(pTargetValueRange))
         log.info(msg_sc)
         print(msg_sc, flush=True)
+    elif isinstance(preloaded_vars, dict) and preloaded_vars.get("targetValueRange") is not None:
+        targetValueRange = preloaded_vars["targetValueRange"]
+        log.info("[PREDICT-SCALE] Restored targetValueRange from phased pickle state: %s", str(targetValueRange))
     scalefactors = True
     clampfactors = False
     scalematrix = True
@@ -493,10 +530,18 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                 "originalBinsList": originalBinsList,
                 "flankingSizeList": flankingSizeList,
                 "windowCoordsList": windowCoordsList,
+                "chromNameList": [c.chromosome for c in testdataContainerList],
+                "windowSize": windowSize,
+                "binSize": binSize,
+                "gridStride": pGridStride,
                 "inputMode": inputMode,
                 "windowMode": windowMode,
                 "featureSet": featureSet,
                 "usePairFeatures": usePairFeatures,
+                "targetValueRange": targetValueRange,
+                "logTransformTarget": logTransformTarget,
+                "blendMode": blendMode,
+                "trainedmodel": trainedmodel,
             }
 
             pickle_path = os.path.join(outputFolder, "prediction_vars.pkl")
@@ -527,6 +572,16 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         windowMode = loaded_vars.get("windowMode", windowMode)
         featureSet = loaded_vars.get("featureSet", featureSet)
         usePairFeatures = loaded_vars.get("usePairFeatures", usePairFeatures)
+        if "windowSize" in loaded_vars and loaded_vars["windowSize"] is not None:
+            windowSize = int(loaded_vars["windowSize"])
+        if "binSize" in loaded_vars and loaded_vars["binSize"] is not None:
+            binSize = int(loaded_vars["binSize"])
+        if targetValueRange is None and loaded_vars.get("targetValueRange") is not None:
+            targetValueRange = loaded_vars["targetValueRange"]
+        if not logTransformTarget and loaded_vars.get("logTransformTarget"):
+            logTransformTarget = bool(loaded_vars["logTransformTarget"])
+        if pBlendMode is None and loaded_vars.get("blendMode"):
+            blendMode = loaded_vars["blendMode"]
 
     if pMode in ["predict", "all"]:
         use_embedding = (inputMode in ("bigwig", "feature_pack"))
@@ -610,7 +665,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                         multiplier,
                         origBins,
                         logTransformTarget,
-                        pBlendMode,
+                        blendMode,
                     )
                     rebuildAsync.append(
                         (chrom, matrixFile, rebuildPool.apply_async(
@@ -646,7 +701,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                         windowSize,
                         matrixSize,
                         starts,
-                        tuple(targetValueRange) if targetValueRange is not None else None,
+                        targetValueRange if isinstance(targetValueRange, dict) else (tuple(targetValueRange) if targetValueRange is not None else None),
                         multiplier,
                         origBins,
                         logTransformTarget,
@@ -699,7 +754,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     pSaveMemory,
                     windowStartsList[idx] if windowStartsList else None,
                     matrixSize,
-                    tuple(targetValueRange) if targetValueRange is not None else None,
+                    targetValueRange if isinstance(targetValueRange, dict) else (tuple(targetValueRange) if targetValueRange is not None else None),
                     multiplier,
                     origBins,
                     logTransformTarget,
@@ -727,6 +782,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             "predictionFiles": predictionFiles,
             "chromNameList": chromNameList,
             "windowSize": windowSize,
+            "binSize": binSize,
             "windowStartsList": windowStartsList,
             "matrixSizeList": matrixSizeList,
             "originalBinsList": originalBinsList,
@@ -736,6 +792,10 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             "bandStarts": bandStarts if useBand else None,
             "inputMode": inputMode,
             "windowMode": windowMode,
+            "targetValueRange": targetValueRange,
+            "logTransformTarget": logTransformTarget,
+            "blendMode": blendMode,
+            "trainedmodel": trainedmodel,
         }
 
         pickle_path = os.path.join(outputFolder, "predictions.pkl")
@@ -763,8 +823,16 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         windowCoordsList = loaded_vars.get("windowCoordsList")
         chunkFormat = loaded_vars.get("chunkFormat", "windows")
         bandStarts = loaded_vars.get("bandStarts")
-        if "windowSize" in loaded_vars:
+        if "windowSize" in loaded_vars and loaded_vars["windowSize"] is not None:
             windowSize = int(loaded_vars["windowSize"])
+        if "binSize" in loaded_vars and loaded_vars["binSize"] is not None and pBinSize is None:
+            binSize = int(loaded_vars["binSize"])
+        if targetValueRange is None and loaded_vars.get("targetValueRange") is not None:
+            targetValueRange = loaded_vars["targetValueRange"]
+        if not logTransformTarget and loaded_vars.get("logTransformTarget"):
+            logTransformTarget = bool(loaded_vars["logTransformTarget"])
+        if pBlendMode is None and loaded_vars.get("blendMode"):
+            blendMode = loaded_vars["blendMode"]
 
         if predictionFiles is None and "predList" in loaded_vars:
             predictionFiles = []
@@ -856,7 +924,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     multiplier,
                     origBins,
                     logTransformTarget,
-                    pBlendMode,
+                    blendMode,
                 ))
             elif fmt == "band":
                 starts = bandStarts[i] if bandStarts else None
@@ -870,7 +938,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     windowSize,
                     matrixSize,
                     starts,
-                    tuple(targetValueRange) if targetValueRange is not None else None,
+                    targetValueRange if isinstance(targetValueRange, dict) else (tuple(targetValueRange) if targetValueRange is not None else None),
                     multiplier,
                     origBins,
                     logTransformTarget,
@@ -884,7 +952,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                     pSaveMemory,
                     windowStarts,
                     matrixSize,
-                    tuple(targetValueRange) if targetValueRange is not None else None,
+                    targetValueRange if isinstance(targetValueRange, dict) else (tuple(targetValueRange) if targetValueRange is not None else None),
                     multiplier,
                     origBins,
                     logTransformTarget,
