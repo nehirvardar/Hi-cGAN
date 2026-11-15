@@ -1,11 +1,14 @@
 #!python3
 import os
-import cooler
-import pyBigWig
-import numpy as np
+try:
+    import cooler
+except ImportError:
+    cooler = None
+try:
+    import pyBigWig
+except ImportError:
+    pyBigWig = None
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 from matplotlib.ticker import MultipleLocator
@@ -15,6 +18,9 @@ from sklearn import metrics as metrics
 import traceback
 
 
+import re
+import hashlib
+import json
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import csr_matrix, issparse
@@ -22,12 +28,194 @@ import logging
 log = logging.getLogger(__name__)
 
 
+def configureLogging(pLogFile=None, pLevel=logging.INFO):
+    """Configure root/package logger with timestamps for console and optional file output."""
+    fmt = "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=pLevel, format=fmt, datefmt=datefmt)
+    else:
+        root.setLevel(pLevel)
+    if pLogFile:
+        os.makedirs(os.path.dirname(os.path.abspath(pLogFile)), exist_ok=True)
+        existing_files = [
+            getattr(h, "baseFilename", None) for h in root.handlers
+        ]
+        if os.path.abspath(pLogFile) not in existing_files:
+            fh = logging.FileHandler(pLogFile)
+            fh.setLevel(pLevel)
+            fh.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+            root.addHandler(fh)
+            log.info("Logging to file: %s", pLogFile)
+
+
+def isNpzMatrixSource(pPath):
+    """Return True if pPath is a .npz file, a chrom_index.csv file, or a folder containing chr*.npz."""
+    if pPath is None:
+        return False
+    pPath = str(pPath)
+    if pPath.endswith(".npz") or pPath.endswith(".csv"):
+        return True
+    if os.path.isdir(pPath):
+        if os.path.isfile(os.path.join(pPath, "chrom_index.csv")):
+            return True
+        for fname in os.listdir(pPath):
+            if fname.endswith(".npz"):
+                return True
+    return False
+
+
+def inferBinSizeFromPath(pPath, pDefaultBinSize=250000):
+    """Infer genomic binSize in bp from path tokens like '250kb', '10kb', '1mb', or fall back to default."""
+    if pPath is not None:
+        m = re.search(r'(?:^|[_\-/])(\d+)\s*(kb|mb|bp)(?:[_\-/.]|$)', str(pPath), flags=re.IGNORECASE)
+        if m:
+            val = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit == "kb":
+                inferred = val * 1000
+            elif unit == "mb":
+                inferred = val * 1000000
+            else:
+                inferred = val
+            log.info("[NPZ-BINSIZE] Inferred binSize=%d bp from path '%s'", inferred, pPath)
+            return inferred
+    log.info("[NPZ-BINSIZE] Using default/explicit binSize=%d bp for path '%s'", int(pDefaultBinSize), str(pPath))
+    return int(pDefaultBinSize)
+
+
+def parseSplitFile(pSplitFile):
+    """Parse a splits.txt file into a dict {'train': [...], 'val': [...], 'test': [...]} of bare chromosome names."""
+    splits = {"train": [], "val": [], "test": []}
+    if not pSplitFile or not os.path.isfile(pSplitFile):
+        raise FileNotFoundError(f"Split file not found: {pSplitFile}")
+    with open(pSplitFile, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                chrom = parts[0].strip().lstrip("chr")
+                role = parts[1].strip().lower()
+                if role in ("val", "valid", "validation"):
+                    role = "val"
+                if role in splits:
+                    splits[role].append(chrom)
+    return splits
+
+
+def resolveNpzFileForChrom(pPath, pChromStr):
+    """Resolve the .npz file path for a given chromosome inside a directory or direct file path."""
+    bare = str(pChromStr).lstrip("chr") if pChromStr is not None else ""
+    if os.path.isfile(pPath) and str(pPath).endswith(".npz"):
+        base = os.path.splitext(os.path.basename(pPath))[0].lstrip("chr")
+        if not bare or base == bare:
+            return pPath
+        parent = os.path.dirname(os.path.abspath(pPath))
+        for cand_name in (f"chr{bare}.npz", f"{bare}.npz", f"{pChromStr}.npz"):
+            cand = os.path.join(parent, cand_name)
+            if os.path.isfile(cand):
+                return cand
+        return pPath
+    candidates = [
+        os.path.join(pPath, f"chr{bare}.npz"),
+        os.path.join(pPath, f"{bare}.npz"),
+        os.path.join(pPath, f"{pChromStr}.npz"),
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    raise FileNotFoundError(
+        f"Could not find .npz matrix for chromosome '{pChromStr}' in '{pPath}'. "
+        f"Tried: {candidates}"
+    )
+
+
+def getMatrixFromNpz(pMatrixPath, pChromNameStr, pBinSizeInt=None, pBinSize=None):
+    """Load a sparse CSR matrix for a given chromosome from a .npz directory or file."""
+    npzFile = resolveNpzFileForChrom(pMatrixPath, pChromNameStr)
+    sparseMatrix = sparse.load_npz(npzFile).tocsr().astype(np.float32)
+    effectiveBinSize = pBinSizeInt if pBinSizeInt is not None else pBinSize
+    binSizeInt = int(effectiveBinSize) if effectiveBinSize is not None else inferBinSizeFromPath(pMatrixPath)
+    dmin = float(sparseMatrix.data.min()) if sparseMatrix.nnz > 0 else 0.0
+    dmax = float(sparseMatrix.data.max()) if sparseMatrix.nnz > 0 else 0.0
+    log.info(
+        "[NPZ-LOAD] Loaded %s for chr%s: shape=%s, nnz=%d, data_range=[%.4f, %.4f], binSize=%d bp",
+        npzFile, str(pChromNameStr).lstrip("chr"), sparseMatrix.shape, sparseMatrix.nnz, dmin, dmax, binSizeInt
+    )
+    return sparseMatrix, binSizeInt
+
+
+def getChromBinsFromNpzSource(pPath, pChrom=None, pBinSize=None):
+    """Return a dict mapping bare chromosome name -> n_bins, or a single int n_bins if pChrom is given."""
+    if pPath is None:
+        return {} if pChrom is None else None
+    chromBins = {}
+    csvPath = None
+    if os.path.isfile(pPath) and str(pPath).endswith(".csv"):
+        csvPath = pPath
+    elif os.path.isdir(pPath) and os.path.isfile(os.path.join(pPath, "chrom_index.csv")):
+        csvPath = os.path.join(pPath, "chrom_index.csv")
+
+    if csvPath is not None:
+        df = pd.read_csv(csvPath)
+        for _, row in df.iterrows():
+            c = str(row["chrom"]).lstrip("chr")
+            chromBins[c] = int(row["n_bins"])
+        log.info("[NPZ-INDEX] Loaded n_bins for %d chromosomes from %s", len(chromBins), csvPath)
+    elif os.path.isdir(pPath):
+        for fname in sorted(os.listdir(pPath)):
+            if fname.endswith(".npz"):
+                c = os.path.splitext(fname)[0].lstrip("chr")
+                mat = sparse.load_npz(os.path.join(pPath, fname))
+                chromBins[c] = int(mat.shape[0])
+        log.info("[NPZ-INDEX] Scanned n_bins for %d chromosomes from .npz files in %s", len(chromBins), pPath)
+    elif os.path.isfile(pPath) and str(pPath).endswith(".npz"):
+        c = os.path.splitext(os.path.basename(pPath))[0].lstrip("chr")
+        mat = sparse.load_npz(pPath)
+        chromBins[c] = int(mat.shape[0])
+
+    if pChrom is not None:
+        bare = str(pChrom).lstrip("chr")
+        if bare not in chromBins:
+            raise KeyError(f"Chromosome '{pChrom}' not found in '{pPath}'. Available: {list(chromBins.keys())}")
+        return int(chromBins[bare])
+    return chromBins
+
+
+def generateSymmetricRandomMatrix(pNumBins, pSeed=None, pChrom=None):
+    """Generate a deterministic (if seeded) symmetric 2D random matrix in [0, 1] of shape (pNumBins, pNumBins)."""
+    n = int(pNumBins)
+    if pSeed is not None:
+        chrom_key = str(pChrom).lstrip("chr") if pChrom is not None else "default"
+        digest = hashlib.sha256(f"hicgan_random2d_{pSeed}_{chrom_key}".encode("utf-8")).digest()
+        derived_seed = int.from_bytes(digest[:8], byteorder="little")
+        rng = np.random.default_rng(derived_seed)
+    else:
+        derived_seed = None
+        rng = np.random.default_rng()
+
+    mat = rng.uniform(0.0, 1.0, size=(n, n)).astype(np.float32)
+    mat = 0.5 * (mat + mat.T)
+    msg = (
+        f"[RANDOM2D] Generated symmetric 2D random matrix for chr{str(pChrom).lstrip('chr')}: "
+        f"shape=({n}, {n}), base_seed={pSeed}, derived_seed={derived_seed}, "
+        f"min={mat.min():.4f}, max={mat.max():.4f}, mean={mat.mean():.4f}"
+    )
+    log.info(msg)
+    print(msg)
+    return mat
+
+
 def getBigwigFileList(pDirectory):
     #returns a list of bigwig files in pDirectory
     retList = []
+    pDir = pDirectory if pDirectory.endswith(os.sep) else pDirectory + os.sep
     for file in sorted(os.listdir(pDirectory)):
         if file.endswith(".bigwig") or file.endswith("bigWig") or file.endswith(".bw"):
-            retList.append(pDirectory + file)
+            retList.append(pDir + file)
     return retList
 
 def getChromSizesFromBigwig(pBigwigFileName):
@@ -140,88 +328,378 @@ def scaleArray(pArray):
         normArray = np.zeros_like(pArray)
     return normArray
 
-def observedValueRange(pMatrixFilePaths, pChromosomes=None):
+def observedValueRange(pMatrixFilePaths, pChromosomes=None, pLogTransform=False):
     """Smallest and largest value actually present in the target matrices.
 
-    Measured, not assumed. The range is taken over the STORED entries only: an
-    absent entry in a sparse Hi-C matrix means "not observed", not "value zero",
-    and letting it into the range would drag the minimum to 0 for any target
-    whose real values are negative.
-
-    One range is computed across every training matrix and chromosome, and the
-    same one is then used everywhere. A per-chromosome range would map the same
-    physical value to a different target on chr1 than on chr2, so the model
-    would be chasing a target that moves between chromosomes.
+    Supports both .cool files and .npz directories/files. For non-negative
+    sparse count matrices (.npz), implicit zeros are included so vmin=0.0.
+    If pLogTransform=True, values are transformed via np.log1p before measuring.
     """
     vmin, vmax = np.inf, -np.inf
-    for path in ([pMatrixFilePaths] if isinstance(pMatrixFilePaths, str)
-                 else pMatrixFilePaths):
-        prefix = getChromPrefixCooler(path)
-        chroms = pChromosomes
-        if chroms is None:
-            chroms = [c.replace(prefix, "", 1) for c in getChromSizesFromCooler(path)]
-        for chrom in chroms:
-            name = prefix + str(chrom).replace(prefix, "", 1)
-            try:
-                M, _ = getMatrixFromCooler(path, name)
-            except Exception:
-                continue
-            if M is None:
-                continue
-            data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
-            data = data[np.isfinite(data)]
-            if data.size == 0:
-                continue
-            vmin = min(vmin, float(data.min()))
-            vmax = max(vmax, float(data.max()))
+    paths = [pMatrixFilePaths] if isinstance(pMatrixFilePaths, str) else list(pMatrixFilePaths)
+    for path in paths:
+        if isNpzMatrixSource(path):
+            chromBins = getChromBinsFromNpzSource(path)
+            chroms = pChromosomes if pChromosomes is not None else list(chromBins.keys())
+            for chrom in chroms:
+                bare = str(chrom).lstrip("chr")
+                try:
+                    M, _ = getMatrixFromNpz(path, bare)
+                except Exception as e:
+                    log.warning("Skipping chr%s in observedValueRange: %s", bare, e)
+                    continue
+                if M is None:
+                    continue
+                data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
+                data = data[np.isfinite(data)]
+                if data.size == 0:
+                    vmin = min(vmin, 0.0)
+                    continue
+                if pLogTransform:
+                    data = np.log1p(np.maximum(data, 0.0))
+                dmin = float(data.min())
+                dmax = float(data.max())
+                # Sparse count matrices have implicit zeros everywhere outside .data
+                if sparse.issparse(M) and dmin >= 0.0 and M.nnz < (M.shape[0] * M.shape[1]):
+                    dmin = 0.0
+                vmin = min(vmin, dmin)
+                vmax = max(vmax, dmax)
+        else:
+            prefix = getChromPrefixCooler(path)
+            chroms = pChromosomes
+            if chroms is None:
+                chroms = [c.replace(prefix, "", 1) for c in getChromSizesFromCooler(path)]
+            for chrom in chroms:
+                name = prefix + str(chrom).replace(prefix, "", 1)
+                try:
+                    M, _ = getMatrixFromCooler(path, name)
+                except Exception:
+                    continue
+                if M is None:
+                    continue
+                data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
+                data = data[np.isfinite(data)]
+                if data.size == 0:
+                    continue
+                if pLogTransform:
+                    data = np.log1p(np.maximum(data, 0.0))
+                vmin = min(vmin, float(data.min()))
+                vmax = max(vmax, float(data.max()))
     if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
         msg = "could not determine a usable value range from the target matrices"
         raise ValueError(msg)
+    log.info(
+        "[TARGET-RANGE] Measured global target value range: [%.4f, %.4f] (logTransform=%s)",
+        vmin, vmax, pLogTransform
+    )
     return vmin, vmax
 
 
-def toUnitRange(pArray, pMin, pMax):
-    """Map a DENSE array from [pMin, pMax] onto [0, 1].
+def computeGlobalP99TargetRange(pMatrixFilePaths, pTrainChromosomes, scale_factor=10.0, clip_percentile=99.0, pSavePath=None):
+    """Compute global P99 of ln(1 + scale_factor * x) over positive entries strictly from training chromosomes."""
+    if not pTrainChromosomes:
+        raise ValueError("pTrainChromosomes must be non-empty to compute global P99 target range without data leakage.")
+    paths = [pMatrixFilePaths] if isinstance(pMatrixFilePaths, str) else list(pMatrixFilePaths)
+    train_chroms = [str(c).lstrip("chr") for c in pTrainChromosomes if c is not None and str(c).strip() != ""]
+    if not train_chroms:
+        raise ValueError("pTrainChromosomes must contain at least one valid chromosome.")
 
-    Dense on purpose. The same map on a sparse matrix would have to shift the
-    implicit zeros too, which scipy refuses ("subtracting a nonzero scalar from
-    a sparse array is not supported") -- the error that made the old
-    scaleArray() path unusable for any signed target. Target windows are
-    densified before use anyway, so the transform is applied there.
-    """
+    pos_log_chunks = []
+    seen_sources = set()
+    sf = float(scale_factor)
+
+    for path in paths:
+        if path is None:
+            continue
+        if isNpzMatrixSource(path):
+            if os.path.isfile(path) and str(path).endswith(".npz"):
+                base_c = os.path.splitext(os.path.basename(path))[0].lstrip("chr")
+                chroms_to_check = [base_c] if base_c in train_chroms else train_chroms
+            else:
+                chroms_to_check = train_chroms
+            for bare in chroms_to_check:
+                try:
+                    npz_file = os.path.abspath(resolveNpzFileForChrom(path, bare))
+                except Exception as e:
+                    log.warning("Skipping chr%s in computeGlobalP99TargetRange: %s", bare, e)
+                    continue
+                key = (npz_file, bare)
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                try:
+                    M, _ = getMatrixFromNpz(npz_file, bare)
+                except Exception as e:
+                    log.warning("Skipping chr%s (%s) in computeGlobalP99TargetRange: %s", bare, npz_file, e)
+                    continue
+                if M is None:
+                    continue
+                data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
+                data = data[np.isfinite(data) & (data > 0.0)]
+                if data.size > 0:
+                    pos_log_chunks.append(np.log1p(data.astype(np.float64) * sf))
+        else:
+            prefix = getChromPrefixCooler(path)
+            abs_cool = os.path.abspath(path)
+            for bare in train_chroms:
+                key = (abs_cool, bare)
+                if key in seen_sources:
+                    continue
+                seen_sources.add(key)
+                name = prefix + str(bare).replace(prefix, "", 1)
+                try:
+                    M, _ = getMatrixFromCooler(path, name)
+                except Exception:
+                    continue
+                if M is None:
+                    continue
+                data = M.data if sparse.issparse(M) else np.asarray(M).ravel()
+                data = data[np.isfinite(data) & (data > 0.0)]
+                if data.size > 0:
+                    pos_log_chunks.append(np.log1p(data.astype(np.float64) * sf))
+
+    if not pos_log_chunks:
+        raise ValueError(f"Could not find any positive finite target entries across training chromosomes {train_chroms}")
+
+    all_pos_log = np.concatenate(pos_log_chunks)
+    hi = float(np.percentile(all_pos_log, float(clip_percentile)))
+    if hi <= 0.0:
+        hi = float(all_pos_log.max())
+    if not np.isfinite(hi) or hi <= 0.0:
+        raise ValueError("Computed non-positive or non-finite hi in computeGlobalP99TargetRange")
+
+    log.info(
+        "[TARGET-P99] Global P%.1f(ln(1 + %.1f * x)_{>0}) over %d train chroms (%d positive entries): hi=%.6f",
+        float(clip_percentile), sf, len(seen_sources), int(all_pos_log.size), hi
+    )
+    cfg_out = {
+        "method": "p99_log10",
+        "scale_factor": float(sf),
+        "clip_percentile": float(clip_percentile),
+        "hi": float(hi),
+        "min": 0.0,
+        "max": float(hi),
+        "log_transform": True,
+        "train_chromosomes": list(train_chroms),
+    }
+    if pSavePath:
+        saveP99ValueRange(
+            pSavePath,
+            pHi=hi,
+            scale_factor=sf,
+            clip_percentile=float(clip_percentile),
+            pTrainChromosomes=train_chroms,
+        )
+    return cfg_out
+
+
+def toP99LogUnitRange(pArray, pHi, scale_factor=10.0):
+    """Map raw count array onto [0, 1] via clip(ln(1 + scale_factor * max(x, 0)) / pHi, 0, 1)."""
+    hi = float(pHi)
+    sf = float(scale_factor)
+    if sparse.issparse(pArray):
+        out = pArray.copy().astype(np.float64)
+        if out.nnz > 0:
+            if hi <= 0.0:
+                out.data[:] = 0.0
+            else:
+                d = np.nan_to_num(out.data, nan=0.0, posinf=0.0, neginf=0.0)
+                d = np.maximum(d, 0.0)
+                out.data = np.clip(np.log1p(d * sf) / hi, 0.0, 1.0)
+            out.eliminate_zeros()
+        return out
+    arr = np.nan_to_num(np.asarray(pArray, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.maximum(arr, 0.0)
+    if hi <= 0.0:
+        return np.zeros_like(arr, dtype=np.float64)
+    log_arr = np.log1p(arr * sf)
+    return np.clip(log_arr / hi, 0.0, 1.0)
+
+
+def fromP99LogUnitRange(pMatrix, pHi, scale_factor=10.0):
+    """Invert toP99LogUnitRange: (exp(clip(y, 0, 1) * pHi) - 1) / scale_factor back to raw count space."""
+    hi = float(pHi)
+    sf = float(scale_factor)
+    if sf <= 0.0:
+        raise ValueError(f"scale_factor must be > 0, got {scale_factor}")
+    if sparse.issparse(pMatrix):
+        out = pMatrix.copy().astype(np.float64)
+        if out.nnz > 0:
+            clipped = np.clip(out.data, 0.0, 1.0)
+            out.data = np.maximum(np.expm1(clipped * hi) / sf, 0.0)
+            out.eliminate_zeros()
+        return out
+    arr = np.nan_to_num(np.asarray(pMatrix, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    clipped = np.clip(arr, 0.0, 1.0)
+    return np.maximum(np.expm1(clipped * hi) / sf, 0.0)
+
+
+def saveP99ValueRange(pPath, pHi, scale_factor=10.0, clip_percentile=99.0, pTrainChromosomes=None):
+    payload = {
+        "method": "p99_log10",
+        "scale_factor": float(scale_factor),
+        "clip_percentile": float(clip_percentile),
+        "hi": float(pHi),
+        "min": 0.0,
+        "max": float(pHi),
+        "log_transform": True,
+    }
+    if pTrainChromosomes is not None:
+        payload["train_chromosomes"] = [str(c).lstrip("chr") for c in pTrainChromosomes]
+    with open(pPath, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    log.info(
+        "wrote P99 target value range (method=p99_log10, scale_factor=%g, hi=%.6f) to %s",
+        float(scale_factor), float(pHi), pPath
+    )
+
+
+def toUnitRange(pArray, pMin, pMax, pLogTransform=False):
+    """Map a DENSE array from [pMin, pMax] onto [0, 1], with optional log1p preprocessing."""
+    arr = np.asarray(pArray, dtype=float)
+    if pLogTransform:
+        arr = np.log1p(np.maximum(arr, 0.0))
     span = float(pMax) - float(pMin)
     if span <= 0:
-        return np.zeros_like(pArray, dtype=float)
-    return np.clip((np.asarray(pArray, dtype=float) - float(pMin)) / span, 0.0, 1.0)
+        return np.zeros_like(arr, dtype=float)
+    return np.clip((arr - float(pMin)) / span, 0.0, 1.0)
 
 
-def fromUnitRange(pMatrix, pMin, pMax):
-    """Inverse of toUnitRange: [0, 1] back to [pMin, pMax], the real units.
-
-    On a sparse matrix only the STORED values are mapped. That is deliberate:
-    an unstored pixel was never predicted, and giving it pMin would invent a
-    maximally depleted contact everywhere the model said nothing.
-    """
+def fromUnitRange(pMatrix, pMin, pMax, pLogTransform=False):
+    """Inverse of toUnitRange: [0, 1] back to [pMin, pMax], with optional expm1 postprocessing."""
     span = float(pMax) - float(pMin)
     if sparse.issparse(pMatrix):
         out = pMatrix.copy().astype(np.float64)
         out.data = out.data * span + float(pMin)
+        if pLogTransform:
+            out.data = np.expm1(np.maximum(out.data, 0.0))
         return out
-    return np.asarray(pMatrix, dtype=float) * span + float(pMin)
+    res = np.asarray(pMatrix, dtype=float) * span + float(pMin)
+    if pLogTransform:
+        res = np.expm1(np.maximum(res, 0.0))
+    return res
 
 
-def saveValueRange(pPath, pMin, pMax):
-    import json
-    with open(pPath, "w") as fh:
-        json.dump({"min": float(pMin), "max": float(pMax)}, fh, indent=1)
-    log.info("wrote target value range [%g, %g] to %s", pMin, pMax, pPath)
+def applyTargetScaling(pArray, pTargetRange, pLogTransform=False):
+    """Apply either P99 log-unit scaling or min-max unit scaling to a dense array."""
+    if pTargetRange is None:
+        return pArray
+    if isinstance(pTargetRange, dict):
+        method = str(pTargetRange.get("method", "")).lower()
+        if method.startswith("p99"):
+            return toP99LogUnitRange(
+                pArray,
+                pHi=float(pTargetRange.get("hi", pTargetRange.get("max", 1.0))),
+                scale_factor=float(pTargetRange.get("scale_factor", 10.0)),
+            )
+        return toUnitRange(
+            pArray,
+            pMin=float(pTargetRange.get("min", 0.0)),
+            pMax=float(pTargetRange.get("max", pTargetRange.get("hi", 1.0))),
+            pLogTransform=bool(pTargetRange.get("log_transform", pLogTransform)),
+        )
+    if isinstance(pTargetRange, (tuple, list)):
+        if len(pTargetRange) >= 2 and isinstance(pTargetRange[0], str) and pTargetRange[0].lower().startswith("p99"):
+            hi = float(pTargetRange[1])
+            sf = float(pTargetRange[2]) if len(pTargetRange) > 2 else 10.0
+            return toP99LogUnitRange(pArray, pHi=hi, scale_factor=sf)
+        if len(pTargetRange) >= 4 and isinstance(pTargetRange[3], str) and pTargetRange[3].lower().startswith("p99"):
+            hi = float(pTargetRange[1])
+            sf = float(pTargetRange[4]) if len(pTargetRange) > 4 else 10.0
+            return toP99LogUnitRange(pArray, pHi=hi, scale_factor=sf)
+        lo, hi = float(pTargetRange[0]), float(pTargetRange[1])
+        log_tf = bool(pTargetRange[2]) if len(pTargetRange) > 2 else bool(pLogTransform)
+        return toUnitRange(pArray, lo, hi, pLogTransform=log_tf)
+    raise ValueError(f"Unsupported pTargetRange format: {pTargetRange!r}")
+
+
+def invertTargetScaling(pMatrix, pTargetRange, pLogTransform=False):
+    """Invert either P99 log-unit scaling or min-max unit scaling back to raw count space."""
+    if pTargetRange is None:
+        return pMatrix
+    if isinstance(pTargetRange, dict):
+        method = str(pTargetRange.get("method", "")).lower()
+        if method.startswith("p99"):
+            return fromP99LogUnitRange(
+                pMatrix,
+                pHi=float(pTargetRange.get("hi", pTargetRange.get("max", 1.0))),
+                scale_factor=float(pTargetRange.get("scale_factor", 10.0)),
+            )
+        return fromUnitRange(
+            pMatrix,
+            pMin=float(pTargetRange.get("min", 0.0)),
+            pMax=float(pTargetRange.get("max", pTargetRange.get("hi", 1.0))),
+            pLogTransform=bool(pTargetRange.get("log_transform", pLogTransform)),
+        )
+    if isinstance(pTargetRange, (tuple, list)):
+        if len(pTargetRange) >= 2 and isinstance(pTargetRange[0], str) and pTargetRange[0].lower().startswith("p99"):
+            hi = float(pTargetRange[1])
+            sf = float(pTargetRange[2]) if len(pTargetRange) > 2 else 10.0
+            return fromP99LogUnitRange(pMatrix, pHi=hi, scale_factor=sf)
+        if len(pTargetRange) >= 4 and isinstance(pTargetRange[3], str) and pTargetRange[3].lower().startswith("p99"):
+            hi = float(pTargetRange[1])
+            sf = float(pTargetRange[4]) if len(pTargetRange) > 4 else 10.0
+            return fromP99LogUnitRange(pMatrix, pHi=hi, scale_factor=sf)
+        lo, hi = float(pTargetRange[0]), float(pTargetRange[1])
+        log_tf = bool(pTargetRange[2]) if len(pTargetRange) > 2 else bool(pLogTransform)
+        return fromUnitRange(pMatrix, lo, hi, pLogTransform=log_tf)
+    raise ValueError(f"Unsupported pTargetRange format: {pTargetRange!r}")
+
+
+def saveValueRange(pPath, pMin, pMax, pLogTransform=False, method=None, scale_factor=None):
+    payload = {
+        "min": float(pMin),
+        "max": float(pMax),
+        "log_transform": bool(pLogTransform),
+    }
+    if method is not None:
+        payload["method"] = str(method)
+        if str(method).lower().startswith("p99"):
+            payload["hi"] = float(pMax)
+            payload["scale_factor"] = float(scale_factor if scale_factor is not None else 10.0)
+    with open(pPath, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=1)
+    log.info("wrote target value range [%g, %g] (log_transform=%s, method=%s) to %s", pMin, pMax, pLogTransform, method, pPath)
 
 
 def loadValueRange(pPath):
-    import json
-    with open(pPath) as fh:
+    with open(pPath, "r", encoding="utf-8") as fh:
         d = json.load(fh)
-    return float(d["min"]), float(d["max"])
+    lo = float(d.get("min", 0.0))
+    hi = float(d.get("max", d.get("hi", 1.0)))
+    return lo, hi
+
+
+def loadValueRangeMeta(pPath):
+    """Load (min, max, log_transform) from target_value_range.json."""
+    with open(pPath, "r", encoding="utf-8") as fh:
+        d = json.load(fh)
+    lo = float(d.get("min", 0.0))
+    hi = float(d.get("max", d.get("hi", 1.0)))
+    method = str(d.get("method", "")).lower()
+    log_tf = bool(d.get("log_transform", method.startswith("p99")))
+    return lo, hi, log_tf
+
+
+def loadTargetRangeConfig(pPath):
+    """Load full target normalization config dict from target_value_range.json."""
+    with open(pPath, "r", encoding="utf-8") as fh:
+        d = json.load(fh)
+    method = str(d.get("method", "minmax_log1p" if d.get("log_transform", False) else "unit_range")).lower()
+    hi = float(d.get("hi", d.get("max", 1.0)))
+    lo = float(d.get("min", 0.0))
+    scale_factor = float(d.get("scale_factor", 10.0))
+    log_transform = bool(d.get("log_transform", method.startswith("p99")))
+    return {
+        "method": method,
+        "min": lo,
+        "max": hi,
+        "hi": hi,
+        "scale_factor": scale_factor,
+        "clip_percentile": float(d.get("clip_percentile", 99.0)),
+        "log_transform": log_transform,
+        "train_chromosomes": d.get("train_chromosomes"),
+    }
 
 
 def showMatrix(pMatrix):
@@ -681,22 +1159,200 @@ def hic_diagonal_sharpen(matrix, strength=0.5, decay=0.3):
     return np.clip(sharpened, 0, None)
 
 
-def rebuildChromosomeToFile(pJob):
-    """Rebuild one chromosome from its predicted triangles and save it.
+def symmetrizeSparseCsr(pMatrix):
+    """Ensure a sparse or dense matrix is symmetric (M = triu(M) + triu(M, 1).T) as float32 CSR."""
+    if not sparse.isspmatrix(pMatrix):
+        pMatrix = sparse.csr_matrix(pMatrix)
+    upper = sparse.triu(pMatrix, k=0, format="csr")
+    strict_upper_T = sparse.triu(pMatrix, k=1, format="csr").T.tocsr()
+    sym = (upper + strict_upper_T).tocsr().astype(np.float32)
+    return sym
 
-    Everything a chromosome needs is in `pJob`, and nothing is returned but the
-    path, so this is safe to hand to a process pool: the 5 GB of triangles are
-    read from disk by the worker (memory-mapped, so only the windows actually
-    touched are paged in) and the assembled matrix is written by the worker.
-    Neither ever crosses the process boundary.
 
-    It lives in this module, and not in hicgan.predict, on purpose. A spawned
-    worker re-imports the module that defines its target, and importing
-    hicgan.predict would drag TensorFlow into every worker: seconds of start-up
-    and hundreds of MB of RAM each, for code that only uses numpy and scipy.
+def unpadMatrix(pMatrix, pOriginalSize, pChrom=None, pLeftPadBins=0):
+    """Crop a padded chromosome matrix back to its original unpadded bin count (supporting both tail padding and start/end flank padding)."""
+    if pOriginalSize is None:
+        return pMatrix
+    if isinstance(pOriginalSize, (tuple, list)):
+        orig = int(pOriginalSize[0])
+        left_pad = int(pOriginalSize[1]) if len(pOriginalSize) > 1 else int(pLeftPadBins)
+    else:
+        orig = int(pOriginalSize)
+        left_pad = int(pLeftPadBins)
+
+    if left_pad > 0 or pMatrix.shape[0] > orig or pMatrix.shape[1] > orig:
+        old_shape = pMatrix.shape
+        start = max(0, left_pad)
+        stop = min(old_shape[0], start + orig)
+        if sparse.isspmatrix(pMatrix):
+            pMatrix = pMatrix.tocsr()[start:stop, start:stop]
+        else:
+            pMatrix = pMatrix[start:stop, start:stop]
+        right_removed = max(0, old_shape[0] - stop)
+        msg = (
+            f"[UNPADDING] Chromosome {pChrom if pChrom is not None else '?'}: "
+            f"cropped padded matrix from shape={old_shape} (slice [{start}:{stop}, {start}:{stop}], "
+            f"left_flank_pad={start}, right_pad={right_removed}) back to original_shape=({orig}, {orig})"
+        )
+        log.info(msg)
+        print(msg, flush=True)
+    return pMatrix
+
+
+def rebuildMatrixGrid(pArrayOfWindows, pWindowCoords, pWindowSize, pMatrixSize, pOriginalMatrixSize=None, pChrom=None, blend_mode="raised_cosine_peak", pBlendMode=None):
+    """Rebuild a full symmetric chromosome matrix from 2D grid windows (row_start, col_start).
+
+    Overlapping windows in the upper triangle (row_start <= col_start) are averaged,
+    diagonal blocks (row_start == col_start) are symmetrized, and off-diagonal blocks
+    are mirrored to the lower triangle (col_start, row_start).
+
+    blend_mode:
+      - 'raised_cosine_peak' (default): 2D raised-cosine spatial confidence window in [0.20, 1.0]
+        combined with peak-preserving weight (1.0 + 2.0 * sub).
+      - 'uniform': equal-weight uniform averaging (pw = 1.0).
     """
-    (predictionFile, matrixFile, windowSize, flankingSize, saveMemory,
-     windowStarts, matrixSize, targetValueRange, multiplier) = pJob
+    if pBlendMode is not None:
+        blend_mode = pBlendMode
+    mode = str(blend_mode or "raised_cosine_peak").strip().lower()
+    if mode not in ("raised_cosine_peak", "uniform"):
+        raise ValueError(f"Unsupported blend_mode={blend_mode!r}. Expected 'raised_cosine_peak' or 'uniform'.")
+
+    W = int(pWindowSize)
+    M = int(pMatrixSize)
+    coords = np.asarray(pWindowCoords, dtype=np.int64)
+    n_win = int(pArrayOfWindows.shape[0])
+    if coords.shape[0] != n_win:
+        raise ValueError(f"rebuildMatrixGrid: {coords.shape[0]} coordinates for {n_win} windows")
+
+    log.info(
+        "[GRID-REBUILD] Rebuilding chr%s from %d 2D grid windows (windowSize=%d, matrixSize=%d, originalSize=%s, blend_mode=%s)",
+        str(pChrom), n_win, W, M, str(pOriginalMatrixSize), mode
+    )
+    sum_mat = np.zeros((M, M), dtype=np.float32)
+    w_mat = np.zeros((M, M), dtype=np.float32)
+
+    if mode == "raised_cosine_peak":
+        # 2D raised-cosine spatial confidence window in [0.20, 1.0] so tile borders
+        # blend seamlessly while peak-preserving weights prevent overlap dilution.
+        t_1d = 0.20 + 0.80 * np.sin(np.pi * (np.arange(W, dtype=np.float32) + 0.5) / float(W))
+        spatial_w_full = np.outer(t_1d, t_1d).astype(np.float32)
+    else:
+        spatial_w_full = None
+
+    for idx in range(n_win):
+        r0, c0 = int(coords[idx, 0]), int(coords[idx, 1])
+        win = np.asarray(pArrayOfWindows[idx], dtype=np.float32)
+        if win.ndim == 3 and win.shape[-1] == 1:
+            win = win[:, :, 0]
+        r1 = min(r0 + W, M)
+        c1 = min(c0 + W, M)
+        h, w = r1 - r0, c1 - c0
+        sub = np.clip(win[:h, :w], 0.0, None)
+        if mode == "uniform":
+            if r0 == c0 and h == w:
+                sub = 0.5 * (sub + sub.T)
+                sum_mat[r0:r1, c0:c1] += sub
+                w_mat[r0:r1, c0:c1] += 1.0
+            else:
+                sum_mat[r0:r1, c0:c1] += sub
+                w_mat[r0:r1, c0:c1] += 1.0
+                sum_mat[c0:c1, r0:r1] += sub.T
+                w_mat[c0:c1, r0:r1] += 1.0
+        else:
+            sw = spatial_w_full[:h, :w]
+            if r0 == c0 and h == w:
+                sub = 0.5 * (sub + sub.T)
+                pw = sw * (1.0 + 2.0 * sub)
+                sum_mat[r0:r1, c0:c1] += pw * sub
+                w_mat[r0:r1, c0:c1] += pw
+            else:
+                pw = sw * (1.0 + 2.0 * sub)
+                sum_mat[r0:r1, c0:c1] += pw * sub
+                w_mat[r0:r1, c0:c1] += pw
+                sum_mat[c0:c1, r0:r1] += (pw * sub).T
+                w_mat[c0:c1, r0:r1] += pw.T
+
+    mask = w_mat > 0.0
+    mean_mat = np.zeros((M, M), dtype=np.float32)
+    mean_mat[mask] = sum_mat[mask] / w_mat[mask]
+    del sum_mat, w_mat
+
+    if pOriginalMatrixSize is not None:
+        mean_mat = unpadMatrix(mean_mat, pOriginalMatrixSize, pChrom=pChrom)
+
+    # Enforce exact symmetry
+    mean_mat = 0.5 * (mean_mat + mean_mat.T)
+    csr = sparse.csr_matrix(mean_mat, dtype=np.float32)
+    del mean_mat
+    return csr
+
+
+def rebuildChromosomeFromGrid(pJob):
+    """Worker to rebuild one chromosome from 2D grid window predictions and save as symmetric CSR .npz."""
+    logTransform = False
+    chrom = None
+    blendMode = "raised_cosine_peak"
+    if len(pJob) >= 10:
+        (predFile, matrixFile, windowSize, matrixSize, windowCoords,
+         targetValueRange, multiplier, originalMatrixSize, logTransform, blendMode) = pJob[:10]
+        if len(pJob) >= 11:
+            chrom = pJob[10]
+    elif len(pJob) == 9:
+        (predFile, matrixFile, windowSize, matrixSize, windowCoords,
+         targetValueRange, multiplier, originalMatrixSize, lastArg) = pJob
+        if isinstance(lastArg, bool):
+            logTransform = lastArg
+        elif str(lastArg).lower() in ("raised_cosine_peak", "uniform"):
+            blendMode = str(lastArg).lower()
+        else:
+            chrom = lastArg
+    else:
+        (predFile, matrixFile, windowSize, matrixSize, windowCoords,
+         targetValueRange, multiplier, originalMatrixSize) = pJob
+    if chrom is None:
+        chrom = os.path.splitext(os.path.basename(matrixFile))[0].replace("matrix_chr", "")
+    predWindows = np.load(predFile, mmap_mode="r")
+    predMatrix = rebuildMatrixGrid(
+        pArrayOfWindows=predWindows,
+        pWindowCoords=windowCoords,
+        pWindowSize=windowSize,
+        pMatrixSize=matrixSize,
+        pOriginalMatrixSize=originalMatrixSize,
+        pChrom=chrom,
+        blend_mode=blendMode,
+    )
+    del predWindows
+    if targetValueRange is not None:
+        predMatrix = invertTargetScaling(predMatrix, targetValueRange, pLogTransform=logTransform)
+    else:
+        predMatrix = scaleArray(predMatrix) * multiplier
+    predMatrix = symmetrizeSparseCsr(predMatrix)
+    sparse.save_npz(matrixFile, predMatrix)
+    nnz = int(predMatrix.nnz)
+    del predMatrix
+    return matrixFile, nnz
+
+
+def rebuildChromosomeToFile(pJob):
+    """Rebuild one chromosome from its predicted triangles and save it as a symmetric CSR .npz."""
+    logTransform = False
+    chrom = None
+    if len(pJob) >= 11:
+        (predictionFile, matrixFile, windowSize, flankingSize, saveMemory,
+         windowStarts, matrixSize, targetValueRange, multiplier, originalMatrixSize, lastArg) = pJob[:11]
+        if isinstance(lastArg, bool):
+            logTransform = lastArg
+        else:
+            chrom = lastArg
+    elif len(pJob) == 10:
+        (predictionFile, matrixFile, windowSize, flankingSize, saveMemory,
+         windowStarts, matrixSize, targetValueRange, multiplier, originalMatrixSize) = pJob
+    else:
+        (predictionFile, matrixFile, windowSize, flankingSize, saveMemory,
+         windowStarts, matrixSize, targetValueRange, multiplier) = pJob
+        originalMatrixSize = None
+    if chrom is None:
+        chrom = os.path.splitext(os.path.basename(matrixFile))[0].replace("matrix_chr", "")
     predTriangles = np.load(predictionFile, mmap_mode="r")
     predMatrix = rebuildMatrix(pArrayOfTriangles=predTriangles,
                                pWindowSize=windowSize,
@@ -706,42 +1362,80 @@ def rebuildChromosomeToFile(pJob):
                                pMatrixSize=matrixSize,
                                pProgress=False)
     del predTriangles
+    if originalMatrixSize is not None:
+        predMatrix = unpadMatrix(predMatrix, originalMatrixSize, pChrom=chrom)
     if targetValueRange is not None:
-        predMatrix = fromUnitRange(predMatrix, *targetValueRange)
+        predMatrix = invertTargetScaling(predMatrix, targetValueRange, pLogTransform=logTransform)
     else:
         predMatrix = scaleArray(predMatrix) * multiplier
-    if not sparse.isspmatrix(predMatrix):
-        predMatrix = sparse.csr_matrix(predMatrix)
-    sparse.save_npz(matrixFile, predMatrix.tocsr())
+    predMatrix = symmetrizeSparseCsr(predMatrix)
+    sparse.save_npz(matrixFile, predMatrix)
     nnz = int(predMatrix.nnz)
     del predMatrix
     return matrixFile, nnz
 
 
 def rebuildChromosomeFromBand(pJob):
-    """Turn one chromosome's accumulated band into a saved matrix chunk.
-
-    The counterpart of rebuildChromosomeToFile for predictions that were summed
-    on the GPU. Nothing is folded here: the summing already happened, so this
-    only divides by the coverage and writes the sparse matrix.
-    """
-    (bandFile, matrixFile, windowSize, matrixSize, windowStarts,
-     targetValueRange, multiplier) = pJob
+    """Turn one chromosome's accumulated band into a saved symmetric CSR matrix chunk."""
+    logTransform = False
+    chrom = None
+    if len(pJob) >= 9:
+        (bandFile, matrixFile, windowSize, matrixSize, windowStarts,
+         targetValueRange, multiplier, originalMatrixSize, lastArg) = pJob[:9]
+        if isinstance(lastArg, bool):
+            logTransform = lastArg
+        else:
+            chrom = lastArg
+    elif len(pJob) == 8:
+        (bandFile, matrixFile, windowSize, matrixSize, windowStarts,
+         targetValueRange, multiplier, originalMatrixSize) = pJob
+    else:
+        (bandFile, matrixFile, windowSize, matrixSize, windowStarts,
+         targetValueRange, multiplier) = pJob
+        originalMatrixSize = None
+    if chrom is None:
+        chrom = os.path.splitext(os.path.basename(matrixFile))[0].replace("matrix_chr", "")
     band = np.load(bandFile, mmap_mode="r")
     startCount = np.bincount(np.asarray(windowStarts, dtype=np.int64),
                              minlength=int(matrixSize))[:int(matrixSize)]
     predMatrix = bandToCsr(band, startCount, windowSize, matrixSize)
     del band
+    if originalMatrixSize is not None:
+        predMatrix = unpadMatrix(predMatrix, originalMatrixSize, pChrom=chrom)
     if targetValueRange is not None:
-        predMatrix = fromUnitRange(predMatrix, *targetValueRange)
+        predMatrix = invertTargetScaling(predMatrix, targetValueRange, pLogTransform=logTransform)
     else:
         predMatrix = scaleArray(predMatrix) * multiplier
-    if not sparse.isspmatrix(predMatrix):
-        predMatrix = sparse.csr_matrix(predMatrix)
-    sparse.save_npz(matrixFile, predMatrix.tocsr())
+    predMatrix = symmetrizeSparseCsr(predMatrix)
+    sparse.save_npz(matrixFile, predMatrix)
     nnz = int(predMatrix.nnz)
     del predMatrix
     return matrixFile, nnz
+
+
+def writeNpzDataset(pMatrixFiles=None, pChromosomeList=None, pOutputDir=None, pMatrixList=None):
+    """Write per-chromosome symmetric CSR .npz files (chr{X}.npz) and chrom_index.csv matching input dataset layout."""
+    matrixFiles = pMatrixFiles if pMatrixFiles is not None else pMatrixList
+    os.makedirs(pOutputDir, exist_ok=True)
+    rows = []
+    offset = 0
+    for matrixFile, chrom in zip(matrixFiles, pChromosomeList):
+        bare = str(chrom).lstrip("chr")
+        mat = sparse.load_npz(matrixFile) if isinstance(matrixFile, str) else matrixFile
+        mat = symmetrizeSparseCsr(mat)
+        outFile = os.path.join(pOutputDir, f"chr{bare}.npz")
+        sparse.save_npz(outFile, mat)
+        n_bins = int(mat.shape[0])
+        nnz = int(mat.nnz)
+        rows.append({"chrom": bare, "n_bins": n_bins, "offset": offset, "nnz": nnz})
+        offset += n_bins
+        log.info("[NPZ-EXPORT] Saved %s: shape=(%d, %d), nnz=%d (symmetric CSR)", outFile, n_bins, n_bins, nnz)
+    indexFile = os.path.join(pOutputDir, "chrom_index.csv")
+    pd.DataFrame(rows, columns=["chrom", "n_bins", "offset", "nnz"]).to_csv(indexFile, index=False)
+    msg = f"[NPZ-EXPORT] Wrote {len(rows)} chromosome .npz files and {indexFile}"
+    log.info(msg)
+    print(msg, flush=True)
+    return indexFile
 
 
 def rebuildProcessCount(pRequested, pWindowSize, pMatrixSizes, pJobCount):
@@ -956,6 +1650,9 @@ def writeCooler(pMatrixList, pBinSizeInt, pOutfile, pChromosomeList, pChromSizeL
     bins["end"] = bins["end"].astype("uint32")
     offsetList = offsetList[:-1] #don't need the last one, no more matrix to follow
 
+    if cooler is None:
+        log.warning("Package 'cooler' is not installed; skipping .cool export (%s). Per-chromosome .npz matrices are already saved.", pOutfile)
+        return
     log.info(f"Writing cooler file to {pOutfile}")
 
     #write out the cooler

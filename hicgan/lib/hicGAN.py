@@ -3,9 +3,7 @@ from tensorflow.keras.layers import Conv2D, Conv1D, BatchNormalization, LeakyReL
 from tensorflow.keras.layers import GroupNormalization
 import numpy as np
 import os
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 from . import utils
 import re
@@ -13,6 +11,103 @@ import re
 #implementation of adapted pix2pix cGAN
 #modified from tensorflow tutorial https://www.tensorflow.org/tutorials/generative/pix
 #also see: https://machinelearningmastery.com/how-to-implement-pix2pix-gan-models-from-scratch-with-keras/
+
+
+import logging
+log = logging.getLogger(__name__)
+
+
+def build_condition_encoder(
+    input_size: int,
+    number_factors: int,
+    use_pair_features: bool = False,
+    enforce_symmetry: bool = False,
+    nr_filters_list=[128, 128, 64, 32],
+    kernel_width_list=[5, 5, 5, 5],
+    apply_dropout: bool = False,
+    name: str = "CNN-embedding",
+):
+    """
+    Modular 1D-to-2D Chromatin Condition Encoder with 2D Genomic Distance Encoding (reusable across cGAN and Diffusion):
+      1. Splits 1D input into row and column chromatin streams (+ genomic coordinate channels in 'grid' mode).
+      2. Encodes row and column 1D spans (length 3*W) with a shared multi-scale dilated Conv1D trunk.
+      3. Extracts the exact center window [W : 2*W] aligned 1-to-1 with the WxW target bins alongside
+         global strided context, and forms a 2D pairwise interaction tensor at every (i, j) pixel:
+           [E_row * E_col, (E_row * E_col) * d_inv, (E_row * E_col) * pair_2d, 0.5*(E_row + E_col), |E_row - E_col|, E_row, E_col, D(i, j)]
+         where D(i, j) encodes the exact genomic distance |(r0 + i) - (c0 + j)| via 4 multi-scale decay maps (+ optional 2D pair_features).
+      4. Refines the 2D representation with Conv2D layers and outputs a (W, W, 16) 2D feature + distance tensor `x_emb`.
+    """
+    inputs = tf.keras.layers.Input(shape=(3 * input_size, number_factors))
+    has_pair_2d = bool(use_pair_features) and (number_factors > input_size)
+    n_1d_total = (number_factors - input_size) if has_pair_2d else number_factors
+    is_grid_mode = (not enforce_symmetry) and (n_1d_total >= 4) and (n_1d_total % 2 == 0)
+    n_chrom_factors = (n_1d_total // 2) - 1 if is_grid_mode else n_1d_total
+
+    f_row, f_col, pos_row, pos_col, pair_mat_2d = SplitChromatinStreamsLayer(
+        window_size=input_size,
+        number_factors=number_factors,
+        is_grid_mode=is_grid_mode,
+        has_pair_2d=has_pair_2d,
+        name="split_chromatin_streams",
+    )(inputs)
+
+    # Shared Siamese 1D multi-scale dilated encoder for 1D chromatin tracks
+    seq_in = tf.keras.layers.Input(shape=(3 * input_size, n_chrom_factors), name="chrom_1d_in")
+    h = seq_in
+    dilation_rates = [1, 2, 4, 8]
+    for i, (nr_filters, kernelWidth, dil) in enumerate(zip(nr_filters_list, kernel_width_list, dilation_rates)):
+        h = Conv1D(
+            filters=nr_filters,
+            kernel_size=kernelWidth,
+            dilation_rate=dil,
+            padding="same",
+            data_format="channels_last",
+            name=f"conv1D_{i + 1}",
+        )(h)
+        n_groups = min(8, max(1, nr_filters // 4))
+        h = GroupNormalization(groups=n_groups, axis=-1, name=f"gn1D_{i + 1}")(h)
+        if apply_dropout:
+            h = Dropout(0.3, name=f"drop1D_{i + 1}")(h)
+        h = LeakyReLU(alpha=0.2, name=f"act1D_{i + 1}")(h)
+
+    h_stride = Conv1D(
+        filters=16,
+        strides=3,
+        kernel_size=5,
+        padding="same",
+        data_format="channels_last",
+        name="conv1D_stride_context",
+    )(h)
+    h_stride = LeakyReLU(alpha=0.2, name="act1D_stride_context")(h_stride)
+    chrom_1d_encoder = tf.keras.Model(inputs=seq_in, outputs=[h, h_stride], name="Chromatin1DEncoder")
+
+    h_row_full, h_row_stride = chrom_1d_encoder(f_row)
+    if is_grid_mode:
+        h_col_full, h_col_stride = chrom_1d_encoder(f_col)
+    else:
+        h_col_full, h_col_stride = h_row_full, h_row_stride
+
+    pair_2d, dist_2d = Pairwise2DEmbeddingLayer(
+        window_size=input_size,
+        is_grid_mode=is_grid_mode,
+        has_pair_2d=has_pair_2d,
+        name="pairwise_2d_embedding",
+    )([f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col, pair_mat_2d])
+
+    initializer = tf.random_normal_initializer(0.0, 0.02)
+    z = Conv2D(64, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_1")(pair_2d)
+    z = GroupNormalization(groups=8, axis=-1, name="emb_gn2d_1")(z)
+    z = LeakyReLU(alpha=0.2, name="emb_act2d_1")(z)
+    n_emb_conv2 = 11 if has_pair_2d else 12
+    z = Conv2D(n_emb_conv2, kernel_size=3, strides=1, padding="same", kernel_initializer=initializer, name="emb_conv2d_2")(z)
+    z = LeakyReLU(alpha=0.2, name="emb_act2d_2")(z)
+
+    x = tf.keras.layers.Concatenate(axis=-1, name="emb_concat_dist")([z, dist_2d])
+    if enforce_symmetry:
+        x = Symmetrize2DLayer(name="emb_symmetrize")(x)
+
+    model = tf.keras.Model(inputs=inputs, outputs=x, name=name)
+    return model
 
 
 class HiCGAN():
@@ -23,6 +118,11 @@ class HiCGAN():
                     loss_weight_discriminator: float = 0.5, #factor for disc loss, like Isola et al. 2017
                     loss_weight_tv: float = 1e-10, #factor for TV loss
                     loss_type_pixel: str = "L1", #type of per-pixel error (L1, L2)
+                    foreground_loss_weight: float = 10.0, #extra weight for non-zero foreground contacts (target > 0)
+                    underpred_boost_factor: float = 1.5, #multiplier for under-predicting active contacts (gen_output < target)
+                    dropout_rate: float = 0.0, #U-Net upsampling dropout rate (default 0.0 for deterministic regression)
+                    decay_steps: int = None, #total optimizer steps for CosineDecay LR schedule
+                    lr_alpha: float = 0.05, #final LR fraction for CosineDecay
                     input_size: int = 256,
                     plot_frequency: int = 20,
                     plot_type: str = "png",
@@ -32,34 +132,79 @@ class HiCGAN():
                     pretrained_model_path: str = "",
                     scope=None,
                     mixed_precision: bool = False,
-                    restore_checkpoint: bool = False):
+                    restore_checkpoint: bool = False,
+                    use_embedding: bool = True,
+                    enforce_symmetry: bool = True,
+                    use_pair_features: bool = False):
         super().__init__()
         # When True, optimizers are wrapped for loss scaling and the loss
         # functions cast their inputs to float32. The global mixed_float16
         # policy itself is set by the caller (training.main) before this model
         # is constructed so that all layers pick it up.
         self.mixed_precision = mixed_precision
+        self.use_embedding = bool(use_embedding)
+        self.enforce_symmetry = bool(enforce_symmetry)
 
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
+        self.EMBEDDING_CHANNELS = 16
         self.input_size = 256
         if input_size in [64,128,256, 512, 768, 1024]:
             self.input_size = input_size
         self.number_factors = number_factors
+        self.use_pair_features = bool(use_pair_features) and (self.number_factors > self.input_size)
         self.loss_weight_pixel = loss_weight_pixel
         self.loss_weight_discriminator = loss_weight_discriminator
         self.loss_weight_adversarial = loss_weight_adversarial
         self.loss_weight_tv = loss_weight_tv
         self.loss_type_pixel = loss_type_pixel
-        self.generator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_generator, beta_1=adam_beta_1, name="Adam_Generator")
-        self.discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_discriminator, beta_1=adam_beta_1, name="Adam_Discriminator")
+        self.foreground_loss_weight = float(foreground_loss_weight)
+        self.underpred_boost_factor = float(underpred_boost_factor)
+        self.dropout_rate = float(dropout_rate)
+        self.decay_steps = int(decay_steps) if (decay_steps is not None and int(decay_steps) > 0) else None
+        self.lr_alpha = float(lr_alpha)
+
+        init_msg = (
+            f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
+            f"use_embedding={self.use_embedding} ({'1D -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
+            f"use_pair_features={self.use_pair_features}, enforce_symmetry={self.enforce_symmetry}, "
+            f"loss_type_pixel={self.loss_type_pixel}, foreground_loss_weight={self.foreground_loss_weight}, "
+            f"underpred_boost_factor={self.underpred_boost_factor}, dropout_rate={self.dropout_rate}, "
+            f"decay_steps={self.decay_steps}, mixed_precision={self.mixed_precision}"
+        )
+        log.info(init_msg)
+        print(init_msg)
+
+        if self.decay_steps is not None:
+            gen_lr = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=float(learning_rate_generator),
+                decay_steps=self.decay_steps,
+                alpha=self.lr_alpha,
+            )
+            disc_lr = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=float(learning_rate_discriminator),
+                decay_steps=self.decay_steps,
+                alpha=self.lr_alpha,
+            )
+        else:
+            gen_lr = float(learning_rate_generator)
+            disc_lr = float(learning_rate_discriminator)
+
+        self.generator_optimizer = tf.keras.optimizers.Adam(learning_rate=gen_lr, beta_1=adam_beta_1, name="Adam_Generator")
+        self.discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=disc_lr, beta_1=adam_beta_1, name="Adam_Discriminator")
         if self.mixed_precision:
             # Dynamic loss scaling to keep float16 gradients from underflowing.
             self.generator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.generator_optimizer)
             self.discriminator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
 
-        self.generator_embedding = self.cnn_embedding()
-        self.discriminator_embedding = self.cnn_embedding()         
+        if self.use_embedding:
+            self.condition_encoder = self.build_condition_encoder()
+            self.generator_embedding = self.condition_encoder
+            self.discriminator_embedding = self.build_condition_encoder()
+        else:
+            self.condition_encoder = None
+            self.generator_embedding = None
+            self.discriminator_embedding = None
         self.generator = self.Generator()
         self.discriminator = self.Discriminator()
 
@@ -102,15 +247,27 @@ class HiCGAN():
 
         #losses per epochs
         self.__gen_train_loss_epochs = []
+        self.__gen_train_pixel_loss_epochs = []
+        self.__gen_train_adv_loss_epochs = []
+        self.__gen_train_tv_loss_epochs = []
         self.__disc_train_loss_true_epochs = []
         self.__disc_train_loss_fake_epochs = []
         self.__gen_val_loss_epochs = []
+        self.__gen_val_pixel_loss_epochs = []
+        self.__gen_val_adv_loss_epochs = []
+        self.__gen_val_tv_loss_epochs = []
         self.__disc_val_loss_epochs = []
         #losses per batch
         self.__gen_train_loss_batches = []
+        self.__gen_train_pixel_loss_batches = []
+        self.__gen_train_adv_loss_batches = []
+        self.__gen_train_tv_loss_batches = []
         self.__disc_train_loss_true_batches = []
         self.__disc_train_loss_fake_batches = []
         self.__gen_val_loss_batches = []
+        self.__gen_val_pixel_loss_batches = []
+        self.__gen_val_adv_loss_batches = []
+        self.__gen_val_tv_loss_batches = []
         self.__disc_val_loss_batches = []
 
         self.__epoch_counter = 0
@@ -118,43 +275,24 @@ class HiCGAN():
 
         self.scope = scope
 
-    def cnn_embedding(self, nr_filters_list=[1024,512,512,256,256,128,128,64], kernel_width_list=[4,4,4,4,4,4,4,4], apply_dropout: bool = False):  
-        inputs = tf.keras.layers.Input(shape=(3*self.input_size, self.number_factors))
-        #add 1D convolutions
-        x = inputs
-        for i, (nr_filters, kernelWidth) in enumerate(zip(nr_filters_list, kernel_width_list)):
-            convParamDict = dict()
-            convParamDict["name"] = "conv1D_" + str(i + 1)
-            convParamDict["filters"] = nr_filters
-            convParamDict["kernel_size"] = kernelWidth
-            convParamDict["data_format"]="channels_last"
-            convParamDict["kernel_regularizer"]=tf.keras.regularizers.l2(0.01)
-            if kernelWidth > 1:
-                convParamDict["padding"] = "same"
-            x = Conv1D(**convParamDict)(x)
-            # x = BatchNormalization()(x)
-            x = GroupNormalization(groups=nr_filters, axis=-1)(x)
-            if apply_dropout:
-                x = Dropout(0.5)(x)
-            x = tf.keras.layers.LeakyReLU(alpha=0.2)(x)
-        #make the shape of a square matrix
-        x = Conv1D(filters=self.input_size, 
-                    strides=3, 
-                    kernel_size=4, 
-                    data_format="channels_last", 
-                    activation="sigmoid", 
-                    padding="same", name="conv1D_final")(x)
-        #ensure the matrix is symmetric, i.e. x = transpose(x)
-        x_T = tf.keras.layers.Permute((2,1))(x) #this is the matrix transpose
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x) #add transpose and divide by 2
-        #reshape the matrix into a 2D grayscale image
-        x = tf.keras.layers.Reshape((self.input_size,self.input_size,self.INPUT_CHANNELS))(x)
-        model = tf.keras.Model(inputs=inputs, outputs=x, name="CNN-embedding")
-        #model.build(input_shape=(3*self.INPUT_SIZE, self.NR_FACTORS))
-        #model.summary()
-        return model
+    def build_condition_encoder(self, nr_filters_list=[128, 128, 64, 32], kernel_width_list=[5, 5, 5, 5], apply_dropout: bool = False):
+        return build_condition_encoder(
+            input_size=self.input_size,
+            number_factors=self.number_factors,
+            use_pair_features=self.use_pair_features,
+            enforce_symmetry=self.enforce_symmetry,
+            nr_filters_list=nr_filters_list,
+            kernel_width_list=kernel_width_list,
+            apply_dropout=apply_dropout,
+            name="CNN-embedding",
+        )
 
+    def cnn_embedding(self, nr_filters_list=[128, 128, 64, 32], kernel_width_list=[5, 5, 5, 5], apply_dropout: bool = False):
+        return self.build_condition_encoder(
+            nr_filters_list=nr_filters_list,
+            kernel_width_list=kernel_width_list,
+            apply_dropout=apply_dropout,
+        )
 
     @staticmethod
     def downsample(filters, size, apply_batchnorm=True):
@@ -163,72 +301,56 @@ class HiCGAN():
         result.add(Conv2D(filters, size, strides=2, padding='same',
                                 kernel_initializer=initializer, use_bias=False))
         if apply_batchnorm:
-            # result.add(BatchNormalization())
-            result.add(GroupNormalization(groups=filters, axis=-1))
+            n_groups = min(32, max(1, filters // 8))
+            result.add(GroupNormalization(groups=n_groups, axis=-1))
         result.add(LeakyReLU(alpha=0.2))
         return result
 
     @staticmethod
-    def upsample(filters, size, apply_dropout=False):
+    def upsample(filters, size, apply_dropout=False, dropout_rate: float = 0.0):
         initializer = tf.random_normal_initializer(0., 0.02)
         result = tf.keras.Sequential()
         result.add(Conv2DTranspose(filters, size, strides=2,
                                             padding='same',
                                             kernel_initializer=initializer,
                                             use_bias=False))
-        # result.add(BatchNormalization())
-        result.add(GroupNormalization(groups=filters, axis=-1))
-        if apply_dropout:
-            result.add(Dropout(0.5))
+        n_groups = min(32, max(1, filters // 8))
+        result.add(GroupNormalization(groups=n_groups, axis=-1))
+        if apply_dropout and dropout_rate > 0.0:
+            result.add(Dropout(float(dropout_rate)))
         result.add(ReLU())
         return result
 
 
     def Generator(self):
-        inputs = tf.keras.layers.Input(shape=[3*self.input_size,self.number_factors], name="factorData")
+        if self.use_embedding:
+            inputs = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name="factorData")
+            x_emb = self.generator_embedding(inputs)
+        else:
+            inputs = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name="factorData")
+            x_emb = inputs
+        x = x_emb
 
-        twoD_conversion = self.generator_embedding
-        #the downsampling part of the network, defined for 256x256 images
+        num_downsamples = int(np.round(np.log2(self.input_size)))
+        down_filters = [min(64 * (2 ** i), 512) for i in range(num_downsamples)]
         down_stack = [
-            HiCGAN.downsample(64, 4, apply_batchnorm=False), # (bs, 128, 128, 64)
-            HiCGAN.downsample(128, 4), # (bs, 64, 64, 128)
-            HiCGAN.downsample(256, 4), # (bs, 32, 32, 256)
-            HiCGAN.downsample(512, 4), # (bs, 16, 16, 512)
-            HiCGAN.downsample(512, 4), # (bs, 8, 8, 512)
-            HiCGAN.downsample(512, 4), # (bs, 4, 4, 512)
-            HiCGAN.downsample(512, 4), # (bs, 2, 2, 512)
-            HiCGAN.downsample(512, 4, apply_batchnorm=False), # (bs, 1, 1, 512)
+            HiCGAN.downsample(
+                f, 4, apply_batchnorm=(i != 0 and i != num_downsamples - 1)
+            )
+            for i, f in enumerate(down_filters)
         ]
-        #if the input images are smaller, leave out some layers accordingly
-        if self.input_size < 256:
-            down_stack = down_stack[:-2] + down_stack[-1:]
-        if self.input_size < 128:
-            down_stack = down_stack[:-2] + down_stack[-1:]
 
-        #the upsampling portion of the generator, designed for 256x256 images
+        up_filters = [min(64 * (2 ** i), 512) for i in reversed(range(num_downsamples - 1))]
         up_stack = [
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 2, 2, 1024)
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 4, 4, 1024)
-            HiCGAN.upsample(512, 4, apply_dropout=True), # (bs, 8, 8, 1024)
-            HiCGAN.upsample(512, 4), # (bs, 16, 16, 1024)
-            HiCGAN.upsample(256, 4), # (bs, 32, 32, 512)
-            HiCGAN.upsample(128, 4), # (bs, 64, 64, 256)
-            HiCGAN.upsample(64, 4), # (bs, 128, 128, 128)
+            HiCGAN.upsample(
+                f, 4,
+                apply_dropout=(i < 3 and self.dropout_rate > 0.0),
+                dropout_rate=self.dropout_rate,
+            )
+            for i, f in enumerate(up_filters)
         ]
-        #for smaller images, take layers away, otherwise downsampling won't work
-        if self.input_size < 256:
-            up_stack = up_stack[:2] + up_stack[3:]
-        if self.input_size < 128:
-            up_stack = up_stack[:2] + up_stack[3:]
 
         initializer = tf.random_normal_initializer(0., 0.02)
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4,
-                                                strides=2,
-                                                padding='same',
-                                                kernel_initializer=initializer) # (bs, 256, 256, 3)
-
-        x = inputs
-        x = twoD_conversion(x)
 
         # Downsampling through the model
         skips = []
@@ -242,12 +364,19 @@ class HiCGAN():
         for up, skip in zip(up_stack, skips):
             x = up(x)
             x = tf.keras.layers.Concatenate()([x, skip])
-        last = tf.keras.layers.Conv2DTranspose(self.OUTPUT_CHANNELS, 4, strides=2, padding='same', kernel_initializer=initializer) 
-        x = last(x)
-        #enforce symmetry
-        x_T = tf.keras.layers.Permute((2,1,3))(x)
-        x = tf.keras.layers.Add()([x, x_T])
-        x = tf.keras.layers.Lambda(lambda z: 0.5*z)(x)
+
+        # Upsample to full (W, W) resolution and fuse with full-resolution pairwise & distance embedding x_emb
+        x = tf.keras.layers.Conv2DTranspose(32, 4, strides=2, padding='same', kernel_initializer=initializer, use_bias=False)(x)
+        x = GroupNormalization(groups=8, axis=-1)(x)
+        x = LeakyReLU(alpha=0.2)(x)
+        x = tf.keras.layers.Concatenate()([x, x_emb])
+        x = Conv2D(32, 3, strides=1, padding='same', kernel_initializer=initializer)(x)
+        x = LeakyReLU(alpha=0.2)(x)
+        x = Conv2D(self.OUTPUT_CHANNELS, 1, strides=1, padding='same', kernel_initializer=initializer)(x)
+
+        #enforce symmetry only in diagonal window mode
+        if self.enforce_symmetry:
+            x = Symmetrize2DLayer(name="gen_symmetrize")(x)
         x = tf.keras.layers.Activation("sigmoid")(x)
 
         return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
@@ -260,58 +389,69 @@ class HiCGAN():
         gen_output = tf.cast(gen_output, tf.float32)
         target = tf.cast(target, tf.float32)
         advers_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_generated_output), logits=disc_generated_output) )
-        # mean squared error or mean absolute error
+        # Per-pixel error (L1 or L2) with Foreground-Weighted + Peak-Proportional + Under-Prediction Penalty
         if self.loss_type_pixel == "L1":
-            pixel_loss = tf.reduce_mean(tf.abs(target - gen_output))
+            per_pixel_err = tf.abs(target - gen_output)
         else: 
-            pixel_loss = tf.reduce_mean(tf.square(target - gen_output))
+            per_pixel_err = tf.square(target - gen_output)
+
+        if self.foreground_loss_weight > 0.0:
+            fg_mask = tf.cast(target > 1e-5, tf.float32)
+            # Active contacts (target > 0) receive (1 + foreground_loss_weight * (1 + 2 * target)) weight
+            # so sparse peaks in P99 log-scaled space are not squashed toward 0.
+            pixel_weights = 1.0 + float(self.foreground_loss_weight) * fg_mask * (
+                1.0 + 2.0 * tf.clip_by_value(target, 0.0, 1.0)
+            )
+            # Penalize under-predicting active contacts (gen_output < target) by underpred_boost_factor
+            underpred_boost = 1.0 + (self.underpred_boost_factor - 1.0) * fg_mask * tf.cast(gen_output < target, tf.float32)
+            pixel_loss = tf.reduce_mean(pixel_weights * underpred_boost * per_pixel_err)
+        else:
+            pixel_loss = tf.reduce_mean(per_pixel_err)
+
         tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
         total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
-        return total_gen_loss, advers_loss, pixel_loss
+        return total_gen_loss, advers_loss, pixel_loss, tv_loss
 
 
     def Discriminator(self):
         initializer = tf.random_normal_initializer(0., 0.02)
 
-        inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
+        def _maybe_symmetrize(tensor):
+            if not self.enforce_symmetry:
+                return tensor
+            return Symmetrize2DLayer()(tensor)
+
+        if self.use_embedding:
+            inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
+            d = self.discriminator_embedding(inp)
+        else:
+            inp = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name='input_image')
+            d = inp
+
         tar = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.OUTPUT_CHANNELS], name='target_image')
-        embedding = self.discriminator_embedding
         #Patch-GAN (Isola et al.)
-        d = embedding(inp)
         d = tf.keras.layers.Concatenate()([d, tar])
         if self.input_size > 64:
             #downsample and symmetrize 1 
             d = HiCGAN.downsample(64, 4, False)(d) # (bs, inp.size/2, inp.size/2, 64)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
             #downsample and symmetrize 2
             d = HiCGAN.downsample(128, 4)(d)# (bs, inp.size/4, inp.size/4, 128)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
         else:    
             #downsample and symmetrize 3
             d = HiCGAN.downsample(256, 4)(d)
-            d_T = tf.keras.layers.Permute((2,1,3))(d)
-            d = tf.keras.layers.Add()([d, d_T])
-            d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+            d = _maybe_symmetrize(d)
         #downsample and symmetrize 4
         d = HiCGAN.downsample(256, 4)(d) # (bs, inp.size/8, inp.size/8, 256)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         d = Conv2D(512, 4, strides=1, padding="same", kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 512)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         # d = BatchNormalization()(d)
         d = LeakyReLU(alpha=0.2)(d)
         d = Conv2D(1, 4, strides=1, padding="same",
                         kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 1)
-        d_T = tf.keras.layers.Permute((2,1,3))(d)
-        d = tf.keras.layers.Add()([d, d_T])
-        d = tf.keras.layers.Lambda(lambda z: 0.5*z)(d)
+        d = _maybe_symmetrize(d)
         #d = tf.keras.layers.Activation("sigmoid")(d) #sigmoid will be done in the loss function itself
         return tf.keras.Model(inputs=[inp, tar], outputs=d, name="Discriminator")
 
@@ -327,7 +467,7 @@ class HiCGAN():
     def distributed_train_step(self, input_data):
         input_image, target = input_data[0]["factorData"], input_data[1]["out_matrixData"]
         per_replica_losses = self.scope.run(self.train_step, args=(input_image, target, ))
-        return self.scope.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+        return self.scope.reduce(tf.distribute.ReduceOp.MEAN, per_replica_losses, axis=None)
     
     @tf.function
     def train_step(self, input_image, target):
@@ -337,7 +477,7 @@ class HiCGAN():
             disc_real_output = self.discriminator([input_image, target], training=True)
             disc_generated_output = self.discriminator([input_image, gen_output], training=True)
 
-            gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
+            gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
             disc_loss, disc_real_loss, disc_gen_loss = self.discriminator_loss(disc_real_output, disc_generated_output)
 
             if self.mixed_precision:
@@ -360,45 +500,49 @@ class HiCGAN():
                                                 self.generator.trainable_variables))
         self.discriminator_optimizer.apply_gradients(zip(discriminator_gradients,
                                                     self.discriminator.trainable_variables))
-        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss
+        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
 
     @tf.function
     def validationStep(self, input_image, target):
-        gen_output = self.generator(input_image, training=True)
+        gen_output = self.generator(input_image, training=False)
 
-        disc_real_output = self.discriminator([input_image, target], training=True)
-        disc_generated_output = self.discriminator([input_image, gen_output], training=True)
+        disc_real_output = self.discriminator([input_image, target], training=False)
+        disc_generated_output = self.discriminator([input_image, gen_output], training=False)
 
-        gen_total_loss, _, _ = self.generator_loss(disc_generated_output, gen_output, target)
+        gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
         disc_loss, _, _ = self.discriminator_loss(disc_real_output, disc_generated_output)
-        return gen_total_loss, disc_loss
+        return gen_total_loss, disc_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
 
     def generate_images(self, model, test_input, tar, epoch: int):
-        prediction = model(test_input, training=True)
-        pred_mse = tf.reduce_mean(tf.square( tar["out_matrixData"][0], prediction[0] ))
+        inp_tensor = test_input["factorData"] if isinstance(test_input, dict) else test_input
+        prediction = model(inp_tensor, training=False)
+        tar_img = tf.cast(tar["out_matrixData"][0], tf.float32)
+        pred_img = tf.cast(prediction[0], tf.float32)
+        pred_mse = float(tf.reduce_mean(tf.square(tar_img - pred_img)))
         figname = "testpred_epoch_{:05d}.png".format(epoch)
         figname = os.path.join(self.log_dir, figname)
-        display_list = [test_input["factorData"][0], tar["out_matrixData"][0], prediction[0]]
-        titleList = ['Input Image', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
+        inp_sample = np.asarray(inp_tensor[0])
+        if inp_sample.ndim == 3 and inp_sample.shape[-1] == 1:
+            inp_sample = inp_sample[:, :, 0]
+        display_list = [inp_sample, np.squeeze(np.asarray(tar_img)), np.squeeze(np.asarray(pred_img))]
+        titleList = ['Input Feature / 2D Random', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
 
         fig1, axs1 = plt.subplots(1,len(display_list), figsize=(15,15))
         for i in range(len(display_list)):
-            axs1[i].imshow(display_list[i] * 0.5 + 0.5)
+            axs1[i].imshow(display_list[i] * 0.5 + 0.5, aspect='auto')
             axs1[i].set_title(titleList[i])
         fig1.savefig(figname)
         plt.close(fig1)
         del fig1, axs1
 
     def fit(self, train_ds, epochs, test_ds, steps_per_epoch: int,
-            validation_steps: int = 0):
+            validation_steps: int = 0, early_stopping_patience: int = 10):
         """validation_steps > 0 evaluates only that many validation batches.
 
-        Validation runs the WHOLE validation set every epoch and, unlike the
-        training step, is not distributed across replicas -- so its cost is
-        fixed while the training half gets faster with every GPU added. On the
-        chr21 pilot it was ~145 s against 94 s of actual training on two GPUs;
-        on eight it would dominate the epoch completely. A few hundred windows
-        track the loss curve just as well.
+        Monitors deterministic validation pixel reconstruction loss (`val_pixel_loss`)
+        for EarlyStopping (`patience=early_stopping_patience`, `min_delta=1e-6`),
+        saves `generator_best.keras` whenever `val_pixel_loss` improves, and
+        restores the best generator weights at the end of training (`generator_final.keras`).
         """
         distributed_dataset = self.scope.experimental_distribute_dataset(train_ds)
         
@@ -408,7 +552,40 @@ class HiCGAN():
             print(f"Checkpoint epoch {self.start_epoch} is greater than or equal to total epochs {epochs}. Starting from scratch.")
             exit(1)
 
+        best_val_pixel_loss = float("inf")
+        best_epoch = -1
+        patience_counter = 0
+        best_weights = None
+        last_epoch = self.start_epoch
+
+        def _save_loss_files(ep_idx):
+            disc_train_tot_epochs = [
+                float(self.loss_weight_discriminator * (f + t))
+                for f, t in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)
+            ]
+            np.savez(
+                os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(ep_idx)),
+                genLossTrain=self.__gen_train_loss_batches,
+                genLossVal=self.__gen_val_loss_batches,
+                discLossTrain_True=self.__disc_train_loss_true_batches,
+                discLossTrain_Fake=self.__disc_train_loss_fake_batches,
+                discLossVal=self.__disc_val_loss_batches,
+                genLossTrainEpochs=self.__gen_train_loss_epochs,
+                genPixelLossTrainEpochs=self.__gen_train_pixel_loss_epochs,
+                genAdvLossTrainEpochs=self.__gen_train_adv_loss_epochs,
+                genTvLossTrainEpochs=self.__gen_train_tv_loss_epochs,
+                discLossTrainEpochs=disc_train_tot_epochs,
+                discLossTrainTrueEpochs=self.__disc_train_loss_true_epochs,
+                discLossTrainFakeEpochs=self.__disc_train_loss_fake_epochs,
+                genLossValEpochs=self.__gen_val_loss_epochs,
+                genPixelLossValEpochs=self.__gen_val_pixel_loss_epochs,
+                genAdvLossValEpochs=self.__gen_val_adv_loss_epochs,
+                genTvLossValEpochs=self.__gen_val_tv_loss_epochs,
+                discLossValEpochs=self.__disc_val_loss_epochs,
+            )
+
         for epoch in range(self.start_epoch, epochs):
+            last_epoch = epoch
             #generate sample output
             if epoch % self.example_plot_frequency == 0:
                 for example_input, example_target in test_ds.take(1):
@@ -422,11 +599,14 @@ class HiCGAN():
             for distributed_input in distributed_dataset:
                
                 train_samples_in_epoch += 1
-                gen_loss, _, disc_loss_real, disc_loss_fake = self.distributed_train_step(distributed_input)
+                gen_loss, _, disc_loss_real, disc_loss_fake, gen_pixel, gen_adv, gen_tv = self.distributed_train_step(distributed_input)
 
-                self.__disc_train_loss_true_batches.append(disc_loss_real)
-                self.__disc_train_loss_fake_batches.append(disc_loss_fake)
-                self.__gen_train_loss_batches.append(gen_loss)
+                self.__disc_train_loss_true_batches.append(float(disc_loss_real))
+                self.__disc_train_loss_fake_batches.append(float(disc_loss_fake))
+                self.__gen_train_loss_batches.append(float(gen_loss))
+                self.__gen_train_pixel_loss_batches.append(float(gen_pixel))
+                self.__gen_train_adv_loss_batches.append(float(gen_adv))
+                self.__gen_train_tv_loss_batches.append(float(gen_tv))
                 train_bar_postfixDict= {"g": "{:.4f}".format(self.__gen_train_loss_batches[-1]),
                                          "dt": "{:.3f}".format(self.__disc_train_loss_true_batches[-1]),
                                          "df": "{:.3f}".format(self.__disc_train_loss_fake_batches[-1])}
@@ -436,27 +616,67 @@ class HiCGAN():
                 train_pbar.update(1)
                 self.__batch_counter += 1
             train_pbar.close()
-            self.__gen_train_loss_epochs.append(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_true_epochs.append(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:]))
-            self.__disc_train_loss_fake_epochs.append(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:]))
+            self.__gen_train_loss_epochs.append(float(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_pixel_loss_epochs.append(float(np.mean(self.__gen_train_pixel_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_adv_loss_epochs.append(float(np.mean(self.__gen_train_adv_loss_batches[-train_samples_in_epoch:])))
+            self.__gen_train_tv_loss_epochs.append(float(np.mean(self.__gen_train_tv_loss_batches[-train_samples_in_epoch:])))
+            self.__disc_train_loss_true_epochs.append(float(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:])))
+            self.__disc_train_loss_fake_epochs.append(float(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:])))
 
-            # Validation
+            # Validation (deterministic, training=False)
             validation_samples_in_epoch = 0
             vds = test_ds.take(validation_steps) if validation_steps else test_ds
             for input_image, target in vds:
-                gen_loss_val, disc_loss_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
-                self.__gen_val_loss_batches.append(gen_loss_val)
-                self.__disc_val_loss_batches.append(disc_loss_val)
+                gen_loss_val, disc_loss_val, gen_pixel_val, gen_adv_val, gen_tv_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
+                self.__gen_val_loss_batches.append(float(gen_loss_val))
+                self.__gen_val_pixel_loss_batches.append(float(gen_pixel_val))
+                self.__gen_val_adv_loss_batches.append(float(gen_adv_val))
+                self.__gen_val_tv_loss_batches.append(float(gen_tv_val))
+                self.__disc_val_loss_batches.append(float(disc_loss_val))
                 validation_samples_in_epoch += 1
-            self.__disc_val_loss_epochs.append(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:]))
-            self.__gen_val_loss_epochs.append(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:]))
+            self.__disc_val_loss_epochs.append(float(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_loss_epochs.append(float(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_pixel_loss_epochs.append(float(np.mean(self.__gen_val_pixel_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_adv_loss_epochs.append(float(np.mean(self.__gen_val_adv_loss_batches[-validation_samples_in_epoch:])))
+            self.__gen_val_tv_loss_epochs.append(float(np.mean(self.__gen_val_tv_loss_batches[-validation_samples_in_epoch:])))
+
+            val_pixel_ep = self.__gen_val_pixel_loss_epochs[-1]
+            disc_train_total_ep = float(self.loss_weight_discriminator * (self.__disc_train_loss_true_epochs[-1] + self.__disc_train_loss_fake_epochs[-1]))
+            log.info(
+                "[EPOCH-LOSS] epoch=%d/%d | train_gen_total=%.6f, train_pixel=%.6f, train_adv=%.6f, train_tv=%.6f, train_disc_total=%.6f, train_disc_true=%.6f, train_disc_fake=%.6f | "
+                "val_gen_total=%.6f, val_pixel=%.6f, val_adv=%.6f, val_tv=%.6f, val_disc_total=%.6f",
+                epoch + 1, epochs,
+                self.__gen_train_loss_epochs[-1], self.__gen_train_pixel_loss_epochs[-1], self.__gen_train_adv_loss_epochs[-1], self.__gen_train_tv_loss_epochs[-1],
+                disc_train_total_ep, self.__disc_train_loss_true_epochs[-1], self.__disc_train_loss_fake_epochs[-1],
+                self.__gen_val_loss_epochs[-1], val_pixel_ep, self.__gen_val_adv_loss_epochs[-1], self.__gen_val_tv_loss_epochs[-1],
+                self.__disc_val_loss_epochs[-1]
+            )
 
             #count the epoch
             self.__epoch_counter += 1
 
-            # saving the model every 20 epochs
+            # EarlyStopping & best checkpoint tracking on deterministic val_pixel_loss
+            if val_pixel_ep < best_val_pixel_loss - 1e-6:
+                best_val_pixel_loss = val_pixel_ep
+                best_epoch = epoch + 1
+                patience_counter = 0
+                best_weights = self.generator.get_weights()
+                best_path = os.path.join(self.log_dir, "generator_best.keras")
+                self.generator.save(filepath=best_path, save_format="keras")
+                msg_best = f"[CHECKPOINT] Epoch {epoch + 1}: val_pixel_loss improved to {best_val_pixel_loss:.6f} -> saved {best_path}"
+                log.info(msg_best)
+                print(msg_best)
+            else:
+                patience_counter += 1
+                msg_pat = (
+                    f"[EARLY-STOPPING] Epoch {epoch + 1}: val_pixel_loss={val_pixel_ep:.6f} did not improve over "
+                    f"best={best_val_pixel_loss:.6f} (epoch {best_epoch}); patience={patience_counter}/{early_stopping_patience}"
+                )
+                log.info(msg_pat)
+                print(msg_pat)
+
+            # saving the model every plot_frequency epochs
             if (epoch + 1) % self.progress_plot_frequency == 0:
-                #plot loss
                 utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
                               pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
                                                     self.__disc_train_loss_true_epochs, 
@@ -466,17 +686,27 @@ class HiCGAN():
                               pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
                               pFilename=self.progress_plot_name,
                               useLogscaleList=[True, False])
-                np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
-                                    genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
+                _save_loss_files(epoch)
                 self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
                 self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
 
-
             self.checkpoint.save(file_prefix = self.checkpoint_prefix)
+
+            if early_stopping_patience is not None and early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+                stop_msg = (
+                    f"[EARLY-STOPPING] Stopping early at epoch {epoch + 1}/{epochs} "
+                    f"(no improvement in val_pixel_loss for {patience_counter} epochs; best={best_val_pixel_loss:.6f} at epoch {best_epoch})."
+                )
+                log.info(stop_msg)
+                print(stop_msg)
+                break
+
+        if best_weights is not None:
+            self.generator.set_weights(best_weights)
+            restore_msg = f"[MODEL-RESTORE] Restored best generator weights from epoch {best_epoch} (val_pixel_loss={best_val_pixel_loss:.6f})."
+            log.info(restore_msg)
+            print(restore_msg)
+
         utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
                               pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
                                                     self.__disc_train_loss_true_epochs, 
@@ -486,14 +716,10 @@ class HiCGAN():
                               pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
                               pFilename=self.progress_plot_name,
                               useLogscaleList=[True, False])
-        np.savez(os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(epoch)), 
-                                    genLossTrain=self.__gen_train_loss_batches, 
-                                    genLossVal=self.__gen_val_loss_batches, 
-                                    discLossTrain_True=self.__disc_train_loss_true_batches,
-                                    discLossTrain_Fake=self.__disc_train_loss_fake_batches, 
-                                    discLossVal=self.__disc_val_loss_batches)
-        self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
-        self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
+        _save_loss_files(last_epoch)
+        self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(last_epoch)), save_format="keras")
+        self.generator.save(filepath=os.path.join(self.log_dir, "generator_final.keras"), save_format="keras")
+        self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(last_epoch)), save_format="keras")
 
     def plotModels(self, pOutputPath: str, pFigureFileFormat: str):
         generatorPlotName = "generatorModel.{:s}".format(pFigureFileFormat)
@@ -508,10 +734,16 @@ class HiCGAN():
         #binary. Without them keras raises ImportError, which used to abort the
         #whole training run before a single step -- losing the job over a
         #picture. Warn and carry on instead.
-        for model, name in ((self.generator, generatorPlotName),
-                            (self.discriminator, discriminatorPlotName),
-                            (self.generator_embedding, generatorEmbeddingPlotName),
-                            (self.discriminator_embedding, discriminatorEmbeddingPlotName)):
+        modelsToPlot = [
+            (self.generator, generatorPlotName),
+            (self.discriminator, discriminatorPlotName),
+        ]
+        if self.use_embedding and self.generator_embedding is not None and self.discriminator_embedding is not None:
+            modelsToPlot.extend([
+                (self.generator_embedding, generatorEmbeddingPlotName),
+                (self.discriminator_embedding, discriminatorEmbeddingPlotName),
+            ])
+        for model, name in modelsToPlot:
             try:
                 tf.keras.utils.plot_model(model, show_shapes=True, to_file=name)
             except (ImportError, OSError) as ex:
@@ -791,6 +1023,9 @@ class HiCGAN():
             # 1. Define custom layers
             custom_layers = {
                 "CustomReshapeLayer": CustomReshapeLayer,
+                "SplitChromatinStreamsLayer": SplitChromatinStreamsLayer,
+                "Pairwise2DEmbeddingLayer": Pairwise2DEmbeddingLayer,
+                "Symmetrize2DLayer": Symmetrize2DLayer,
             }
             
             # 2. Add GroupNormalization
@@ -833,7 +1068,153 @@ class HiCGAN():
         except Exception as e:
             msg = f"Failed to load generator.\nDetail: {str(e)}"
             raise ValueError(msg)
-        
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class Symmetrize2DLayer(tf.keras.layers.Layer):
+    """Symmetrize a 4D (batch, H, W, C) tensor along its spatial axes: 0.5 * (X + X^T)."""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def call(self, inputs):
+        x_T = tf.transpose(inputs, perm=[0, 2, 1, 3])
+        return 0.5 * (inputs + x_T)
+
+    def get_config(self):
+        return super().get_config()
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class SplitChromatinStreamsLayer(tf.keras.layers.Layer):
+    """
+    Split 1D (+ optional packed 2D pair_features) factorData of shape (batch, 3*W, number_factors) into:
+      - f_row:       (batch, 3*W, n_chrom)
+      - f_col:       (batch, 3*W, n_chrom)
+      - pos_row:     (batch, 3*W, 1)
+      - pos_col:     (batch, 3*W, 1)
+      - pair_mat_2d: (batch, W, W, 1)
+    """
+    def __init__(self, window_size: int, number_factors: int, is_grid_mode: bool = False, has_pair_2d: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.window_size = int(window_size)
+        self.number_factors = int(number_factors)
+        self.is_grid_mode = bool(is_grid_mode)
+        self.has_pair_2d = bool(has_pair_2d)
+
+    def call(self, inputs):
+        x = inputs
+        if x.shape.rank == 4:
+            x = tf.squeeze(x, axis=-1)
+        W = self.window_size
+        if self.has_pair_2d and self.number_factors > W:
+            c_1d = self.number_factors - W
+            x_1d = x[:, :, :c_1d]
+            pair_mat_2d = tf.expand_dims(x[:, W : 2 * W, c_1d:], axis=-1)
+        else:
+            c_1d = self.number_factors
+            x_1d = x
+            z_base = x[:, W : 2 * W, :1] * 0.0
+            pair_mat_2d = tf.expand_dims(z_base, axis=2) + tf.expand_dims(z_base, axis=1)
+
+        if self.is_grid_mode and c_1d >= 4 and (c_1d % 2 == 0):
+            half_ch = c_1d // 2
+            n_chrom = half_ch - 1
+            f_row = x_1d[:, :, :n_chrom]
+            pos_row = x_1d[:, :, n_chrom:half_ch]
+            f_col = x_1d[:, :, half_ch : half_ch + n_chrom]
+            pos_col = x_1d[:, :, half_ch + n_chrom : 2 * half_ch]
+        else:
+            f_row = x_1d
+            f_col = x_1d
+            pos_row = tf.zeros_like(x_1d[:, :, :1])
+            pos_col = tf.zeros_like(x_1d[:, :, :1])
+        return f_row, f_col, pos_row, pos_col, pair_mat_2d
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "window_size": self.window_size,
+            "number_factors": self.number_factors,
+            "is_grid_mode": self.is_grid_mode,
+            "has_pair_2d": self.has_pair_2d,
+        })
+        return cfg
+
+
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
+    """
+    Construct a 2D (batch, W, W, C_pair) pairwise chromatin + genomic distance (+ optional 2D pair_features) representation.
+    """
+    def __init__(self, window_size: int, is_grid_mode: bool = False, has_pair_2d: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        self.window_size = int(window_size)
+        self.is_grid_mode = bool(is_grid_mode)
+        self.has_pair_2d = bool(has_pair_2d)
+        idx = np.arange(self.window_size, dtype=np.float32)
+        diag_dist_bins = np.abs(idx[:, None] - idx[None, :])[None, :, :, None]
+        self._diag_dist_bins = tf.constant(diag_dist_bins, dtype=tf.float32)
+
+    def call(self, inputs):
+        f_row, f_col, h_row_full, h_col_full, h_row_stride, h_col_stride, pos_row, pos_col, pair_mat_2d = inputs
+        W = self.window_size
+        compute_dtype = h_row_full.dtype
+
+        f_row_c = tf.cast(f_row[:, W : 2 * W, :], compute_dtype)
+        f_col_c = tf.cast(f_col[:, W : 2 * W, :], compute_dtype)
+        h_row_c = h_row_full[:, W : 2 * W, :]
+        h_col_c = h_col_full[:, W : 2 * W, :]
+
+        e_row = tf.concat([h_row_c, h_row_stride, f_row_c], axis=-1)
+        e_col = tf.concat([h_col_c, h_col_stride, f_col_c], axis=-1)
+
+        E_row = tf.tile(tf.expand_dims(e_row, axis=2), [1, 1, W, 1])
+        E_col = tf.tile(tf.expand_dims(e_col, axis=1), [1, W, 1, 1])
+
+        if self.is_grid_mode:
+            p_row = tf.cast(pos_row[:, W : 2 * W, 0], tf.float32)
+            p_col = tf.cast(pos_col[:, W : 2 * W, 0], tf.float32)
+            dist_norm = tf.abs(tf.expand_dims(p_col, axis=1) - tf.expand_dims(p_row, axis=2))
+            dist_norm = tf.expand_dims(dist_norm, axis=-1)
+            dist_bins = dist_norm * float(W)
+        else:
+            batch_sz = tf.shape(f_row)[0]
+            dist_bins = tf.tile(self._diag_dist_bins, [batch_sz, 1, 1, 1])
+            dist_norm = dist_bins / float(W)
+
+        d_inv1 = 1.0 / (1.0 + dist_bins / 2.0)
+        d_inv2 = 1.0 / (1.0 + dist_bins / 8.0)
+        d_exp = tf.exp(-dist_norm)
+        d_diag = tf.exp(-tf.square(dist_bins / 1.5))
+
+        dist_only = tf.cast(tf.concat([d_inv1, d_inv2, d_exp, d_diag], axis=-1), compute_dtype)
+        d_gate = tf.cast(d_inv2, compute_dtype)
+
+        E_prod = E_row * E_col
+        E_prod_gated = E_prod * d_gate
+        E_sum = 0.5 * (E_row + E_col)
+        E_diff = tf.abs(E_row - E_col)
+
+        if self.has_pair_2d:
+            pair_2d_feat = tf.cast(pair_mat_2d, compute_dtype)
+            E_prod_kmer = E_prod * pair_2d_feat
+            dist_2d = tf.concat([dist_only, pair_2d_feat], axis=-1)
+            pair_2d = tf.concat([E_prod, E_prod_gated, E_prod_kmer, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
+        else:
+            dist_2d = dist_only
+            pair_2d = tf.concat([E_prod, E_prod_gated, E_sum, E_diff, E_row, E_col, dist_2d], axis=-1)
+        return pair_2d, dist_2d
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "window_size": self.window_size,
+            "is_grid_mode": self.is_grid_mode,
+            "has_pair_2d": self.has_pair_2d,
+        })
+        return cfg
+
+
 class CustomReshapeLayer(tf.keras.layers.Layer):
     '''
     reshape a 1D tensor such that it represents 

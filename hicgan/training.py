@@ -5,13 +5,20 @@ import tensorflow as tf
 import concurrent.futures
 import argparse
 from datetime import datetime
-import cooler
-import h5py
+try:
+    import cooler
+except ImportError:
+    cooler = None
+try:
+    import h5py
+except ImportError:
+    h5py = None
 
 from .lib import hicGAN
 from .lib import dataContainer
 from .lib import records
 from .lib import utils
+from .lib import featurePack
 
 from hicgan._version import __version__
 
@@ -22,33 +29,101 @@ log = logging.getLogger(__name__)
 
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trainingMatrices", "-tm", required=True,
-                        type=str, nargs='+',
-                        help="mcooler matrices for training.")
-    parser.add_argument("--trainingChromosomes", "-tchroms", required=True,
-                        type=str, nargs='+',
+    parser.add_argument("--dataDir", "-d", required=False,
+                        default=None, type=str,
+                        help="Directory containing per-chromosome .npz target matrices (e.g. hicgan/data/rna_gt). "
+                             "Used when --trainingMatrices / --validationMatrices are omitted.")
+    parser.add_argument("--splitFile", "-sf", required=False,
+                        default=None, type=str,
+                        help="Path to splits.txt defining train/val/test chromosomes (e.g. hicgan/data/splits.txt). "
+                             "Used when --trainingChromosomes / --validationChromosomes are omitted.")
+    parser.add_argument("--trainingMatrices", "-tm", required=False,
+                        default=None, type=str, nargs='+',
+                        help="Target matrices for training (.cool files, .npz files, or folders of per-chromosome .npz files).")
+    parser.add_argument("--trainingChromosomes", "-tchroms", required=False,
+                        default=None, type=str, nargs='+',
                         help="Train chromosomes. Must be present in all train matrices.")
-    parser.add_argument("--trainingChromatinFolders", "-tcp", required=True,
-                        type=str, nargs='+',
-                        help="Path where chromatin factors for training reside (bigwig files).")
-    parser.add_argument("--validationMatrices", "-vm", required=True,
-                        type=str, nargs='+',
-                        help="Cooler matrices for validation.")
-    parser.add_argument("--validationChromosomes", "-vchroms", required=True,
-                        type=str, nargs='+',
+    parser.add_argument("--trainingChromatinFolders", "-tcp", required=False,
+                        default=None, type=str, nargs='+',
+                        help="Path where chromatin factors for training reside (feature_pack or bigwig files). Optional in 'random2d' inputMode.")
+    parser.add_argument("--validationMatrices", "-vm", required=False,
+                        default=None, type=str, nargs='+',
+                        help="Target matrices for validation (.cool files, .npz files, or folders of per-chromosome .npz files).")
+    parser.add_argument("--validationChromosomes", "-vchroms", required=False,
+                        default=None, type=str, nargs='+',
                         help="Validation chromosomes. Must be present in all validation matrices.")
-    parser.add_argument("--validationChromatinFolders", "-vcp", required=True,
-                        type=str, nargs='+',
-                        help="Path where chromatin factors for validation reside (bigwig files).")
-    parser.add_argument("--windowSize", "-ws", required=True,
-                        type=int, choices=[64, 128, 256, 512, 768, 1024],
-                        help="window size for submatrices.")
+    parser.add_argument("--validationChromatinFolders", "-vcp", required=False,
+                        default=None, type=str, nargs='+',
+                        help="Path where chromatin factors for validation reside (feature_pack or bigwig files). Optional in 'random2d' inputMode.")
+    parser.add_argument("--inputMode", "-im", required=False,
+                        type=str, choices=["bigwig", "feature_pack", "random2d"], default=None,
+                        help="Input feature mode: 'bigwig' (1D chromatin BigWig tracks + cnn_embedding), "
+                             "'feature_pack' (bin_features.xlsx + optional 2D pair_features.xlsx from feature_paketi), or "
+                             "'random2d' (direct 2D symmetric random matrix input, bypassing cnn_embedding). "
+                             "Auto-detected from -tcp when omitted.")
+    parser.add_argument("--featureSet", "-fset", required=False,
+                        type=str, default="representative",
+                        help="Feature subset preset or comma-separated sheet/column names when --inputMode is 'feature_pack': "
+                             "'representative' (default, 24 non-redundant cols + 3 indicators), 'direct', 'tier1_2', "
+                             "'gm12878', 'hela', or 'all' (all 80 cols + 3 indicators).")
+    parser.add_argument("--usePairFeatures", "-upf", dest="usePairFeatures",
+                        action="store_true", default=True,
+                        help="Include 2D kmer7_revcomp_cosine from pair_features.xlsx when --inputMode is 'feature_pack' (default: True).")
+    parser.add_argument("--noPairFeatures", "-npf", dest="usePairFeatures",
+                        action="store_false",
+                        help="Disable 2D pair_features.xlsx channel when --inputMode is 'feature_pack' (1D bin_features only).")
+    parser.add_argument("--windowMode", "-wm", required=False,
+                        type=str, choices=["diagonal", "grid"], default="grid",
+                        help="Windowing mode: 'diagonal' (sliding windows along main diagonal [i:i+W, i:i+W]) or "
+                             "'grid' (default, 2D grid over upper triangle [i:i+W, j:j+W] with i <= j to cover off-diagonal contacts).")
+    parser.add_argument("--gridStride", "-gs", required=False,
+                        type=int, default=16,
+                        help="Stride in bins for 'grid' windowMode (default: 16).")
+    parser.add_argument("--binSize", "-b", required=False,
+                        type=int, default=250000,
+                        help="Bin size in bp when loading .npz matrices that do not store bin size internally (default: 250000).")
+    parser.add_argument("--targetNorm", "-tn", required=False,
+                        type=str, choices=["p99_log10", "minmax_log1p", "unit_range", "none"],
+                        default="p99_log10",
+                        help="Target matrix normalization scheme: 'p99_log10' (default, global P99 clipped ln(1+10x) computed on training chromosomes only), "
+                             "'minmax_log1p' (min-max of log1p(x)), 'unit_range' (min-max of raw x), or 'none'.")
+    parser.add_argument("--logTransformTarget", "-ltt", required=False,
+                        action="store_true", default=False,
+                        help="Apply log1p(x) transform to target matrices before [0, 1] scaling (inverted via expm1 in hicPredict).")
+    parser.add_argument("--flankPadChromosomes", "-fpc", required=False,
+                        type=str, nargs='+', default=["all"],
+                        help="Chromosome names (e.g. 21 22 or 'all') to pad with +flankingSize zero bins at both start and end "
+                             "so that target windows cover the entire [0..n_bins) chromosome range (default: 'all').")
+    parser.add_argument("--flankPadMaxBins", "-fpmb", required=False,
+                        type=int, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome with "
+                             "n_bins < flankPadMaxBins (e.g. 250).")
+    parser.add_argument("--flankPadMinRatio", "-fpmr", required=False,
+                        type=float, default=None,
+                        help="Automatically apply start/end flank padding (+flankingSize at both ends) to any chromosome whose "
+                             "unpadded predictable bin ratio (n_bins - 2*flankingSize)/n_bins is below this threshold "
+                             "(accepts [0, 1] fraction like 0.5 or percentage like 50).")
+    parser.add_argument("--noFilterEmptyWindows", "-nfew", dest="filterEmptyWindows",
+                        action="store_false", default=True,
+                        help="Disable the 2D Integral Image (SAT) active window filter that removes empty off-diagonal windows during training.")
+    parser.add_argument("--windowSize", "-ws", required=False,
+                        type=int, default=64, choices=[64, 128, 256, 512, 768, 1024],
+                        help="window size for submatrices (default: 64).")
     parser.add_argument("--outputFolder", "-o", required=True,
                         type=str,
                         help="Folder where trained model and diverse outputs will be stored.")
-    parser.add_argument("--epochs", "-ep", required=True,
-                        type=int, default=10,
-                        help="Number of epochs for training.")
+    parser.add_argument("--epochs", "-ep", required=False,
+                        type=int, default=50,
+                        help="Number of epochs for training (default: 50).")
+    parser.add_argument("--earlyStoppingPatience", "--earlyStop", "-es", dest="earlyStoppingPatience",
+                        required=False, type=int, default=10,
+                        help="EarlyStopping patience on deterministic validation pixel reconstruction loss (default: 10; set 0 to disable).")
+    parser.add_argument("--dropout", "-drop", required=False,
+                        type=float, default=0.0,
+                        help="U-Net upsampling dropout rate in Generator (default: 0.0 for deterministic regression).")
+    parser.add_argument("--underpredBoost", "-upb", required=False,
+                        type=float, default=1.5,
+                        help="Under-prediction penalty multiplier for active foreground contacts where gen_output < target (default: 1.5).")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
                         help="Batch size for training.")
@@ -64,6 +139,11 @@ def parse_arguments(args=None):
                         type=str, choices=["L1", "L2"],
                         default="L1",
                         help="Type of per-pixel loss to use for the generator.")
+    parser.add_argument("--foregroundLossWeight", "-flw", required=False,
+                        type=float,
+                        default=10.0,
+                        help="Extra loss multiplier for non-zero foreground contacts (target > 0) in pixel loss "
+                             "to prevent sparse matrices from collapsing predictions into [0, 1]. Set 0 for unweighted L1/L2.")
     parser.add_argument("--lossWeightTV", "-lwt", required=False,
                         type=float,
                         default=1e-10,
@@ -188,7 +268,7 @@ def parse_arguments(args=None):
                         help="If set, attempt to resume training by loading the latest checkpoint from the output folder.")
     parser.add_argument("--mixedPrecision", "-mp", required=False, action='store_true',
                         help="Enable mixed-precision (float16) training. Faster and uses less GPU memory on modern GPUs; does not change system RAM usage.")
-    parser.add_argument("--seed", "-sd", required=False,
+    parser.add_argument("--seed", "-sd", "-seed", required=False,
                         type=int, default=None,
                         help="Seed for Python, NumPy and TensorFlow random number "
                              "generators. Set it to make a run repeatable, or to "
@@ -203,11 +283,23 @@ def parse_arguments(args=None):
                            version='%(prog)s {}'.format(__version__))
 
     return parser
-def create_container(chrom, matrix, chromatinpath):
-        container = dataContainer.DataContainer(chromosome=chrom,
-                                                matrixFilePath=matrix,
-                                                chromatinFolder=chromatinpath)
-        return container
+
+def create_container(chrom, matrix, chromatinpath, binSize=None, inputMode="bigwig", randomSeed=42,
+                     flankPadChromosomes="all", flankPadMaxBins=None, flankPadMinRatio=None,
+                     featureSet="representative", usePairFeatures=True, filterEmptyWindows=True):
+    container = dataContainer.DataContainer(chromosome=chrom,
+                                            matrixFilePath=matrix,
+                                            chromatinFolder=chromatinpath,
+                                            binSize=binSize,
+                                            inputMode=inputMode,
+                                            randomSeed=randomSeed,
+                                            flankPadChromosomes=flankPadChromosomes,
+                                            flankPadMaxBins=flankPadMaxBins,
+                                            flankPadMinRatio=flankPadMinRatio,
+                                            featureSet=featureSet,
+                                            usePairFeatures=usePairFeatures,
+                                            filterEmptyWindows=filterEmptyWindows)
+    return container
 
 def create_data(pTrainingMatrices, 
                 pTrainingChromosomes, 
@@ -226,84 +318,181 @@ def create_data(pTrainingMatrices,
                 pThreads=4,
                 pMinTargetCoverage=0.0,
                 pExcludeRegions=None,
-                pScaleTargetToUnitRange=False):
+                pScaleTargetToUnitRange=False,
+                pInputMode="feature_pack",
+                pWindowMode="grid",
+                pGridStride=16,
+                pBinSize=250000,
+                pRandomSeed=42,
+                pLogTransformTarget=False,
+                pTargetNorm="p99_log10",
+                pFlankPadChromosomes="all",
+                pFlankPadMaxBins=None,
+                pFlankPadMinRatio=None,
+                pFeatureSet="representative",
+                pUsePairFeatures=True,
+                pFilterEmptyWindows=True):
     os.makedirs(pOutputFolder, exist_ok=True)
-    #few constants
-    # windowSize = int(windowSize)
     debugstate = None
     paramDict = locals().copy()
 
-    #remove spaces, commas and "chr" from the train and val chromosome lists
-    #ensure each chrom name is used only once, but allow the same chrom for train and validation
-    #sort the lists and write to param dict
-    # trainChromNameList = trainingChromosomes.replace(",","")
-    # trainChromNameList = trainChromNameList.rstrip().split(" ")  
-    trainChromNameList = [x.lstrip("chr") for x in pTrainingChromosomes]
-    trainChromNameList = sorted(list(set(trainChromNameList)))
+    trainChromRaw = [str(x).lstrip("chr") for x in pTrainingChromosomes]
+    trainChromNameList = list(dict.fromkeys(trainChromRaw))
     paramDict["trainChromNameList"] = trainChromNameList
-    # valChromNameList = validationChromosomes.replace(",","")
-    # valChromNameList = valChromNameList.rstrip().split(" ")
-    valChromNameList = [x.lstrip("chr") for x in pValidationChromosomes]
-    valChromNameList = sorted(list(set(valChromNameList)))
+
+    valChromRaw = [str(x).lstrip("chr") for x in pValidationChromosomes]
+    valChromNameList = list(dict.fromkeys(valChromRaw))
     paramDict["valChromNameList"] = valChromNameList
 
-    #ensure there are as many matrices as chromatin paths
-    if len(pTrainingMatrices) != len(ptrainingChromatinFolders):
-        msg = "Number of train matrices and chromatin paths must match\n"
-        msg += "Current numbers: Matrices: {:d}; Chromatin Paths: {:d}"
-        msg = msg.format(len(pTrainingMatrices), len(ptrainingChromatinFolders))
-        raise SystemExit(msg)
-    if len(pValidationMatrices) != len(pvalidationChromatinFolders):
-        msg = "Number of validation matrices and chromatin paths must match\n"
-        msg += "Current numbers: Matrices: {:d}; Chromatin Paths: {:d}"
-        msg = msg.format(len(pValidationMatrices), len(pvalidationChromatinFolders))
-        raise SystemExit(msg)
+    if pInputMode == "random2d":
+        if not ptrainingChromatinFolders:
+            ptrainingChromatinFolders = [None] * len(pTrainingMatrices)
+        if not pvalidationChromatinFolders:
+            pvalidationChromatinFolders = [None] * len(pValidationMatrices)
+    else:
+        if not ptrainingChromatinFolders or not pvalidationChromatinFolders:
+            raise SystemExit(f"Aborting. --trainingChromatinFolders (-tcp) and --validationChromatinFolders (-vcp) are required when --inputMode is '{pInputMode}'.")
+        if len(ptrainingChromatinFolders) == 1 and len(pTrainingMatrices) > 1:
+            ptrainingChromatinFolders = list(ptrainingChromatinFolders) * len(pTrainingMatrices)
+        if len(pvalidationChromatinFolders) == 1 and len(pValidationMatrices) > 1:
+            pvalidationChromatinFolders = list(pvalidationChromatinFolders) * len(pValidationMatrices)
+        if len(pTrainingMatrices) != len(ptrainingChromatinFolders):
+            msg = "Number of train matrices and chromatin paths must match\n"
+            msg += "Current numbers: Matrices: {:d}; Chromatin Paths: {:d}"
+            msg = msg.format(len(pTrainingMatrices), len(ptrainingChromatinFolders))
+            raise SystemExit(msg)
+        if len(pValidationMatrices) != len(pvalidationChromatinFolders):
+            msg = "Number of validation matrices and chromatin paths must match\n"
+            msg += "Current numbers: Matrices: {:d}; Chromatin Paths: {:d}"
+            msg = msg.format(len(pValidationMatrices), len(pvalidationChromatinFolders))
+            raise SystemExit(msg)
 
-    #prepare the training data containers. No data is loaded yet.
+    log.info(
+        "[CREATE-DATA] Preparing containers: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
+        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, filterEmptyWindows=%s, trainChroms=%s, valChroms=%s",
+        pInputMode, pWindowMode, str(pGridStride), pWindowSize, pFeatureSet, str(pUsePairFeatures),
+        str(pTargetNorm), str(pFilterEmptyWindows), trainChromNameList, valChromNameList
+    )
+    print(
+        f"[CREATE-DATA] Preparing containers: inputMode={pInputMode}, windowMode={pWindowMode}, "
+        f"gridStride={pGridStride}, windowSize={pWindowSize}, featureSet={pFeatureSet}, usePairFeatures={pUsePairFeatures}, "
+        f"targetNorm={pTargetNorm}, filterEmptyWindows={pFilterEmptyWindows}, "
+        f"trainChroms={trainChromNameList}, valChroms={valChromNameList}",
+        flush=True
+    )
+
     traindataContainerList = []
-
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    if len(pTrainingMatrices) == len(trainChromRaw) and len(pTrainingMatrices) > 1 and all(str(m).endswith(".npz") for m in pTrainingMatrices):
+        for chrom, matrix, chromatinpath in zip(trainChromRaw, pTrainingMatrices, ptrainingChromatinFolders):
+            traindataContainerList.append(
+                create_container(
+                    chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                    featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures, filterEmptyWindows=pFilterEmptyWindows
+                )
+            )
+    else:
         for chrom in trainChromNameList:
             for matrix, chromatinpath in zip(pTrainingMatrices, ptrainingChromatinFolders):
-                future = executor.submit(create_container, chrom, matrix, chromatinpath)
-                traindataContainerList.append(future.result())
+                traindataContainerList.append(
+                    create_container(
+                        chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                        flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                        featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures, filterEmptyWindows=pFilterEmptyWindows
+                    )
+                )
 
-    #prepare the validation data containers. No data is loaded yet.
     valdataContainerList = []
-
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    if len(pValidationMatrices) == len(valChromRaw) and len(pValidationMatrices) > 1 and all(str(m).endswith(".npz") for m in pValidationMatrices):
+        for chrom, matrix, chromatinpath in zip(valChromRaw, pValidationMatrices, pvalidationChromatinFolders):
+            valdataContainerList.append(
+                create_container(
+                    chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                    flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                    featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures, filterEmptyWindows=pFilterEmptyWindows
+                )
+            )
+    else:
         for chrom in valChromNameList:
             for matrix, chromatinpath in zip(pValidationMatrices, pvalidationChromatinFolders):
-                future = executor.submit(create_container, chrom, matrix, chromatinpath)
-                valdataContainerList.append(future.result())
+                valdataContainerList.append(
+                    create_container(
+                        chrom, matrix, chromatinpath, binSize=pBinSize, inputMode=pInputMode, randomSeed=pRandomSeed,
+                        flankPadChromosomes=pFlankPadChromosomes, flankPadMaxBins=pFlankPadMaxBins, flankPadMinRatio=pFlankPadMinRatio,
+                        featureSet=pFeatureSet, usePairFeatures=pUsePairFeatures, filterEmptyWindows=pFilterEmptyWindows
+                    )
+                )
 
-    #Measure the target value range ONCE, over every training matrix and
-    #chromosome, and reuse it everywhere. Per-chromosome ranges would map the
-    #same physical value to a different target on each chromosome.
+    # Measure the target value range ONCE, strictly over training chromosomes,
+    # and reuse it everywhere (no validation/test data leakage).
+    hasNpzSource = any(utils.isNpzMatrixSource(m) for m in pTrainingMatrices)
+    rangePath = os.path.join(pOutputFolder, "target_value_range.json")
     targetValueRange = None
-    if pScaleTargetToUnitRange:
-        targetValueRange = utils.observedValueRange(pTrainingMatrices, trainChromNameList)
-        rangePath = os.path.join(pOutputFolder, "target_value_range.json")
-        utils.saveValueRange(rangePath, *targetValueRange)
-        print("target value range measured from the training targets: "
-              "[{:.4f}, {:.4f}] -> mapped to [0, 1]".format(*targetValueRange))
-        print("  written to {:s}; hicPredict needs it to invert the mapping".format(rangePath))
-        paramDict["targetValueRange"] = targetValueRange
+    useGlobalTargetRange = False
 
+    if pTargetNorm == "p99_log10" and not pScaleTargetToUnitRange and not pLogTransformTarget:
+        useGlobalTargetRange = True
+        p99Cfg = utils.computeGlobalP99TargetRange(
+            pTrainingMatrices,
+            trainChromNameList,
+            scale_factor=10.0,
+            clip_percentile=99.0,
+            pSavePath=rangePath,
+        )
+        targetValueRange = p99Cfg
+        msg = (
+            "[TARGET-SCALE] Global P99 ln(1 + 10*x) target scaling measured on training chromosomes only: "
+            "hi={:.6f}, scale_factor={:.1f} -> mapped to [0, 1] (saved to {:s})"
+        ).format(float(p99Cfg["hi"]), float(p99Cfg["scale_factor"]), rangePath)
+        log.info(msg)
+        print(msg, flush=True)
+        paramDict["targetValueRange"] = targetValueRange
+    else:
+        effLogTransform = bool(pLogTransformTarget or (pTargetNorm == "minmax_log1p"))
+        useGlobalTargetRange = bool(
+            pScaleTargetToUnitRange
+            or effLogTransform
+            or (pTargetNorm in ("minmax_log1p", "unit_range"))
+            or (hasNpzSource and noScaleNorm and pTargetNorm != "none")
+        )
+        if useGlobalTargetRange:
+            lo, hi = utils.observedValueRange(
+                pTrainingMatrices,
+                trainChromNameList,
+                pLogTransform=effLogTransform
+            )
+            targetValueRange = (lo, hi, effLogTransform)
+            utils.saveValueRange(rangePath, lo, hi, pLogTransform=effLogTransform)
+            msg = (
+                "[TARGET-SCALE] Global target value range measured from training targets "
+                "(log1p={:s}): [{:.4f}, {:.4f}] -> mapped to [0, 1] (saved to {:s})"
+            ).format(str(effLogTransform), lo, hi, rangePath)
+            log.info(msg)
+            print(msg, flush=True)
+            paramDict["targetValueRange"] = targetValueRange
+
+    flankingSize = 0 if pInputMode == "random2d" else pWindowSize
     #define the load params for the containers
-    loadParams = {"scaleFeatures": True,
-                "clampFeatures": False,
-                #The two target scalings are alternatives, not a stack. The old
-                #one calls utils.scaleArray on the sparse matrix, which raises
-                #on any signed target; the new one supersedes it and works on
-                #the dense window instead. Asking for both would crash.
-                "scaleTargets": False if pScaleTargetToUnitRange else noScaleNorm,
-                "windowSize": pWindowSize,
-                "flankingSize": pWindowSize,
-                "maximumDistance": None,
-                "minTargetCoverage": pMinTargetCoverage,
-                "excludedRegions": pExcludeRegions,
-                "targetValueRange": targetValueRange}
+    loadParams = {
+        "scaleFeatures": True,
+        "clampFeatures": False,
+        "scaleTargets": False if useGlobalTargetRange else noScaleNorm,
+        "windowSize": pWindowSize,
+        "flankingSize": flankingSize,
+        "maximumDistance": None,
+        "minTargetCoverage": pMinTargetCoverage,
+        "excludedRegions": pExcludeRegions,
+        "targetValueRange": targetValueRange,
+        "windowMode": pWindowMode,
+        "gridStride": pGridStride,
+        "logTransformTarget": pLogTransformTarget,
+        "flankPadChromosomes": pFlankPadChromosomes,
+        "flankPadMaxBins": pFlankPadMaxBins,
+        "flankPadMinRatio": pFlankPadMinRatio,
+        "featureSet": pFeatureSet,
+        "usePairFeatures": pUsePairFeatures,
+        "filterEmptyWindows": pFilterEmptyWindows,
+    }
     if pExcludeRegions:
         missing = [f for f in pExcludeRegions if not os.path.isfile(f)]
         if missing:
@@ -319,6 +508,8 @@ def create_data(pTrainingMatrices,
     nr_samples_list = []
     usedTrainContainerList = []
     for container in traindataContainerList + valdataContainerList:
+        role = "TRAIN" if container in traindataContainerList else "VAL"
+        log.info("[CREATE-DATA] Loading %s container for chr%s...", role, str(container.chromosome))
         container.loadData(**loadParams)
         if not referenceContainer.checkCompatibility(container):
             msg = "Aborting. Incompatible data"
@@ -329,11 +520,19 @@ def create_data(pTrainingMatrices,
             #gap in the target matrix. Drop it instead of writing an empty record.
             msg = "Skipping chromosome {:s}: no sample left after skipping gaps in the target"
             print(msg.format(str(container.chromosome)))
+            log.warning(msg.format(str(container.chromosome)))
             continue
-        tfRecordFilenames.append(container.writeTFRecord(pOutputFolder=pOutputFolder,
-                                                        pRecordSize=pRecordSize,
-                                                        pSaveMemory=pSaveMemory,
-                                                        pThreads=pThreads))
+        writtenRecords = container.writeTFRecord(
+            pOutputFolder=pOutputFolder,
+            pRecordSize=pRecordSize,
+            pSaveMemory=pSaveMemory,
+            pThreads=pThreads
+        )
+        tfRecordFilenames.append(writtenRecords)
+        log.info(
+            "[CREATE-DATA] Wrote %d TFRecord file(s) (%d samples) for %s chr%s",
+            len(writtenRecords), nr_samples, role, str(container.chromosome)
+        )
         if debugstate is not None:
             if isinstance(debugstate, int):
                 idx = debugstate
@@ -346,6 +545,7 @@ def create_data(pTrainingMatrices,
         nr_samples_list.append(nr_samples)
         if container in traindataContainerList:
             usedTrainContainerList.append(container)
+    log.info("[CREATE-DATA] All TFRecords created successfully (%d container groups).", len(tfRecordFilenames))
     print('ALL TF RECORDS CREATED!')
     if len(usedTrainContainerList) == 0:
         msg = "Exiting. No training sample left after skipping gaps in the target matrix"
@@ -394,32 +594,35 @@ def training(pTfRecordFilenames,
              pResume=False,
              pMixedPrecision=False,
              pValidationSteps=0,
-             pTargetValueRange=None
+             pTargetValueRange=None,
+             pInputMode="feature_pack",
+             pWindowMode="grid",
+             pLogTransformTarget=False,
+             pForegroundLossWeight=10.0,
+             pUnderpredBoost=1.5,
+             pDropout=0.0,
+             pEarlyStoppingPatience=10,
+             pUsePairFeatures=True
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
         valdataRecords = [item for sublist in pTfRecordFilenames[pLengthTrainDataContainerList:] for item in sublist]
 
-        
-        # paramDict["binSize"] = pBinSize
-        #because of compatibility checks above, 
-        #the following properties are the same with all containers,
-        #so just use data from first container
-        # nr_factors = container0.nr_factors
-        # paramDict["nr_factors"] = nr_factors
-        # for i in range(nr_factors):
-        #     paramDict["chromFactor_" + str(i)] = container0.factorNames[i]
         nr_trainingSamples = sum(pNumberSamplesList[0:pLengthTrainDataContainerList])
-        # storedFeaturesDict = container0.storedFeatures
-
-        #save the training parameters to a file before starting to train
-        #(allows recovering the parameters even if training is aborted
-        # and only intermediate models are available)
-        # parameterFile = os.path.join(pOutputFolder, "trainParams.csv")    
-        # with open(parameterFile, "w") as csvfile:
-        #     dictWriter = csv.DictWriter(csvfile, fieldnames=sorted(list(paramDict.keys())))
-        #     dictWriter.writeheader()
-        #     dictWriter.writerow(paramDict)
+        nr_valSamples = sum(pNumberSamplesList[pLengthTrainDataContainerList:])
+        log.info(
+            "[TRAINING-SETUP] Training samples=%d across %d TFRecords; Validation samples=%d across %d TFRecords; "
+            "inputMode=%s, windowMode=%s, windowSize=%d, batchSize=%d, epochs=%d",
+            nr_trainingSamples, len(traindataRecords), nr_valSamples, len(valdataRecords),
+            pInputMode, pWindowMode, pWindowSize, pBatchSize, pEpochs
+        )
+        print(
+            f"[TRAINING-SETUP] Training samples={nr_trainingSamples} ({len(traindataRecords)} TFRecords), "
+            f"Validation samples={nr_valSamples} ({len(valdataRecords)} TFRecords), "
+            f"inputMode={pInputMode}, windowMode={pWindowMode}, windowSize={pWindowSize}, "
+            f"batchSize={pBatchSize}, epochs={pEpochs}",
+            flush=True
+        )
 
         #build the input streams for training
         shuffleBufferSize = 3*pRecordSize
@@ -435,7 +638,10 @@ def training(pTfRecordFilenames,
         #them usable without rewriting hundreds of GB.
         def _toUnitRange(x, y):
             lo, hi = float(pTargetValueRange[0]), float(pTargetValueRange[1])
-            t = tf.clip_by_value((y["out_matrixData"] - lo) / (hi - lo), 0.0, 1.0)
+            raw_t = y["out_matrixData"]
+            if pLogTransformTarget:
+                raw_t = tf.math.log1p(tf.maximum(raw_t, 0.0))
+            t = tf.clip_by_value((raw_t - lo) / (hi - lo), 0.0, 1.0)
             out = dict(y); out["out_matrixData"] = t
             return x, out
 
@@ -445,7 +651,10 @@ def training(pTfRecordFilenames,
             trainDs = trainDs.map(_toUnitRange,
                                   num_parallel_calls=tf.data.experimental.AUTOTUNE)
         if pFlipSamples:
-            flippedDs = trainDs.map(lambda a,b: records.mirror_function(a["factorData"], b["out_matrixData"]))
+            is_2d_inp = (pInputMode == "random2d")
+            is_grid_m = (pWindowMode == "grid")
+            has_pair = bool(pUsePairFeatures) and (pInputMode == "feature_pack")
+            flippedDs = trainDs.map(lambda a,b: records.mirror_function(a["factorData"], b["out_matrixData"], is_2d_input=is_2d_inp, is_grid_mode=is_grid_m, has_pair_2d=has_pair))
             trainDs = trainDs.concatenate(flippedDs)
         trainDs = trainDs.shuffle(buffer_size=shuffleBufferSize, reshuffle_each_iteration=True)
         trainDs = trainDs.batch(pBatchSize, drop_remainder=True)
@@ -461,16 +670,28 @@ def training(pTfRecordFilenames,
         validationDs = validationDs.batch(pBatchSize)
         validationDs = validationDs.prefetch(tf.data.experimental.AUTOTUNE)
         
-        steps_per_epoch = int( np.floor(nr_trainingSamples / pBatchSize) )
+        steps_per_epoch = max(1, int(np.floor(nr_trainingSamples / pBatchSize)))
         if pFlipSamples:
             steps_per_epoch *= 2
+        decay_steps = max(1, int(pEpochs) * int(steps_per_epoch))
+
+        use_embedding = (pInputMode in ("bigwig", "feature_pack"))
+        enforce_symmetry = (pWindowMode == "diagonal")
+        if use_embedding and isinstance(pStoredFeaturesDict, dict) and "factorData" in pStoredFeaturesDict:
+            stored_shape = pStoredFeaturesDict["factorData"].get("shape")
+            if stored_shape is not None and len(stored_shape) >= 2:
+                pNumberOfFactors = int(stored_shape[1])
 
         hicGanModel = hicGAN.HiCGAN(log_dir=pOutputFolder, 
                                         number_factors=pNumberOfFactors,
                                         loss_weight_pixel=pLossWeightPixel,
                                         loss_weight_adversarial=pLossWeightAdversarial,
                                         loss_weight_discriminator=pLossWeightDiscriminator, 
-                                        loss_type_pixel=pLossTypePixel, 
+                                        loss_type_pixel=pLossTypePixel,
+                                        foreground_loss_weight=pForegroundLossWeight,
+                                        underpred_boost_factor=pUnderpredBoost,
+                                        dropout_rate=pDropout,
+                                        decay_steps=decay_steps,
                                         loss_weight_tv=pLossWeightTV, 
                                         input_size=pWindowSize,
                                         learning_rate_generator=pLearningRateGenerator,
@@ -480,14 +701,18 @@ def training(pTfRecordFilenames,
                                         plot_frequency=pPlotFrequency,
                                         scope=pScope,
                                         mixed_precision=pMixedPrecision,
-                                        restore_checkpoint=pResume)
+                                        restore_checkpoint=pResume,
+                                        use_embedding=use_embedding,
+                                        enforce_symmetry=enforce_symmetry,
+                                        use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
         
         hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
         log.info("Starting training at %s" % datetime.now())
         hicGanModel.fit(train_ds=trainDs, epochs=pEpochs, test_ds=validationDs,
                         steps_per_epoch=steps_per_epoch,
-                        validation_steps=pValidationSteps)
+                        validation_steps=pValidationSteps,
+                        early_stopping_patience=pEarlyStoppingPatience)
         log.info("Training finished at %s" % datetime.now())
 
 
@@ -496,12 +721,81 @@ def delete_model_files(pTFRecordFiles):
     print(pTFRecordFiles)
     for tfRecordfile in pTFRecordFiles:
         for file in tfRecordfile:
-        # print(tfRecordfile)
             if os.path.exists(file):
                 os.remove(file)
 
 def main(args=None):
     args = parse_arguments().parse_args(args)
+    os.makedirs(args.outputFolder, exist_ok=True)
+    utils.configureLogging(os.path.join(args.outputFolder, "training.log"))
+
+    # Resolve splitFile for trainingChromosomes and validationChromosomes when omitted
+    if args.trainingChromosomes is None or args.validationChromosomes is None:
+        split_candidates = [args.splitFile] if args.splitFile else ["hicgan/data/splits.txt", "data/splits.txt"]
+        resolved_split = next((p for p in split_candidates if p and os.path.exists(p)), None)
+        if resolved_split is None:
+            raise SystemExit(
+                "Aborting. Provide --trainingChromosomes (-tchroms) and --validationChromosomes (-vchroms), "
+                "or provide --splitFile (-sf) pointing to splits.txt."
+            )
+        splits_map = utils.parseSplitFile(resolved_split)
+        if args.trainingChromosomes is None:
+            args.trainingChromosomes = splits_map["train"]
+        if args.validationChromosomes is None:
+            args.validationChromosomes = splits_map["val"]
+        log.info("[MAIN] Loaded chromosome splits from %s: train=%s, val=%s", resolved_split, args.trainingChromosomes, args.validationChromosomes)
+
+    # Resolve dataDir for trainingMatrices and validationMatrices when omitted
+    if args.trainingMatrices is None or args.validationMatrices is None:
+        data_candidates = [args.dataDir] if args.dataDir else [
+            "hicgan/data/rna_gt",
+            "data/chrom_npz_homo_sapiens_GRCh38_250kb_tss_count",
+        ]
+        resolved_data = next((p for p in data_candidates if p and os.path.exists(p)), None)
+        if resolved_data is None:
+            raise SystemExit(
+                "Aborting. Provide --trainingMatrices (-tm) and --validationMatrices (-vm), "
+                "or provide --dataDir (-d) pointing to the target .npz directory."
+            )
+        if args.trainingMatrices is None:
+            args.trainingMatrices = [resolved_data]
+        if args.validationMatrices is None:
+            args.validationMatrices = [resolved_data]
+
+    # Auto-resolve feature_pack directory when chromatin folders are omitted and inputMode is not random2d
+    if args.inputMode != "random2d" and (not args.trainingChromatinFolders or not args.validationChromatinFolders):
+        fp_candidates = ["data/feature_paketi_20261029", "data/feature_pack"]
+        resolved_fp = next((p for p in fp_candidates if os.path.exists(p) and featurePack.is_feature_pack_source(p)), None)
+        if resolved_fp is not None:
+            if not args.trainingChromatinFolders:
+                args.trainingChromatinFolders = [resolved_fp] * len(args.trainingMatrices)
+            if not args.validationChromatinFolders:
+                args.validationChromatinFolders = [resolved_fp] * len(args.validationMatrices)
+
+    inputMode = args.inputMode
+    if inputMode is None:
+        if not args.trainingChromatinFolders:
+            inputMode = "random2d"
+        elif any(featurePack.is_feature_pack_source(p) for p in args.trainingChromatinFolders):
+            inputMode = "feature_pack"
+        else:
+            inputMode = "bigwig"
+    elif inputMode == "bigwig" and args.trainingChromatinFolders and any(featurePack.is_feature_pack_source(p) for p in args.trainingChromatinFolders):
+        inputMode = "feature_pack"
+    windowMode = args.windowMode
+    featureSet = args.featureSet
+    usePairFeatures = bool(args.usePairFeatures) and (inputMode == "feature_pack")
+    randomSeed = args.seed if args.seed is not None else 42
+
+    log.info(
+        "[MAIN] Starting hicTraining: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
+        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, dropout=%s, underpredBoost=%s, "
+        "earlyStoppingPatience=%s, binSize=%d, logTransformTarget=%s, seed=%s",
+        inputMode, windowMode, str(args.gridStride), args.windowSize,
+        featureSet, str(usePairFeatures), str(args.targetNorm), str(args.dropout),
+        str(args.underpredBoost), str(args.earlyStoppingPatience),
+        args.binSize, str(args.logTransformTarget), str(args.seed)
+    )
 
     #seed every generator that can affect a run: weight initialisation, the
     #shuffle buffer and dropout all draw from these
@@ -525,11 +819,13 @@ def main(args=None):
         if args.targetValueRange.lower() == "auto":
             resolvedTargetRange = utils.observedValueRange(
                 args.trainingMatrices,
-                [c.lstrip("chr") for c in args.trainingChromosomes])
+                [c.lstrip("chr") for c in args.trainingChromosomes],
+                pLogTransform=args.logTransformTarget)
             os.makedirs(args.outputFolder, exist_ok=True)
             utils.saveValueRange(
                 os.path.join(args.outputFolder, "target_value_range.json"),
-                *resolvedTargetRange)
+                *resolvedTargetRange,
+                pLogTransform=args.logTransformTarget)
         elif os.path.exists(args.targetValueRange):
             resolvedTargetRange = utils.loadValueRange(args.targetValueRange)
         else:
@@ -551,79 +847,48 @@ def main(args=None):
 
     for matrix in args.trainingMatrices + args.validationMatrices:
         if not os.path.exists(matrix):
-            msg = "Exiting. Matrix file not found: {:s}".format(matrix)
+            msg = "Exiting. Matrix file or folder not found: {:s}".format(matrix)
             print(msg)
+            log.error(msg)
             return
-        if not matrix.endswith(".cool"):
-            msg = "Exiting. Only .cool matrices are supported: {:s}".format(matrix)
+        if not (matrix.endswith(".cool") or utils.isNpzMatrixSource(matrix)):
+            msg = "Exiting. Only .cool files, .npz files, or directories of .npz files are supported: {:s}".format(matrix)
             print(msg)
+            log.error(msg)
             return
-    
-    # gpu = tf.config.list_physical_devices('GPU')
-    # # if gpu:
-    # #     try:
-    # #         for gpu_device in gpu:
-    # #             tf.config.experimental.set_memory_growth(gpu_device, True)
-    # #     except Exception as e:
-    # #         print("Error: {}".format(e))
-    
-    # if args.multiGPUTraining:
-    #     strategy = tf.distribute.MirroredStrategy()
-    # else:
-    #     log.info("Using single GPU training")
-    #     log.info("Available GPUs: {}".format(gpu))
-    #     log.info("Using GPU: {}".format(args.whichGPU-1))
 
-    #     log.info("Using GPU: {}".format(gpu[args.whichGPU-1].name))
-    #     if args.whichGPU:
-    #         if args.whichGPU-1 >= len(gpu):
-    #             raise ValueError("Invalid GPU index: {}".format(args.whichGPU - 1))
-    #         # strategy = tf.distribute.OneDeviceStrategy(device=gpu[args.whichGPU].name)
-    #         strategy = tf.distribute.OneDeviceStrategy(device=f"/GPU:{args.whichGPU-1}")
     if (args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
         physical_gpus = tf.config.list_physical_devices('GPU')
 
         try:
-            if args.multiGPUTraining:
+            if not physical_gpus:
+                log.info("No physical GPUs detected. Falling back to CPU strategy (/CPU:0).")
+                print("[DEVICE] No physical GPUs detected. Running on /CPU:0.", flush=True)
+                strategy = tf.distribute.OneDeviceStrategy(device="/CPU:0")
+            elif args.multiGPUTraining:
                 # --- MULTI GPU SETUP ---
-                # Ensure all physical GPUs are visible
                 tf.config.set_visible_devices(physical_gpus, 'GPU')
-                
-                # Enable memory growth for all
                 for gpu_device in physical_gpus:
                     tf.config.experimental.set_memory_growth(gpu_device, True)
-                    
                 strategy = tf.distribute.MirroredStrategy()
                 log.info(f"Using MirroredStrategy on {len(physical_gpus)} GPUs")
-
             else:
                 # --- SINGLE GPU SETUP ---
                 log.info("Using single GPU training")
-                
-                # Validation
                 target_index = args.whichGPU - 1
                 if target_index < 0 or target_index >= len(physical_gpus):
                     raise ValueError(f"Invalid GPU index: {target_index}. Available: {len(physical_gpus)}")
 
-                # 1. HIDE other GPUs. Only make the selected structure visible to TF.
                 tf.config.set_visible_devices(physical_gpus[target_index], 'GPU')
-                
-                # 2. Set memory growth only on the visible device
                 tf.config.experimental.set_memory_growth(physical_gpus[target_index], True)
-
                 log.info("Physically selected GPU: {}".format(physical_gpus[target_index].name))
-
-                # 3. Define Strategy
-                # Note: Because we hid the other GPUs, TF sees this as the ONLY device.
-                # It is therefore logically indexed as "/GPU:0" regardless of physical ID.
                 strategy = tf.distribute.OneDeviceStrategy(device="/GPU:0")
 
         except Exception as e:
             print("Error during GPU setup: {}".format(e))
             raise e
 
-        if args.mixedPrecision:
-            # Set before any model layers are constructed so they adopt float16.
+        if args.mixedPrecision and physical_gpus:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
             log.info("Mixed precision enabled: global policy = %s", tf.keras.mixed_precision.global_policy().name)
     # Only force the CPU strategy for a *pure* create-data run. In "all" mode
@@ -636,37 +901,69 @@ def main(args=None):
     with strategy.scope() as scope: 
 
         if (not args.trainOnly and args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
-            tfRecordFilenames, traindataContainerListLength, nr_samples_list, storedFeatures, nr_factors = create_data(args.trainingMatrices, 
-                        args.trainingChromosomes, 
-                        args.trainingChromatinFolders, 
-                        args.validationMatrices, 
-                        args.validationChromosomes, 
-                        args.validationChromatinFolders,
-                        args.windowSize,
-                        args.outputFolder,
-                        args.batchSize,
-                        args.flipSamples,
-                        args.figureFileFormat,
-                        args.recordSize,
-                        args.noScaleNorm,
-                        args.saveMemory,
-                        args.threads,
-                        pMinTargetCoverage=args.minTargetCoverage,
-                        pExcludeRegions=args.excludeRegions,
-                        pScaleTargetToUnitRange=args.scaleTargetToUnitRange)
-            if args.createDataOnly:
-                meta = {
-                    "tfRecordFilenames": tfRecordFilenames,
-                    "traindataContainerListLength": traindataContainerListLength,
-                    "nr_samples_list": nr_samples_list,
-                    "storedFeatures": storedFeatures,
-                    "nr_factors": nr_factors,
-                    "created_at": datetime.utcnow().isoformat()
-                }
-                outfile = os.path.join(args.outputFolder, "hicgan_metadata.pkl")
-                with open(outfile, "wb") as f:
-                    pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
-                print(f"Saved metadata to {outfile}")
+            tfRecordFilenames, traindataContainerListLength, nr_samples_list, storedFeatures, nr_factors = create_data(
+                args.trainingMatrices, 
+                args.trainingChromosomes, 
+                args.trainingChromatinFolders, 
+                args.validationMatrices, 
+                args.validationChromosomes, 
+                args.validationChromatinFolders,
+                args.windowSize,
+                args.outputFolder,
+                args.batchSize,
+                args.flipSamples,
+                args.figureFileFormat,
+                args.recordSize,
+                args.noScaleNorm,
+                args.saveMemory,
+                args.threads,
+                pMinTargetCoverage=args.minTargetCoverage,
+                pExcludeRegions=args.excludeRegions,
+                pScaleTargetToUnitRange=args.scaleTargetToUnitRange,
+                pInputMode=inputMode,
+                pWindowMode=windowMode,
+                pGridStride=args.gridStride,
+                pBinSize=args.binSize,
+                pRandomSeed=randomSeed,
+                pLogTransformTarget=args.logTransformTarget,
+                pTargetNorm=args.targetNorm,
+                pFlankPadChromosomes=args.flankPadChromosomes,
+                pFlankPadMaxBins=args.flankPadMaxBins,
+                pFlankPadMinRatio=args.flankPadMinRatio,
+                pFeatureSet=featureSet,
+                pUsePairFeatures=usePairFeatures,
+                pFilterEmptyWindows=args.filterEmptyWindows
+            )
+            meta = {
+                "tfRecordFilenames": tfRecordFilenames,
+                "traindataContainerListLength": traindataContainerListLength,
+                "nr_samples_list": nr_samples_list,
+                "storedFeatures": storedFeatures,
+                "nr_factors": nr_factors,
+                "inputMode": inputMode,
+                "windowMode": windowMode,
+                "gridStride": args.gridStride,
+                "binSize": args.binSize,
+                "windowSize": args.windowSize,
+                "targetNorm": args.targetNorm,
+                "logTransformTarget": args.logTransformTarget,
+                "flankPadChromosomes": args.flankPadChromosomes,
+                "flankPadMaxBins": args.flankPadMaxBins,
+                "flankPadMinRatio": args.flankPadMinRatio,
+                "filterEmptyWindows": args.filterEmptyWindows,
+                "featureSet": featureSet,
+                "usePairFeatures": usePairFeatures,
+                "dropout": args.dropout,
+                "underpredBoost": args.underpredBoost,
+                "earlyStoppingPatience": args.earlyStoppingPatience,
+                "seed": randomSeed,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            outfile = os.path.join(args.outputFolder, "hicgan_metadata.pkl")
+            with open(outfile, "wb") as f:
+                pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
+            log.info("[MAIN] Saved metadata to %s", outfile)
+            print(f"Saved metadata to {outfile}")
         if (args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly):
             if args.trainOnly:
                 meta_file = os.path.join(args.outputFolder, "hicgan_metadata.pkl")
@@ -680,6 +977,10 @@ def main(args=None):
                 nr_samples_list = meta["nr_samples_list"]
                 storedFeatures = meta["storedFeatures"]
                 nr_factors = meta["nr_factors"]
+                inputMode = meta.get("inputMode", inputMode)
+                windowMode = meta.get("windowMode", windowMode)
+                featureSet = meta.get("featureSet", featureSet)
+                usePairFeatures = meta.get("usePairFeatures", usePairFeatures)
             training(
                 pTfRecordFilenames=tfRecordFilenames,
                 pLengthTrainDataContainerList=traindataContainerListLength,
@@ -706,7 +1007,15 @@ def main(args=None):
                 pResume=args.resume,
                 pMixedPrecision=args.mixedPrecision,
                 pValidationSteps=args.validationSteps,
-                pTargetValueRange=resolvedTargetRange
+                pTargetValueRange=resolvedTargetRange,
+                pInputMode=inputMode,
+                pWindowMode=windowMode,
+                pLogTransformTarget=args.logTransformTarget,
+                pForegroundLossWeight=args.foregroundLossWeight,
+                pUnderpredBoost=args.underpredBoost,
+                pDropout=args.dropout,
+                pEarlyStoppingPatience=args.earlyStoppingPatience,
+                pUsePairFeatures=usePairFeatures
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)

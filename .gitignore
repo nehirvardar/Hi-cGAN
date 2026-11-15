@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+.idea
+.keras
+output_models
+
 # Distribution / packaging
 .Python
 build/
