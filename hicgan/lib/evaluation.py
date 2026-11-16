@@ -74,10 +74,10 @@ def compute_cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
 
 
 def safe_corr(vec1: np.ndarray, vec2: np.ndarray):
-    """Return (pearson_r, spearman_rho), safely handling constant arrays."""
+    """Return (pearson_r, spearman_rho), matching pandas/scipy NaN behavior on constant arrays."""
     u = np.asarray(vec1, dtype=np.float64).ravel()
     v = np.asarray(vec2, dtype=np.float64).ravel()
-    if u.size < 2 or np.std(u) <= 1e-12 or np.std(v) <= 1e-12:
+    if u.size < 2 or np.ptp(u) == 0.0 or np.ptp(v) == 0.0:
         return float("nan"), float("nan")
     try:
         pr, _ = stats.pearsonr(u, v)
@@ -88,6 +88,37 @@ def safe_corr(vec1: np.ndarray, vec2: np.ndarray):
     except Exception:
         sr = float("nan")
     return float(pr), float(sr)
+
+
+def _resolve_eval_window_size(run_or_pred_dir: str):
+    """Resolve prediction windowSize (in bins) from predictions.pkl or hicgan_metadata.pkl if present."""
+    import pickle
+    if not run_or_pred_dir:
+        return None
+    d = os.path.abspath(run_or_pred_dir)
+    parent = os.path.dirname(d)
+    grandparent = os.path.dirname(parent)
+    candidates = [
+        os.path.join(d, "predictions.pkl"),
+        os.path.join(parent, "predictions.pkl"),
+        os.path.join(d, "hicgan_metadata.pkl"),
+        os.path.join(parent, "hicgan_metadata.pkl"),
+        os.path.join(grandparent, "hicgan_metadata.pkl"),
+        os.path.join(parent, "train_run", "hicgan_metadata.pkl"),
+        os.path.join(grandparent, "train_run", "hicgan_metadata.pkl"),
+    ]
+    for cand in candidates:
+        if os.path.exists(cand):
+            try:
+                with open(cand, "rb") as fh:
+                    obj = pickle.load(fh)
+                if isinstance(obj, dict) and obj.get("windowSize"):
+                    ws = int(obj["windowSize"])
+                    if ws > 0:
+                        return ws
+            except Exception:
+                pass
+    return None
 
 
 def compute_binary_classification_metrics(y_true_bin: np.ndarray, y_score: np.ndarray):
@@ -582,13 +613,14 @@ def evaluate_chromosome_pair(
     pred_dense_raw: np.ndarray,
     chrom: str,
     include_baseline: bool = True,
+    max_distance_bins: int = None,
 ) -> dict:
     """
-    Compute comprehensive numerical metrics comparing ground-truth and predicted
-    matrices in both raw and log1p spaces for a single chromosome, including:
-      - Core 5 metrics (AUPRC, Distance-Stratified Corr, Active GT>0 Corr, 1D Marginal Corr, SSIM/Cosine)
-      - 0-100 Composite Quality Score
-      - P(d) Distance-Decay Baseline comparison and Lift/Delta metrics
+    Compute Hi-C evaluation metrics comparing ground-truth and predicted matrices.
+    Pearson & Spearman correlations match the `main` branch (`utils.computePearsonCorrelationSparse`
+    & `utils.getCorrelation`): evaluated in RAW counts over the upper-triangular diagonal band
+    `0 <= (j - i) < k` (where `k = windowSize` when available), with distance-stratified Pearson AUC
+    and Spearman AUC computed via trapezoid rule after dropping constant (NaN) diagonals.
     """
     gt_raw = np.maximum(np.asarray(gt_dense_raw, dtype=np.float64), 0.0)
     pred_raw = np.maximum(np.asarray(pred_dense_raw, dtype=np.float64), 0.0)
@@ -597,24 +629,31 @@ def evaluate_chromosome_pair(
     pred_log = np.log1p(pred_raw)
 
     n = gt_raw.shape[0]
+    k_band = n if (max_distance_bins is None or int(max_distance_bins) <= 0) else min(int(max_distance_bins), n)
     triu_r, triu_c = np.triu_indices(n, k=0)
+    band_mask = (triu_c - triu_r) < k_band
     gt_triu_raw = gt_raw[triu_r, triu_c]
     pred_triu_raw = pred_raw[triu_r, triu_c]
     gt_triu_log = gt_log[triu_r, triu_c]
     pred_triu_log = pred_log[triu_r, triu_c]
 
-    # Error metrics (all upper-triangle pairs)
-    mae_raw = float(np.mean(np.abs(gt_triu_raw - pred_triu_raw)))
-    mse_raw = float(np.mean((gt_triu_raw - pred_triu_raw) ** 2))
+    gt_band_raw = gt_triu_raw[band_mask]
+    pred_band_raw = pred_triu_raw[band_mask]
+    gt_band_log = gt_triu_log[band_mask]
+    pred_band_log = pred_triu_log[band_mask]
+
+    # Error metrics on the evaluated trapezoid band (matching main's matrixDf region)
+    mae_raw = float(np.mean(np.abs(gt_band_raw - pred_band_raw)))
+    mse_raw = float(np.mean((gt_band_raw - pred_band_raw) ** 2))
     rmse_raw = float(np.sqrt(mse_raw))
 
-    mae_log = float(np.mean(np.abs(gt_triu_log - pred_triu_log)))
-    mse_log = float(np.mean((gt_triu_log - pred_triu_log) ** 2))
+    mae_log = float(np.mean(np.abs(gt_band_log - pred_band_log)))
+    mse_log = float(np.mean((gt_band_log - pred_band_log) ** 2))
     rmse_log = float(np.sqrt(mse_log))
 
-    # Correlations on all upper-triangle bin pairs
-    pearson_all_raw, spearman_all_raw = safe_corr(gt_triu_raw, pred_triu_raw)
-    pearson_all_log, spearman_all_log = safe_corr(gt_triu_log, pred_triu_log)
+    # Overall band correlations in raw and log1p spaces
+    pearson_all_raw, spearman_all_raw = safe_corr(gt_band_raw, pred_band_raw)
+    pearson_all_log, spearman_all_log = safe_corr(gt_band_log, pred_band_log)
 
     # Correlations on active bin pairs (GT > 0)
     pos_mask = gt_triu_raw > 0
@@ -626,10 +665,14 @@ def evaluate_chromosome_pair(
     else:
         pearson_pos_raw = spearman_pos_raw = pearson_pos_log = spearman_pos_log = float("nan")
 
-    # Distance-stratified correlations (across genomic distances d >= 1 where GT has variance)
-    curves = compute_distance_curves(gt_raw, pred_raw)
-    dist_strat_pearson_log = float(curves["mean_dist_pearson_log"])
-    dist_strat_spearman_log = float(curves["mean_dist_spearman_log"])
+    # Distance-stratified correlations & AUC matching main's computePearsonCorrelationSparse (raw counts, d=0..k-1, dropna)
+    curves = compute_distance_curves(gt_raw, pred_raw, max_distance_bins=k_band)
+    pearson_auc = float(curves["pearson_auc"])
+    spearman_auc = float(curves["spearman_auc"])
+    dist_strat_pearson_raw = float(curves["mean_dist_pearson_raw"])
+    dist_strat_spearman_raw = float(curves["mean_dist_spearman_raw"])
+    dist_strat_pearson_log = dist_strat_pearson_raw
+    dist_strat_spearman_log = dist_strat_spearman_raw
 
     # 1D Marginal (row sum) correlations in log1p space
     gt_marg_log = np.sum(gt_log, axis=1)
@@ -643,11 +686,11 @@ def evaluate_chromosome_pair(
     # Structural & similarity metrics
     ssim_raw = compute_ssim_2d(gt_raw, pred_raw)
     psnr_raw = compute_psnr(gt_raw, pred_raw)
-    cos_raw = compute_cosine_similarity(gt_triu_raw, pred_triu_raw)
+    cos_raw = compute_cosine_similarity(gt_band_raw, pred_band_raw)
 
     ssim_log = compute_ssim_2d(gt_log, pred_log)
     psnr_log = compute_psnr(gt_log, pred_log)
-    cos_log = compute_cosine_similarity(gt_triu_log, pred_triu_log)
+    cos_log = compute_cosine_similarity(gt_band_log, pred_band_log)
 
     # Binary classification 1: Interaction present (GT > 0)
     y_bin_pos = (gt_triu_raw > 0).astype(np.int32)
@@ -680,11 +723,16 @@ def evaluate_chromosome_pair(
     result = {
         "chrom": f"chr{str(chrom).lstrip('chr')}",
         "n_bins": int(n),
+        "band_diagonals": int(k_band),
         "gt_nnz_triu": n_pos,
         "Prevalence_GTpos": prevalence_pos,
         "Composite_Score_100": composite_score,
         "AUPRC_GTpos": auprc_pos,
         "AUPRC_Top10pct": auprc_top10,
+        "Pearson_AUC": pearson_auc,
+        "Spearman_AUC": spearman_auc,
+        "DistStrat_Pearson_raw": dist_strat_pearson_raw,
+        "DistStrat_Spearman_raw": dist_strat_spearman_raw,
         "DistStrat_Spearman_log1p": dist_strat_spearman_log,
         "DistStrat_Pearson_log1p": dist_strat_pearson_log,
         "Pearson_GTpos_log1p": 0.0 if np.isnan(pearson_pos_log) else pearson_pos_log,
@@ -717,7 +765,9 @@ def evaluate_chromosome_pair(
 
     if include_baseline:
         base_raw = build_distance_decay_baseline(gt_raw)
-        base_metrics = evaluate_chromosome_pair(gt_raw, base_raw, chrom=chrom, include_baseline=False)
+        base_metrics = evaluate_chromosome_pair(
+            gt_raw, base_raw, chrom=chrom, include_baseline=False, max_distance_bins=k_band
+        )
         result["Baseline_Composite_Score_100"] = base_metrics["Composite_Score_100"]
         result["Composite_Delta_vs_Base"] = result["Composite_Score_100"] - base_metrics["Composite_Score_100"]
         result["Baseline_AUPRC_GTpos"] = base_metrics["AUPRC_GTpos"]
@@ -735,29 +785,36 @@ def evaluate_chromosome_pair(
     return result
 
 
-def compute_distance_curves(gt_dense_raw: np.ndarray, pred_dense_raw: np.ndarray):
+def compute_distance_curves(
+    gt_dense_raw: np.ndarray,
+    pred_dense_raw: np.ndarray,
+    max_distance_bins: int = None,
+):
     """
-    Compute distance-dependent mean contact intensity P(d) and distance-stratified
-    Pearson/Spearman correlations as a function of genomic bin distance d = |i - j|.
-    For distances d >= 1 where GT has non-zero variance (std > 1e-12) and >= 5 bins,
-    if prediction has zero variance, correlation at distance d is recorded as 0.0.
+    Compute distance-dependent P(d) and distance-stratified Pearson/Spearman
+    correlations matching the `main` branch (`utils.computePearsonCorrelationSparse`
+    & `utils.getCorrelation`):
+      - Raw interaction counts (`gt_raw`, `pred_raw`), NOT log1p
+      - Diagonals d = 0, 1, ..., k - 1 (where k = max_distance_bins if given, else n)
+      - Constant / < 2-element diagonals stay NaN and are omitted (dropna)
+      - Computes Pearson AUC & Spearman AUC via sklearn.metrics.auc over normalized d / (k - 1)
     """
+    from sklearn import metrics as sk_metrics
+
     gt_raw = np.maximum(np.asarray(gt_dense_raw, dtype=np.float64), 0.0)
     pred_raw = np.maximum(np.asarray(pred_dense_raw, dtype=np.float64), 0.0)
     gt_log = np.log1p(gt_raw)
     pred_log = np.log1p(pred_raw)
 
     n = gt_raw.shape[0]
-    distances = np.arange(0, n, dtype=int)
-    gt_pd_raw = np.zeros(n, dtype=np.float64)
-    pred_pd_raw = np.zeros(n, dtype=np.float64)
-    gt_pd_log = np.zeros(n, dtype=np.float64)
-    pred_pd_log = np.zeros(n, dtype=np.float64)
-    pearson_by_d = np.full(n, np.nan, dtype=np.float64)
-    spearman_by_d = np.full(n, np.nan, dtype=np.float64)
-
-    active_pearson_list = []
-    active_spearman_list = []
+    k = n if (max_distance_bins is None or int(max_distance_bins) <= 0) else min(int(max_distance_bins), n)
+    distances = np.arange(0, k, dtype=int)
+    gt_pd_raw = np.zeros(k, dtype=np.float64)
+    pred_pd_raw = np.zeros(k, dtype=np.float64)
+    gt_pd_log = np.zeros(k, dtype=np.float64)
+    pred_pd_log = np.zeros(k, dtype=np.float64)
+    pearson_by_d = np.full(k, np.nan, dtype=np.float64)
+    spearman_by_d = np.full(k, np.nan, dtype=np.float64)
 
     for d in distances:
         g_diag_raw = np.diagonal(gt_raw, offset=d)
@@ -770,21 +827,30 @@ def compute_distance_curves(gt_dense_raw: np.ndarray, pred_dense_raw: np.ndarray
         gt_pd_log[d] = float(np.mean(g_diag_log))
         pred_pd_log[d] = float(np.mean(p_diag_log))
 
-        if g_diag_log.size >= 5 and np.std(g_diag_log) > 1e-12:
-            if np.std(p_diag_log) <= 1e-12:
-                pr, sr = 0.0, 0.0
-            else:
-                pr, sr = safe_corr(g_diag_log, p_diag_log)
-                pr = 0.0 if np.isnan(pr) else float(pr)
-                sr = 0.0 if np.isnan(sr) else float(sr)
-            pearson_by_d[d] = pr
-            spearman_by_d[d] = sr
-            if d >= 1:
-                active_pearson_list.append(pr)
-                active_spearman_list.append(sr)
+        # Match main's pData.groupby('distance').corr(...) on raw reads (constant diagonals -> NaN)
+        pr, sr = safe_corr(g_diag_raw, p_diag_raw)
+        if np.isfinite(pr):
+            pearson_by_d[d] = float(pr)
+        if np.isfinite(sr):
+            spearman_by_d[d] = float(sr)
 
-    mean_dist_pearson = float(np.mean(active_pearson_list)) if active_pearson_list else 0.0
-    mean_dist_spearman = float(np.mean(active_spearman_list)) if active_spearman_list else 0.0
+    max_distance = max(int(k - 1), 1)
+    mask_p = np.isfinite(pearson_by_d)
+    mask_s = np.isfinite(spearman_by_d)
+
+    pearson_auc = (
+        float(sk_metrics.auc(distances[mask_p] / float(max_distance), pearson_by_d[mask_p]))
+        if int(np.sum(mask_p)) >= 2
+        else (float(pearson_by_d[mask_p][0]) if int(np.sum(mask_p)) == 1 else float("nan"))
+    )
+    spearman_auc = (
+        float(sk_metrics.auc(distances[mask_s] / float(max_distance), spearman_by_d[mask_s]))
+        if int(np.sum(mask_s)) >= 2
+        else (float(spearman_by_d[mask_s][0]) if int(np.sum(mask_s)) == 1 else float("nan"))
+    )
+
+    mean_dist_pearson_raw = float(np.mean(pearson_by_d[mask_p])) if np.any(mask_p) else float("nan")
+    mean_dist_spearman_raw = float(np.mean(spearman_by_d[mask_s])) if np.any(mask_s) else float("nan")
 
     return {
         "distances": distances,
@@ -794,8 +860,12 @@ def compute_distance_curves(gt_dense_raw: np.ndarray, pred_dense_raw: np.ndarray
         "pred_pd_log": pred_pd_log,
         "pearson_by_d": pearson_by_d,
         "spearman_by_d": spearman_by_d,
-        "mean_dist_pearson_log": mean_dist_pearson,
-        "mean_dist_spearman_log": mean_dist_spearman,
+        "pearson_auc": pearson_auc,
+        "spearman_auc": spearman_auc,
+        "mean_dist_pearson_raw": mean_dist_pearson_raw,
+        "mean_dist_spearman_raw": mean_dist_spearman_raw,
+        "mean_dist_pearson_log": mean_dist_pearson_raw,
+        "mean_dist_spearman_log": mean_dist_spearman_raw,
     }
 
 
@@ -1006,7 +1076,7 @@ def plot_contact_decay_and_stratified_corr(chrom_data_dict: dict, bin_size: int,
 
 
 def plot_stratified_corr(chrom_data_dict: dict, bin_size: int, eval_out_dir: str, run_name: str = ""):
-    """Plot only distance-stratified Pearson r(d) and Spearman rho(d) curves."""
+    """Plot distance-stratified Pearson r(d) and Spearman rho(d) curves (raw counts, main style)."""
     os.makedirs(eval_out_dir, exist_ok=True)
     n_chroms = len(chrom_data_dict)
     if n_chroms == 0:
@@ -1021,6 +1091,8 @@ def plot_stratified_corr(chrom_data_dict: dict, bin_size: int, eval_out_dir: str
 
         p_vals = curves["pearson_by_d"]
         s_vals = curves["spearman_by_d"]
+        p_auc = float(curves.get("pearson_auc", np.nan))
+        s_auc = float(curves.get("spearman_auc", np.nan))
         mask_p = ~np.isnan(p_vals)
         mask_s = ~np.isnan(s_vals)
 
@@ -1032,7 +1104,7 @@ def plot_stratified_corr(chrom_data_dict: dict, bin_size: int, eval_out_dir: str
                 color=c,
                 markersize=3,
                 alpha=0.85,
-                label=f"chr{chrom} (ort={np.nanmean(p_vals):.3f})",
+                label=f"chr{chrom} (AUC={p_auc:.3f}, ort={np.nanmean(p_vals):.3f})",
             )
         if np.any(mask_s):
             axes[1].plot(
@@ -1042,26 +1114,26 @@ def plot_stratified_corr(chrom_data_dict: dict, bin_size: int, eval_out_dir: str
                 color=c,
                 markersize=3,
                 alpha=0.85,
-                label=f"chr{chrom} (ort={np.nanmean(s_vals):.3f})",
+                label=f"chr{chrom} (AUC={s_auc:.3f}, ort={np.nanmean(s_vals):.3f})",
             )
 
     axes[0].axhline(0.0, color="gray", ls="--", lw=1)
-    axes[0].set_title("Mesafeye Göre Katmanlı Pearson Korelasyonu r(d)")
-    axes[0].set_xlabel("Genomik Mesafe |i - j| (Mb)")
-    axes[0].set_ylabel("Pearson r (log1p)")
+    axes[0].set_title("Mesafeye Göre Katmanlı Pearson Korelasyonu r(d) [main]")
+    axes[0].set_xlabel("Genomik Mesafe |i - j| (Mbp)")
+    axes[0].set_ylabel("Pearson r (raw)")
     axes[0].set_ylim(-0.3, 1.05)
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
     axes[1].axhline(0.0, color="gray", ls="--", lw=1)
-    axes[1].set_title("Mesafeye Göre Katmanlı Spearman Korelasyonu ρ(d)")
-    axes[1].set_xlabel("Genomik Mesafe |i - j| (Mb)")
-    axes[1].set_ylabel("Spearman ρ (log1p)")
+    axes[1].set_title("Mesafeye Göre Katmanlı Spearman Korelasyonu ρ(d) [main]")
+    axes[1].set_xlabel("Genomik Mesafe |i - j| (Mbp)")
+    axes[1].set_ylabel("Spearman ρ (raw)")
     axes[1].set_ylim(-0.3, 1.05)
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    fig.suptitle(f"Genomik Mesafeye Göre Katmanlı Korelasyon — {run_name}", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Genomik Mesafeye Göre Katmanlı Korelasyon (main yöntemi) — {run_name}", fontsize=13, fontweight="bold")
     plt.tight_layout()
     corr_path = os.path.join(eval_out_dir, "distance_stratified_correlation.png")
     fig.savefig(corr_path, dpi=300, bbox_inches="tight")
@@ -1189,8 +1261,9 @@ def _diagnose_score_row(row: pd.Series) -> str:
 
 def build_core_scorecard_df(df_metrics_full: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a concise classic-paper metrics scorecard table (Pearson, Spearman,
-    distance-stratified correlations, MAE, MSE, RMSE, SSIM, PSNR) from `df_metrics_full`.
+    Build a concise paper metrics scorecard table aligned with `main` branch Pearson/Spearman
+    calculation (raw counts over the evaluated diagonal band, distance-stratified AUC & mean r(d)/rho(d),
+    plus MAE, MSE, RMSE, SSIM, PSNR).
     """
     if df_metrics_full is None or df_metrics_full.empty:
         return pd.DataFrame()
@@ -1199,12 +1272,12 @@ def build_core_scorecard_df(df_metrics_full: pd.DataFrame) -> pd.DataFrame:
     for _, r in df_metrics_full.iterrows():
         rows.append({
             "Kromozom": r.get("chrom"),
-            "Pearson r (raw)": float(r.get("Pearson_all_raw", np.nan)),
-            "Spearman ρ (raw)": float(r.get("Spearman_all_raw", np.nan)),
-            "Pearson r (log1p)": float(r.get("Pearson_all_log1p", np.nan)),
-            "Spearman ρ (log1p)": float(r.get("Spearman_all_log1p", np.nan)),
-            "Katmanlı Pearson r(d)": float(r.get("DistStrat_Pearson_log1p", np.nan)),
-            "Katmanlı Spearman ρ(d)": float(r.get("DistStrat_Spearman_log1p", np.nan)),
+            "Pearson AUC (main)": float(r.get("Pearson_AUC", np.nan)),
+            "Spearman AUC (main)": float(r.get("Spearman_AUC", np.nan)),
+            "Katmanlı Pearson r(d) (raw)": float(r.get("DistStrat_Pearson_raw", np.nan)),
+            "Katmanlı Spearman ρ(d) (raw)": float(r.get("DistStrat_Spearman_raw", np.nan)),
+            "Band Pearson r (raw)": float(r.get("Pearson_all_raw", np.nan)),
+            "Band Spearman ρ (raw)": float(r.get("Spearman_all_raw", np.nan)),
             "MAE (raw)": float(r.get("MAE_raw", np.nan)),
             "MSE (raw)": float(r.get("MSE_raw", np.nan)),
             "RMSE (raw)": float(r.get("RMSE_raw", np.nan)),
@@ -1403,6 +1476,7 @@ def evaluate_predictions_dir(
     os.makedirs(eval_out_dir, exist_ok=True)
 
     has_feature_pack = bool(chromatin_dir and featurePack.is_feature_pack_source(chromatin_dir))
+    eval_window_size = _resolve_eval_window_size(pred_npz_dir)
 
     npz_files = sorted(glob.glob(os.path.join(pred_npz_dir, "chr*.npz")))
     chrom_filter = {str(c).lstrip("chr") for c in chroms} if chroms else None
@@ -1449,7 +1523,7 @@ def evaluate_predictions_dir(
             except Exception as exc:
                 log.warning("Could not load input features for chr%s: %s", chrom, str(exc))
 
-        row = evaluate_chromosome_pair(gt_dense, pr_dense, chrom=chrom, include_baseline=True)
+        row = evaluate_chromosome_pair(gt_dense, pr_dense, chrom=chrom, include_baseline=False, max_distance_bins=eval_window_size)
         metric_rows.append(row)
         chrom_data_dict[chrom] = {
             "gt_raw": gt_dense,
@@ -1458,7 +1532,7 @@ def evaluate_predictions_dir(
             "input_title": input_title,
             "input_xlabel": input_xlabel,
             "input_ylabel": input_ylabel,
-            "curves": compute_distance_curves(gt_dense, pr_dense),
+            "curves": compute_distance_curves(gt_dense, pr_dense, max_distance_bins=eval_window_size),
         }
 
     if not metric_rows:
@@ -1670,7 +1744,9 @@ def compare_runs_leaderboard(
                 gt_sp, _ = utils.getMatrixFromNpz(npz_data_dir, chrom, pBinSizeInt=bin_size)
                 pr_sp = sparse.load_npz(pfile)
                 if gt_sp.shape == pr_sp.shape:
-                    crow = evaluate_chromosome_pair(gt_sp.toarray(), pr_sp.toarray(), chrom=chrom, include_baseline=False)
+                    crow = evaluate_chromosome_pair(
+                        gt_sp.toarray(), pr_sp.toarray(), chrom=chrom, include_baseline=False, max_distance_bins=ws
+                    )
                     chrom_rows.append(crow)
                     chrom_names.append(f"chr{chrom}")
             except Exception as exc:
@@ -1688,12 +1764,12 @@ def compare_runs_leaderboard(
             "WS": ws,
             "Epoch": ep,
             "Kromozomlar": ",".join(chrom_names),
-            "Pearson r (raw)": float(dfc["Pearson_all_raw"].mean()),
-            "Spearman ρ (raw)": float(dfc["Spearman_all_raw"].mean()),
-            "Pearson r (log1p)": float(dfc["Pearson_all_log1p"].mean()),
-            "Spearman ρ (log1p)": float(dfc["Spearman_all_log1p"].mean()),
-            "Katmanlı Pearson r(d)": float(dfc["DistStrat_Pearson_log1p"].mean()),
-            "Katmanlı Spearman ρ(d)": float(dfc["DistStrat_Spearman_log1p"].mean()),
+            "Pearson AUC (main)": float(dfc["Pearson_AUC"].mean()),
+            "Spearman AUC (main)": float(dfc["Spearman_AUC"].mean()),
+            "Katmanlı Pearson r(d) (raw)": float(dfc["DistStrat_Pearson_raw"].mean()),
+            "Katmanlı Spearman ρ(d) (raw)": float(dfc["DistStrat_Spearman_raw"].mean()),
+            "Band Pearson r (raw)": float(dfc["Pearson_all_raw"].mean()),
+            "Band Spearman ρ (raw)": float(dfc["Spearman_all_raw"].mean()),
             "MAE (raw)": float(dfc["MAE_raw"].mean()),
             "MSE (raw)": float(dfc["MSE_raw"].mean()),
             "RMSE (raw)": float(dfc["RMSE_raw"].mean()),
@@ -1705,7 +1781,7 @@ def compare_runs_leaderboard(
     if not leaderboard_rows:
         return pd.DataFrame()
 
-    df_lb = pd.DataFrame(leaderboard_rows).sort_values("Pearson r (log1p)", ascending=False).reset_index(drop=True)
+    df_lb = pd.DataFrame(leaderboard_rows).sort_values("Pearson AUC (main)", ascending=False).reset_index(drop=True)
     df_lb.insert(0, "Sıra", np.arange(1, len(df_lb) + 1))
 
     if eval_out_dir:
@@ -1719,11 +1795,11 @@ def compare_runs_leaderboard(
 
         fig, ax = plt.subplots(figsize=(10, max(3.6, 0.55 * len(df_plot) + 1.4)))
         bar_h = 0.36
-        pearson_vals = df_plot["Pearson r (log1p)"].values
-        spearman_vals = df_plot["Spearman ρ (log1p)"].values
+        pearson_vals = df_plot["Pearson AUC (main)"].values
+        spearman_vals = df_plot["Spearman AUC (main)"].values
 
-        ax.barh(y_pos - bar_h / 2, pearson_vals, height=bar_h, color="#1f77b4", alpha=0.88, label="Pearson r (log1p)")
-        ax.barh(y_pos + bar_h / 2, spearman_vals, height=bar_h, color="#ff7f0e", alpha=0.88, label="Spearman ρ (log1p)")
+        ax.barh(y_pos - bar_h / 2, pearson_vals, height=bar_h, color="#1f77b4", alpha=0.88, label="Pearson AUC (main)")
+        ax.barh(y_pos + bar_h / 2, spearman_vals, height=bar_h, color="#ff7f0e", alpha=0.88, label="Spearman AUC (main)")
         for i, (pv, sv) in enumerate(zip(pearson_vals, spearman_vals)):
             ax.text(max(pv, 0.0) + 0.015, i - bar_h / 2, f"{pv:.3f}", va="center", ha="left", fontsize=8.5)
             ax.text(max(sv, 0.0) + 0.015, i + bar_h / 2, f"{sv:.3f}", va="center", ha="left", fontsize=8.5)
@@ -1733,8 +1809,8 @@ def compare_runs_leaderboard(
         ax.invert_yaxis()
         max_x = max(float(np.nanmax(pearson_vals)), float(np.nanmax(spearman_vals)), 0.5)
         ax.set_xlim(min(0.0, float(np.nanmin(pearson_vals)), float(np.nanmin(spearman_vals))) - 0.05, max_x * 1.18)
-        ax.set_xlabel("Korelasyon Skoru (log1p)")
-        ax.set_title("Run Liderlik Sıralaması (Pearson r & Spearman ρ)", fontsize=12, fontweight="bold")
+        ax.set_xlabel("Korelasyon AUC Skoru (main yöntemi)")
+        ax.set_title("Run Liderlik Sıralaması (Pearson & Spearman AUC — main)", fontsize=12, fontweight="bold")
         ax.grid(True, axis="x", alpha=0.3)
         ax.legend(loc="lower right")
         plt.tight_layout()
@@ -1985,6 +2061,14 @@ def compare_two_models(
     cgan_best_ep, cgan_best_loss = _best_ep_and_loss(df_loss_cgan)
     diff_best_ep, diff_best_loss = _best_ep_and_loss(df_loss_diff)
 
+    cmp_ws = (
+        cgan_info["meta"].get("windowSize")
+        or diff_info["meta"].get("windowSize")
+        or _resolve_eval_window_size(cgan_info["npz_dir"])
+        or _resolve_eval_window_size(diff_info["npz_dir"])
+    )
+    cmp_ws = int(cmp_ws) if cmp_ws else None
+
     per_chrom_rows = []
     cgan_chrom_rows = []
     diff_chrom_rows = []
@@ -1993,12 +2077,12 @@ def compare_two_models(
     heatmap_files = []
 
     core_cols = [
+        "Pearson_AUC",
+        "Spearman_AUC",
+        "DistStrat_Pearson_raw",
+        "DistStrat_Spearman_raw",
         "Pearson_all_raw",
         "Spearman_all_raw",
-        "Pearson_all_log1p",
-        "Spearman_all_log1p",
-        "DistStrat_Pearson_log1p",
-        "DistStrat_Spearman_log1p",
         "MAE_raw",
         "MSE_raw",
         "RMSE_raw",
@@ -2020,8 +2104,12 @@ def compare_two_models(
         cgan_dense = cgan_sp.toarray()
         diff_dense = diff_sp.toarray()
 
-        row_cgan = evaluate_chromosome_pair(gt_dense, cgan_dense, chrom=chrom, include_baseline=False)
-        row_diff = evaluate_chromosome_pair(gt_dense, diff_dense, chrom=chrom, include_baseline=False)
+        row_cgan = evaluate_chromosome_pair(
+            gt_dense, cgan_dense, chrom=chrom, include_baseline=False, max_distance_bins=cmp_ws
+        )
+        row_diff = evaluate_chromosome_pair(
+            gt_dense, diff_dense, chrom=chrom, include_baseline=False, max_distance_bins=cmp_ws
+        )
         cgan_chrom_rows.append(row_cgan)
         diff_chrom_rows.append(row_diff)
 
@@ -2032,8 +2120,8 @@ def compare_two_models(
             merged[f"Delta_Diff_minus_cGAN_{k}"] = float(row_diff[k] - row_cgan[k])
         per_chrom_rows.append(merged)
 
-        dist_curves_cgan.append(compute_distance_curves(gt_dense, cgan_dense))
-        dist_curves_diff.append(compute_distance_curves(gt_dense, diff_dense))
+        dist_curves_cgan.append(compute_distance_curves(gt_dense, cgan_dense, max_distance_bins=cmp_ws))
+        dist_curves_diff.append(compute_distance_curves(gt_dense, diff_dense, max_distance_bins=cmp_ws))
 
         if idx_c < max_heatmap_chroms:
             input_mat = None
@@ -2090,8 +2178,8 @@ def compare_two_models(
 
                 panels = [
                     (gt_log, f"chr{chrom} Ground Truth (log1p)", "YlOrRd", 0.0, vmax),
-                    (cgan_log, f"cGAN\nr={row_cgan['Pearson_all_log1p']:.3f}, ρ={row_cgan['Spearman_all_log1p']:.3f}", "YlOrRd", 0.0, vmax),
-                    (diff_log, f"Diffusion\nr={row_diff['Pearson_all_log1p']:.3f}, ρ={row_diff['Spearman_all_log1p']:.3f}", "YlOrRd", 0.0, vmax),
+                    (cgan_log, f"cGAN\nAUC_P={row_cgan['Pearson_AUC']:.3f}, AUC_S={row_cgan['Spearman_AUC']:.3f}", "YlOrRd", 0.0, vmax),
+                    (diff_log, f"Diffusion\nAUC_P={row_diff['Pearson_AUC']:.3f}, AUC_S={row_diff['Spearman_AUC']:.3f}", "YlOrRd", 0.0, vmax),
                 ]
                 for ax, (mat, ttl, cm, v0, v1) in zip(mat_axes, panels):
                     im = ax.imshow(mat, cmap=cm, vmin=v0, vmax=v1, origin="upper", interpolation="nearest")
@@ -2103,8 +2191,8 @@ def compare_two_models(
                 diff_map = diff_log - cgan_log
                 dlim = max(float(np.percentile(np.abs(diff_map), 99.5)), 1e-3)
                 im_d = diff_ax.imshow(diff_map, cmap="coolwarm", vmin=-dlim, vmax=dlim, origin="upper", interpolation="nearest")
-                delta_r = row_diff["Pearson_all_log1p"] - row_cgan["Pearson_all_log1p"]
-                diff_ax.set_title(f"Diff - cGAN (log1p)\nΔr={delta_r:+.4f}", fontsize=10, fontweight="bold")
+                delta_auc = row_diff["Pearson_AUC"] - row_cgan["Pearson_AUC"]
+                diff_ax.set_title(f"Diff - cGAN (log1p)\nΔAUC_P={delta_auc:+.4f}", fontsize=10, fontweight="bold")
                 diff_ax.set_xlabel("Bin")
                 plt.colorbar(im_d, ax=diff_ax, fraction=0.046, pad=0.04)
 
@@ -2126,10 +2214,14 @@ def compare_two_models(
 
     df_c = pd.DataFrame(cgan_chrom_rows)
     df_d = pd.DataFrame(diff_chrom_rows)
-    cgan_pearson_mean = float(df_c["Pearson_all_log1p"].mean())
-    diff_pearson_mean = float(df_d["Pearson_all_log1p"].mean())
-    cgan_spearman_mean = float(df_c["Spearman_all_log1p"].mean())
-    diff_spearman_mean = float(df_d["Spearman_all_log1p"].mean())
+    cgan_pauc_mean = float(df_c["Pearson_AUC"].mean())
+    diff_pauc_mean = float(df_d["Pearson_AUC"].mean())
+    cgan_sauc_mean = float(df_c["Spearman_AUC"].mean())
+    diff_sauc_mean = float(df_d["Spearman_AUC"].mean())
+    cgan_pearson_mean = float(df_c["Pearson_all_raw"].mean())
+    diff_pearson_mean = float(df_d["Pearson_all_raw"].mean())
+    cgan_spearman_mean = float(df_c["Spearman_all_raw"].mean())
+    diff_spearman_mean = float(df_d["Spearman_all_raw"].mean())
     chrom_label = ",".join(f"chr{c}" for c in common_chroms)
 
     def _lb_row(name, mtype, dff, ep, vloss):
@@ -2139,12 +2231,12 @@ def compare_two_models(
             "Kromozomlar": chrom_label,
             "Best Epoch": ep,
             "Min Val Loss": vloss,
-            "Pearson r (raw)": float(dff["Pearson_all_raw"].mean()),
-            "Spearman ρ (raw)": float(dff["Spearman_all_raw"].mean()),
-            "Pearson r (log1p)": float(dff["Pearson_all_log1p"].mean()),
-            "Spearman ρ (log1p)": float(dff["Spearman_all_log1p"].mean()),
-            "Katmanlı Pearson r(d)": float(dff["DistStrat_Pearson_log1p"].mean()),
-            "Katmanlı Spearman ρ(d)": float(dff["DistStrat_Spearman_log1p"].mean()),
+            "Pearson AUC (main)": float(dff["Pearson_AUC"].mean()),
+            "Spearman AUC (main)": float(dff["Spearman_AUC"].mean()),
+            "Katmanlı Pearson r(d) (raw)": float(dff["DistStrat_Pearson_raw"].mean()),
+            "Katmanlı Spearman ρ(d) (raw)": float(dff["DistStrat_Spearman_raw"].mean()),
+            "Band Pearson r (raw)": float(dff["Pearson_all_raw"].mean()),
+            "Band Spearman ρ (raw)": float(dff["Spearman_all_raw"].mean()),
             "MAE (raw)": float(dff["MAE_raw"].mean()),
             "MSE (raw)": float(dff["MSE_raw"].mean()),
             "RMSE (raw)": float(dff["RMSE_raw"].mean()),
@@ -2155,7 +2247,7 @@ def compare_two_models(
     df_lb = pd.DataFrame([
         _lb_row(diffusion_name, "Diffusion", df_d, diff_best_ep, diff_best_loss),
         _lb_row(cgan_name, "cGAN", df_c, cgan_best_ep, cgan_best_loss),
-    ]).sort_values("Pearson r (log1p)", ascending=False).reset_index(drop=True)
+    ]).sort_values("Pearson AUC (main)", ascending=False).reset_index(drop=True)
     df_lb.insert(0, "Sıra", np.arange(1, len(df_lb) + 1))
     lb_csv = os.path.join(eval_out_dir, "comparison_leaderboard.csv")
     df_lb.to_csv(lb_csv, index=False)
@@ -2166,12 +2258,12 @@ def compare_two_models(
     try:
         fig_bar, (ax_corr, ax_err) = plt.subplots(1, 2, figsize=(15, 5.2))
         corr_keys = [
-            "Pearson r (raw)",
-            "Spearman ρ (raw)",
-            "Pearson r (log1p)",
-            "Spearman ρ (log1p)",
-            "Katmanlı Pearson r(d)",
-            "Katmanlı Spearman ρ(d)",
+            "Pearson AUC (main)",
+            "Spearman AUC (main)",
+            "Katmanlı Pearson r(d) (raw)",
+            "Katmanlı Spearman ρ(d) (raw)",
+            "Band Pearson r (raw)",
+            "Band Spearman ρ (raw)",
             "SSIM (log1p)",
         ]
         y_c = np.arange(len(corr_keys))
@@ -2191,7 +2283,7 @@ def compare_two_models(
         ax_corr.invert_yaxis()
         ax_corr.set_xlim(min(0.0, float(np.nanmin(c_vals + d_vals))) - 0.05, max(max(c_vals + d_vals), 0.5) * 1.18)
         ax_corr.set_xlabel("Skor")
-        ax_corr.set_title("Korelasyon ve Yapısal Benzerlik Metrikleri (Yüksek = İyi)", fontsize=11, fontweight="bold")
+        ax_corr.set_title("Korelasyon (main) ve Yapısal Benzerlik Metrikleri (Yüksek = İyi)", fontsize=11, fontweight="bold")
         ax_corr.grid(True, axis="x", alpha=0.3)
         ax_corr.legend(loc="lower right")
 
@@ -2213,7 +2305,7 @@ def compare_two_models(
         ax_err.legend()
 
         fig_bar.suptitle(
-            f"Faz 1 cGAN vs Faz 2 Diffusion (Δ Pearson r = {diff_pearson_mean - cgan_pearson_mean:+.4f})",
+            f"Faz 1 cGAN vs Faz 2 Diffusion (Δ Pearson AUC = {diff_pauc_mean - cgan_pauc_mean:+.4f})",
             fontsize=12.5, fontweight="bold",
         )
         plt.tight_layout()
@@ -2227,28 +2319,28 @@ def compare_two_models(
         if fig_bar is not None:
             plt.close(fig_bar)
 
-    # Plot 2: Per-chromosome Pearson r & Spearman rho grouped bars
+    # Plot 2: Per-chromosome Pearson AUC & Spearman AUC grouped bars (main method)
     per_chrom_png = None
     fig_pc = None
     try:
         fig_pc, (ax_pr, ax_sr) = plt.subplots(1, 2, figsize=(15, 5.2))
         x = np.arange(len(df_per_chrom))
         w = 0.35
-        ax_pr.bar(x - w / 2, df_per_chrom["cGAN_Pearson_all_log1p"], width=w, color="#ff7f0e", label="cGAN")
-        ax_pr.bar(x + w / 2, df_per_chrom["Diffusion_Pearson_all_log1p"], width=w, color="#1f77b4", label="Diffusion")
+        ax_pr.bar(x - w / 2, df_per_chrom["cGAN_Pearson_AUC"], width=w, color="#ff7f0e", label="cGAN")
+        ax_pr.bar(x + w / 2, df_per_chrom["Diffusion_Pearson_AUC"], width=w, color="#1f77b4", label="Diffusion")
         ax_pr.set_xticks(x)
         ax_pr.set_xticklabels(df_per_chrom["Chromosome"])
-        ax_pr.set_ylabel("Pearson r (log1p)")
-        ax_pr.set_title("Kromozom Bazlı Pearson r (log1p)")
+        ax_pr.set_ylabel("Pearson AUC (main)")
+        ax_pr.set_title("Kromozom Bazlı Pearson AUC (main)")
         ax_pr.grid(True, axis="y", alpha=0.3)
         ax_pr.legend()
 
-        ax_sr.bar(x - w / 2, df_per_chrom["cGAN_Spearman_all_log1p"], width=w, color="#ff7f0e", label="cGAN")
-        ax_sr.bar(x + w / 2, df_per_chrom["Diffusion_Spearman_all_log1p"], width=w, color="#1f77b4", label="Diffusion")
+        ax_sr.bar(x - w / 2, df_per_chrom["cGAN_Spearman_AUC"], width=w, color="#ff7f0e", label="cGAN")
+        ax_sr.bar(x + w / 2, df_per_chrom["Diffusion_Spearman_AUC"], width=w, color="#1f77b4", label="Diffusion")
         ax_sr.set_xticks(x)
         ax_sr.set_xticklabels(df_per_chrom["Chromosome"])
-        ax_sr.set_ylabel("Spearman ρ (log1p)")
-        ax_sr.set_title("Kromozom Bazlı Spearman ρ (log1p)")
+        ax_sr.set_ylabel("Spearman AUC (main)")
+        ax_sr.set_title("Kromozom Bazlı Spearman AUC (main)")
         ax_sr.grid(True, axis="y", alpha=0.3)
         ax_sr.legend()
 
@@ -2263,7 +2355,7 @@ def compare_two_models(
         if fig_pc is not None:
             plt.close(fig_pc)
 
-    # Plot 3: Distance-Stratified Pearson r(d) & Spearman rho(d) Curves
+    # Plot 3: Distance-Stratified Pearson r(d) & Spearman rho(d) Curves (raw counts, main style)
     dist_png = None
     fig_dist = None
     try:
@@ -2271,6 +2363,7 @@ def compare_two_models(
         min_len = min(min_len, 80)
         if min_len >= 2:
             dists = dist_curves_cgan[0]["distances"][:min_len]
+            d_mb = dists * (bin_size / 1e6)
 
             def _safe_nanmean(arrays):
                 stacked = np.vstack(arrays)
@@ -2286,21 +2379,25 @@ def compare_two_models(
             diff_rho = _safe_nanmean([dc["spearman_by_d"][:min_len] for dc in dist_curves_diff])
 
             fig_dist, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.2))
-            ax1.plot(dists, cgan_pr, "--", color="#ff7f0e", lw=2.0, label="Phase 1: cGAN")
-            ax1.plot(dists, diff_pr, "-", color="#1f77b4", lw=2.0, label="Phase 2: Diffusion")
+            mp_c = ~np.isnan(cgan_pr)
+            mp_d = ~np.isnan(diff_pr)
+            ms_c = ~np.isnan(cgan_rho)
+            ms_d = ~np.isnan(diff_rho)
+            ax1.plot(d_mb[mp_c], cgan_pr[mp_c], "--", color="#ff7f0e", lw=2.0, label=f"Phase 1: cGAN (AUC={cgan_pauc_mean:.3f})")
+            ax1.plot(d_mb[mp_d], diff_pr[mp_d], "-", color="#1f77b4", lw=2.0, label=f"Phase 2: Diffusion (AUC={diff_pauc_mean:.3f})")
             ax1.axhline(0.0, color="#666666", lw=0.9, ls=":")
-            ax1.set_xlabel("Genomik Mesafe d (bin)")
-            ax1.set_ylabel("Pearson r(d) [log1p]")
-            ax1.set_title("Mesafeye Göre Katmanlı Pearson r(d)")
+            ax1.set_xlabel("Genomik Mesafe |i - j| (Mbp)")
+            ax1.set_ylabel("Pearson r(d) [raw]")
+            ax1.set_title("Mesafeye Göre Katmanlı Pearson r(d) [main]")
             ax1.grid(True, alpha=0.3)
             ax1.legend()
 
-            ax2.plot(dists, cgan_rho, "--", color="#ff7f0e", lw=2.0, label="Phase 1: cGAN")
-            ax2.plot(dists, diff_rho, "-", color="#1f77b4", lw=2.0, label="Phase 2: Diffusion")
+            ax2.plot(d_mb[ms_c], cgan_rho[ms_c], "--", color="#ff7f0e", lw=2.0, label=f"Phase 1: cGAN (AUC={cgan_sauc_mean:.3f})")
+            ax2.plot(d_mb[ms_d], diff_rho[ms_d], "-", color="#1f77b4", lw=2.0, label=f"Phase 2: Diffusion (AUC={diff_sauc_mean:.3f})")
             ax2.axhline(0.0, color="#666666", lw=0.9, ls=":")
-            ax2.set_xlabel("Genomik Mesafe d (bin)")
-            ax2.set_ylabel("Spearman ρ(d) [log1p]")
-            ax2.set_title("Mesafeye Göre Katmanlı Spearman ρ(d)")
+            ax2.set_xlabel("Genomik Mesafe |i - j| (Mbp)")
+            ax2.set_ylabel("Spearman ρ(d) [raw]")
+            ax2.set_title("Mesafeye Göre Katmanlı Spearman ρ(d) [main]")
             ax2.grid(True, alpha=0.3)
             ax2.legend()
             plt.tight_layout()
@@ -2323,12 +2420,18 @@ def compare_two_models(
         "per_chromosome": df_per_chrom,
         "fairness_audit": fairness,
         "summary_metrics": {
-            "cgan_pearson_log1p": cgan_pearson_mean,
-            "diffusion_pearson_log1p": diff_pearson_mean,
-            "delta_pearson_log1p": diff_pearson_mean - cgan_pearson_mean,
-            "cgan_spearman_log1p": cgan_spearman_mean,
-            "diffusion_spearman_log1p": diff_spearman_mean,
-            "delta_spearman_log1p": diff_spearman_mean - cgan_spearman_mean,
+            "cgan_pearson_auc": cgan_pauc_mean,
+            "diffusion_pearson_auc": diff_pauc_mean,
+            "delta_pearson_auc": diff_pauc_mean - cgan_pauc_mean,
+            "cgan_spearman_auc": cgan_sauc_mean,
+            "diffusion_spearman_auc": diff_sauc_mean,
+            "delta_spearman_auc": diff_sauc_mean - cgan_sauc_mean,
+            "cgan_pearson_raw": cgan_pearson_mean,
+            "diffusion_pearson_raw": diff_pearson_mean,
+            "delta_pearson_raw": diff_pearson_mean - cgan_pearson_mean,
+            "cgan_spearman_raw": cgan_spearman_mean,
+            "diffusion_spearman_raw": diff_spearman_mean,
+            "delta_spearman_raw": diff_spearman_mean - cgan_spearman_mean,
         },
         "files": {
             "fairness_audit": fairness_path,

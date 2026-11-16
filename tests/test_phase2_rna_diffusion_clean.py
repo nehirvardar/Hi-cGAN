@@ -493,13 +493,28 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "evaluation_metrics_full.csv")))
         import pandas as pd
         df_sc = pd.read_csv(os.path.join(pred_out, "evaluation", "core_metrics_scorecard.csv"))
-        for col in ("Kromozom", "Pearson r (raw)", "Spearman ρ (raw)", "Pearson r (log1p)", "Spearman ρ (log1p)", "MAE (raw)", "MSE (raw)", "RMSE (raw)", "SSIM (log1p)", "PSNR (log1p)"):
+        for col in ("Kromozom", "Pearson AUC (main)", "Spearman AUC (main)", "Katmanlı Pearson r(d) (raw)", "Katmanlı Spearman ρ(d) (raw)", "Band Pearson r (raw)", "Band Spearman ρ (raw)", "MAE (raw)", "MSE (raw)", "RMSE (raw)", "SSIM (log1p)", "PSNR (log1p)"):
             self.assertIn(col, df_sc.columns)
         self.assertNotIn("Bileşik Skor (0-100)", df_sc.columns)
         self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "heatmap_triple_chr21.png")))
         self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "distance_stratified_correlation.png")))
         for old_png in ("core_metrics_radar_and_baseline.png", "contact_decay_curve_Pd.png", "marginal_1d_profiles.png", "value_distribution_hexbin_hist.png"):
             self.assertFalse(os.path.exists(os.path.join(pred_out, "evaluation", old_png)))
+
+        # Verify numerical parity between evaluation Pearson/Spearman AUC and main's utils.computePearsonCorrelationSparse
+        gt_sp, _ = utils.getMatrixFromNpz(self.gt_dir, "21", pBinSizeInt=self.bin_size)
+        main_df = utils.computePearsonCorrelationSparse(
+            pSparseCsrMatrix1=gt_sp,
+            pSparseCsrMatrix2=pred_sp,
+            pBinsize=self.bin_size,
+            pWindowsize_bp=64 * self.bin_size,
+            pModelChromList=["1"],
+            pTargetChromStr="chr21",
+            pModelCellLineList=["m"],
+            pTargetCellLineStr="t",
+        )
+        self.assertAlmostEqual(float(df_sc.loc[0, "Pearson AUC (main)"]), float(main_df.loc["pearson", "AUC"]), places=5)
+        self.assertAlmostEqual(float(df_sc.loc[0, "Spearman AUC (main)"]), float(main_df.loc["spearman", "AUC"]), places=5)
 
         # Verify phased predict (--mode create-data -> predict -> make-matrix)
         hic_predict.main(predict_args_common + ["--outputFolder", phased_out, "--mode", "create-data"])
@@ -572,8 +587,8 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         )
         self.assertEqual(len(df_lb), 2)
         self.assertEqual(set(df_lb["Model Tipi"]), {"cGAN", "Diffusion"})
-        self.assertIn("Pearson r (log1p)", df_lb.columns)
-        self.assertIn("Spearman ρ (log1p)", df_lb.columns)
+        self.assertIn("Pearson AUC (main)", df_lb.columns)
+        self.assertIn("Spearman AUC (main)", df_lb.columns)
         self.assertTrue(os.path.exists(os.path.join(lb_out, "multi_run_leaderboard.csv")))
         self.assertTrue(os.path.exists(os.path.join(lb_out, "multi_run_comparison.png")))
 
@@ -590,8 +605,8 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         self.assertTrue(res["fairness_audit"]["fair_comparison"])
         self.assertEqual(res["fairness_audit"]["evaluated_chromosomes"], ["chr21"])
         self.assertEqual(len(res["leaderboard"]), 2)
-        self.assertIn("Delta_Diff_minus_cGAN_Pearson_all_log1p", res["per_chromosome"].columns)
-        self.assertIn("delta_pearson_log1p", res["summary_metrics"])
+        self.assertIn("Delta_Diff_minus_cGAN_Pearson_AUC", res["per_chromosome"].columns)
+        self.assertIn("delta_pearson_auc", res["summary_metrics"])
         for key, fpath in res["files"].items():
             if isinstance(fpath, list):
                 for p in fpath:
