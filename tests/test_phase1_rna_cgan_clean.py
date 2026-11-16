@@ -300,14 +300,22 @@ def test_end_to_end_smoke_train_predict_and_eval():
             "-gt", "hicgan/data/rna_gt",
         ])
 
+        import pandas as pd
         pred_npz = os.path.join(pred_out, "npz_matrices", "chr22.npz")
         scorecard_csv = os.path.join(pred_out, "evaluation", "core_metrics_scorecard.csv")
         triple_png = os.path.join(pred_out, "evaluation", "heatmap_triple_chr22.png")
+        corr_png = os.path.join(pred_out, "evaluation", "distance_stratified_correlation.png")
         sample_png = os.path.join(train_out, "testpred_epoch_00000.png")
         assert os.path.exists(pred_npz)
         assert os.path.exists(scorecard_csv)
         assert os.path.exists(triple_png)
+        assert os.path.exists(corr_png)
         assert os.path.exists(sample_png)
+        df_sc = pd.read_csv(scorecard_csv)
+        assert "Pearson r (log1p)" in df_sc.columns
+        assert "Spearman ρ (log1p)" in df_sc.columns
+        assert "Bileşik Skor (0-100)" not in df_sc.columns
+        assert "1) AUPRC (GT>0)" not in df_sc.columns
 
         mat = sp.load_npz(pred_npz).toarray()
         assert mat.shape == (204, 204)
