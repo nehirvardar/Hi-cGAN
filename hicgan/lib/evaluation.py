@@ -116,26 +116,58 @@ def parse_training_losses(train_out_dir: str) -> pd.DataFrame:
     """
     Parse epoch-by-epoch training and validation losses from `lossValues_*.npz`
     and/or `training.log` inside `train_out_dir`.
-    Returns a DataFrame with columns:
-      epoch, train_gen_total, val_gen_total, train_pixel, val_pixel,
-      train_adv, val_adv, train_tv, val_tv,
-      train_disc_total, val_disc_total, train_disc_true, train_disc_fake
+    Supports both Phase 1 cGAN (`train_gen_total=...`) and Phase 2 Diffusion (`train_total=...`).
     """
     rows = []
     log_path = os.path.join(train_out_dir, "training.log")
     if os.path.exists(log_path):
-        epoch_pattern = re.compile(
+        cgan_pattern = re.compile(
             r"\[EPOCH-LOSS\]\s*epoch=(\d+)/(\d+)\s*\|\s*"
             r"train_gen_total=([0-9.eE+-]+),\s*train_pixel=([0-9.eE+-]+),\s*train_adv=([0-9.eE+-]+),\s*train_tv=([0-9.eE+-]+),\s*"
             r"train_disc_total=([0-9.eE+-]+),\s*train_disc_true=([0-9.eE+-]+),\s*train_disc_fake=([0-9.eE+-]+)\s*\|\s*"
             r"val_gen_total=([0-9.eE+-]+),\s*val_pixel=([0-9.eE+-]+),\s*val_adv=([0-9.eE+-]+),\s*val_tv=([0-9.eE+-]+),\s*val_disc_total=([0-9.eE+-]+)"
         )
+        diff_pattern = re.compile(
+            r"\[EPOCH-LOSS\]\s*epoch=(\d+)/(\d+)\s*\|\s*"
+            r"train_total=([0-9.eE+-]+),\s*train_noise=([0-9.eE+-]+),\s*train_x0=([0-9.eE+-]+),\s*train_bg=([0-9.eE+-]+)\s*\|\s*"
+            r"val_total=([0-9.eE+-]+),\s*val_noise=([0-9.eE+-]+),\s*val_x0=([0-9.eE+-]+),\s*val_bg=([0-9.eE+-]+)"
+        )
         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                m = epoch_pattern.search(line)
+                md = diff_pattern.search(line)
+                if md:
+                    tr_tot = float(md.group(3))
+                    va_tot = float(md.group(7))
+                    rows.append({
+                        "epoch": int(md.group(1)),
+                        "model_type": "diffusion",
+                        "train_total": tr_tot,
+                        "val_total": va_tot,
+                        "train_noise": float(md.group(4)),
+                        "train_x0": float(md.group(5)),
+                        "train_bg": float(md.group(6)),
+                        "val_noise": float(md.group(8)),
+                        "val_x0": float(md.group(9)),
+                        "val_bg": float(md.group(10)),
+                        "train_gen_total": tr_tot,
+                        "val_gen_total": va_tot,
+                        "train_pixel": np.nan,
+                        "val_pixel": np.nan,
+                        "train_adv": np.nan,
+                        "val_adv": np.nan,
+                        "train_tv": np.nan,
+                        "val_tv": np.nan,
+                        "train_disc_total": np.nan,
+                        "val_disc_total": np.nan,
+                        "train_disc_true": np.nan,
+                        "train_disc_fake": np.nan,
+                    })
+                    continue
+                m = cgan_pattern.search(line)
                 if m:
                     rows.append({
                         "epoch": int(m.group(1)),
+                        "model_type": "cgan",
                         "train_gen_total": float(m.group(3)),
                         "train_pixel": float(m.group(4)),
                         "train_adv": float(m.group(5)),
@@ -161,10 +193,41 @@ def parse_training_losses(train_out_dir: str) -> pd.DataFrame:
     data = np.load(latest_npz)
     keys = set(data.keys())
 
+    if "diffLossTrainEpochs" in keys and "diffLossValEpochs" in keys:
+        n_ep = len(data["diffLossTrainEpochs"])
+        tr_tot = np.asarray(data["diffLossTrainEpochs"], dtype=float)
+        va_tot = np.asarray(data["diffLossValEpochs"], dtype=float)
+        df = pd.DataFrame({
+            "epoch": np.arange(1, n_ep + 1, dtype=int),
+            "model_type": "diffusion",
+            "train_total": tr_tot,
+            "val_total": va_tot,
+            "train_noise": np.asarray(data["diffNoiseLossTrainEpochs"], dtype=float) if "diffNoiseLossTrainEpochs" in keys else np.nan,
+            "val_noise": np.asarray(data["diffNoiseLossValEpochs"], dtype=float) if "diffNoiseLossValEpochs" in keys else np.nan,
+            "train_x0": np.asarray(data["diffX0LossTrainEpochs"], dtype=float) if "diffX0LossTrainEpochs" in keys else np.nan,
+            "val_x0": np.asarray(data["diffX0LossValEpochs"], dtype=float) if "diffX0LossValEpochs" in keys else np.nan,
+            "train_bg": np.asarray(data["diffBgLossTrainEpochs"], dtype=float) if "diffBgLossTrainEpochs" in keys else np.nan,
+            "val_bg": np.asarray(data["diffBgLossValEpochs"], dtype=float) if "diffBgLossValEpochs" in keys else np.nan,
+            "train_gen_total": tr_tot,
+            "val_gen_total": va_tot,
+            "train_pixel": np.nan,
+            "val_pixel": np.nan,
+            "train_adv": np.nan,
+            "val_adv": np.nan,
+            "train_tv": np.nan,
+            "val_tv": np.nan,
+            "train_disc_total": np.nan,
+            "val_disc_total": np.nan,
+            "train_disc_true": np.nan,
+            "train_disc_fake": np.nan,
+        })
+        return df
+
     if "genLossTrainEpochs" in keys and "genLossValEpochs" in keys:
         n_ep = len(data["genLossTrainEpochs"])
         df = pd.DataFrame({
             "epoch": np.arange(1, n_ep + 1, dtype=int),
+            "model_type": "cgan",
             "train_gen_total": np.asarray(data["genLossTrainEpochs"], dtype=float),
             "val_gen_total": np.asarray(data["genLossValEpochs"], dtype=float),
             "train_pixel": np.asarray(data["genPixelLossTrainEpochs"], dtype=float) if "genPixelLossTrainEpochs" in keys else np.nan,
@@ -224,8 +287,10 @@ def parse_training_losses(train_out_dir: str) -> pd.DataFrame:
 
 def plot_training_loss_analysis(df_loss: pd.DataFrame, eval_out_dir: str, run_name: str = ""):
     """
-    Plot epoch-wise Train vs Validation curves for Generator Total, Pixel L1/L2,
-    Adversarial, TV, and Discriminator losses, marking the best validation epoch.
+    Plot epoch-wise Train vs Validation curves for either Phase 2 Diffusion
+    (Total, Noise MSE, x0 L1, Background L1) or Phase 1 cGAN
+    (Generator Total, Pixel L1/L2, Adversarial, TV, Discriminator),
+    marking the best validation epoch.
     """
     if df_loss is None or df_loss.empty:
         print("[EVAL-LOSS] Kaydedilmiş eğitim kayıp (loss) verisi bulunamadı.")
@@ -234,6 +299,115 @@ def plot_training_loss_analysis(df_loss: pd.DataFrame, eval_out_dir: str, run_na
     os.makedirs(eval_out_dir, exist_ok=True)
     csv_path = os.path.join(eval_out_dir, "training_loss_history.csv")
     df_loss.to_csv(csv_path, index=False)
+
+    is_diffusion = (
+        ("model_type" in df_loss.columns and (df_loss["model_type"] == "diffusion").any())
+        or ("train_noise" in df_loss.columns and not df_loss["train_noise"].isna().all())
+    )
+    epochs = df_loss["epoch"].values
+
+    if is_diffusion:
+        val_col = "val_total" if "val_total" in df_loss.columns and not df_loss["val_total"].isna().all() else "val_gen_total"
+        tr_col = "train_total" if "train_total" in df_loss.columns and not df_loss["train_total"].isna().all() else "train_gen_total"
+        best_idx = int(df_loss[val_col].idxmin())
+        best_epoch = int(df_loss.loc[best_idx, "epoch"])
+        best_val_loss = float(df_loss.loc[best_idx, val_col])
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.ravel()
+
+        # 1. Diffusion Total Loss
+        ax = axes[0]
+        ax.plot(epochs, df_loss[tr_col], "o-", label="Train Total Loss", color="#1f77b4", lw=2)
+        ax.plot(epochs, df_loss[val_col], "s-", label="Val Total Loss", color="#d62728", lw=2)
+        ax.axvline(best_epoch, color="#2ca02c", ls="--", alpha=0.8, label=f"En İyi Epoch: {best_epoch} ({best_val_loss:.4f})")
+        ax.scatter([best_epoch], [best_val_loss], color="#2ca02c", s=110, zorder=5, marker="*")
+        ax.set_title("Diffusion Total Loss (Train vs Val)")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Total Loss")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+        # 2. Weighted Noise MSE Loss
+        ax_n = axes[1]
+        if "train_noise" in df_loss.columns and not df_loss["train_noise"].isna().all():
+            ax_n.plot(epochs, df_loss["train_noise"], "o-", label="Train Noise Loss", color="#17becf", lw=2)
+            ax_n.plot(epochs, df_loss["val_noise"], "s-", label="Val Noise Loss", color="#e377c2", lw=2)
+        ax_n.set_title("Weighted Epsilon-Noise MSE Loss")
+        ax_n.set_xlabel("Epoch")
+        ax_n.set_ylabel("Noise Loss")
+        ax_n.grid(True, alpha=0.3)
+        ax_n.legend()
+
+        # 3. x0 Reconstruction Loss
+        ax_x0 = axes[2]
+        if "train_x0" in df_loss.columns and not df_loss["train_x0"].isna().all():
+            ax_x0.plot(epochs, df_loss["train_x0"], "o-", label="Train x0 MSE Loss", color="#9467bd", lw=2)
+            ax_x0.plot(epochs, df_loss["val_x0"], "s-", label="Val x0 MSE Loss", color="#8c564b", lw=2)
+            if not df_loss["val_x0"].isna().all():
+                bx = int(df_loss["val_x0"].idxmin())
+                ax_x0.axvline(int(df_loss.loc[bx, "epoch"]), color="#2ca02c", ls=":", alpha=0.8,
+                              label=f"Min Val x0 Ep: {int(df_loss.loc[bx, 'epoch'])} ({float(df_loss.loc[bx, 'val_x0']):.4f})")
+        ax_x0.set_title("Alpha-Weighted Leaky-Clipped x0 MSE Loss")
+        ax_x0.set_xlabel("Epoch")
+        ax_x0.set_ylabel("x0 MSE Loss")
+        ax_x0.grid(True, alpha=0.3)
+        ax_x0.legend()
+
+        # 4. Background L1 Penalty
+        ax_bg = axes[3]
+        if "train_bg" in df_loss.columns and not df_loss["train_bg"].isna().all():
+            ax_bg.plot(epochs, df_loss["train_bg"], "o-", label="Train BG L1", color="#ff7f0e", lw=2)
+            ax_bg.plot(epochs, df_loss["val_bg"], "s-", label="Val BG L1", color="#d62728", lw=2)
+        ax_bg.set_title("Background Zero-Anchor L1 Penalty")
+        ax_bg.set_xlabel("Epoch")
+        ax_bg.set_ylabel("BG L1 Loss")
+        ax_bg.grid(True, alpha=0.3)
+        ax_bg.legend()
+
+        # 5. Train vs Val Gap
+        ax_gap = axes[4]
+        gap = np.asarray(df_loss[val_col], dtype=float) - np.asarray(df_loss[tr_col], dtype=float)
+        ax_gap.plot(epochs, gap, "o-", label="Val - Train Gap", color="#2ca02c", lw=2)
+        ax_gap.axhline(0.0, color="#555555", ls="--", lw=1)
+        ax_gap.set_title("Generalization Gap (Val - Train Total)")
+        ax_gap.set_xlabel("Epoch")
+        ax_gap.set_ylabel("Loss Gap")
+        ax_gap.grid(True, alpha=0.3)
+        ax_gap.legend()
+
+        # 6. Summary text box
+        ax_txt = axes[5]
+        ax_txt.axis("off")
+        summary_lines = [
+            f"Run: {run_name} [Diffusion]",
+            f"Toplam Epoch Sayısı    : {len(df_loss)}",
+            f"En Düşük Val Total Loss: {best_val_loss:.5f} (Ep {best_epoch})",
+            f"Son Epoch Train Total  : {df_loss[tr_col].iloc[-1]:.5f}",
+            f"Son Epoch Val Total    : {df_loss[val_col].iloc[-1]:.5f}",
+        ]
+        if "train_noise" in df_loss.columns and not df_loss["train_noise"].isna().all():
+            summary_lines.append(f"Son Epoch Train Noise  : {df_loss['train_noise'].iloc[-1]:.5f}")
+            summary_lines.append(f"Son Epoch Val Noise    : {df_loss['val_noise'].iloc[-1]:.5f}")
+        if "train_x0" in df_loss.columns and not df_loss["train_x0"].isna().all():
+            summary_lines.append(f"Son Epoch Train x0     : {df_loss['train_x0'].iloc[-1]:.5f}")
+            summary_lines.append(f"Son Epoch Val x0       : {df_loss['val_x0'].iloc[-1]:.5f}")
+        if "val_bg" in df_loss.columns and not df_loss["val_bg"].isna().all():
+            summary_lines.append(f"Son Epoch Val BG L1    : {df_loss['val_bg'].iloc[-1]:.5f}")
+        ax_txt.text(
+            0.05, 0.92, "\n".join(summary_lines),
+            va="top", ha="left", fontsize=11, family="monospace",
+            bbox=dict(boxstyle="round,pad=0.6", facecolor="#f8f9fa", edgecolor="#cccccc")
+        )
+
+        fig.suptitle(f"Diffusion Eğitim Süreci Kayıp (Loss) Analizi — {run_name} (En İyi Epoch: {best_epoch})", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        fig_path = os.path.join(eval_out_dir, "training_loss_curves.png")
+        fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[EVAL-LOSS] Diffusion eğitim kayıp grafiği kaydedildi: {fig_path}")
+        print(f"[EVAL-LOSS] En düşük Validation Diffusion Loss: Epoch {best_epoch} (val_total={best_val_loss:.6f})")
+        return fig_path
 
     best_idx = int(df_loss["val_gen_total"].idxmin())
     best_epoch = int(df_loss.loc[best_idx, "epoch"])
@@ -246,8 +420,6 @@ def plot_training_loss_analysis(df_loss: pd.DataFrame, eval_out_dir: str, run_na
     else:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         axes = np.asarray(axes).ravel()
-
-    epochs = df_loss["epoch"].values
 
     # 1. Generator Total Loss
     ax = axes[0]
@@ -1264,6 +1436,46 @@ def evaluate_predictions_dir(
     return df_scorecard, df_metrics_full
 
 
+def _detect_model_type(run_dir: str, train_dir: str = None, df_loss: pd.DataFrame = None) -> str:
+    """Detect whether a run directory belongs to Diffusion or cGAN."""
+    import pickle
+    if df_loss is not None and not df_loss.empty:
+        if "model_type" in df_loss.columns and (df_loss["model_type"] == "diffusion").any():
+            return "Diffusion"
+        if "train_noise" in df_loss.columns and not df_loss["train_noise"].isna().all():
+            return "Diffusion"
+    cand_dirs = [d for d in (train_dir, run_dir) if d and os.path.isdir(d)]
+    for d in cand_dirs:
+        if os.path.exists(os.path.join(d, "denoiser_best.keras")) or os.path.exists(os.path.join(d, "denoiser_final.keras")):
+            return "Diffusion"
+        meta_p = os.path.join(d, "hicgan_metadata.pkl")
+        if os.path.exists(meta_p):
+            try:
+                with open(meta_p, "rb") as mf:
+                    mobj = pickle.load(mf)
+                if isinstance(mobj, dict):
+                    mt = str(mobj.get("modelType", "")).lower()
+                    if mt == "diffusion" or "timesteps" in mobj:
+                        return "Diffusion"
+                    if mt == "cgan":
+                        return "cGAN"
+            except Exception:
+                pass
+        tlog = os.path.join(d, "training.log")
+        if os.path.exists(tlog):
+            try:
+                with open(tlog, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read(65536)
+                if "HiCGAN-Diffusion" in txt or "denoiser_best.keras" in txt or "train_noise=" in txt:
+                    return "Diffusion"
+            except Exception:
+                pass
+    rlow = os.path.basename(os.path.normpath(run_dir)).lower()
+    if "diff" in rlow:
+        return "Diffusion"
+    return "cGAN"
+
+
 def compare_runs_leaderboard(
     search_root_dirs,
     npz_data_dir: str,
@@ -1271,11 +1483,13 @@ def compare_runs_leaderboard(
     chroms=None,
     eval_out_dir: str = None,
     max_runs: int = 8,
+    include_baseline_row: bool = True,
 ) -> pd.DataFrame:
     """
     Scan run directories in `search_root_dirs` (e.g. ['output_models', 'notebook_pipeline_output']),
     compute or load Core 5 Metrics + Composite Score (0-100) for each run that has predicted `.npz`
-    chromosome matrices, rank them in a Leaderboard DataFrame, and plot a Multi-Run Radar & Bar chart.
+    chromosome matrices, rank them (plus optional P(d) Baseline row) in a Leaderboard DataFrame,
+    and plot a Multi-Run Radar & Bar chart.
     """
     from . import utils
 
@@ -1287,12 +1501,19 @@ def compare_runs_leaderboard(
     def _resolve_npz_and_train_dirs(d):
         for cand_npz in (
             os.path.join(d, "predict_run", "npz_matrices"),
+            os.path.join(d, "test_eval", "npz_matrices"),
             os.path.join(d, "npz_matrices"),
             d,
         ):
             files = sorted(glob.glob(os.path.join(cand_npz, "chr*.npz")))
             if files:
-                t_dir = os.path.join(d, "train_run") if os.path.isdir(os.path.join(d, "train_run")) else d
+                if os.path.isdir(os.path.join(d, "train_run")):
+                    t_dir = os.path.join(d, "train_run")
+                elif os.path.basename(os.path.normpath(d)) in ("predict_run", "test_eval", "npz_matrices"):
+                    parent = os.path.dirname(os.path.normpath(d))
+                    t_dir = os.path.join(parent, "train_run") if os.path.isdir(os.path.join(parent, "train_run")) else parent
+                else:
+                    t_dir = d
                 return cand_npz, t_dir, files
         return None, None, []
 
@@ -1302,7 +1523,12 @@ def compare_runs_leaderboard(
         if not root or not os.path.exists(root):
             continue
         _, _, direct_files = _resolve_npz_and_train_dirs(root)
-        if direct_files or os.path.isdir(os.path.join(root, "predict_run")) or os.path.isdir(os.path.join(root, "train_run")):
+        if (
+            direct_files
+            or os.path.isdir(os.path.join(root, "predict_run"))
+            or os.path.isdir(os.path.join(root, "test_eval"))
+            or os.path.isdir(os.path.join(root, "train_run"))
+        ):
             candidates = [root]
         else:
             candidates = sorted(glob.glob(os.path.join(root, "run_*")))
@@ -1315,9 +1541,10 @@ def compare_runs_leaderboard(
                 run_dirs.append(cdir)
 
     leaderboard_rows = []
+    baseline_ref_chroms = []
     for rdir in run_dirs:
         rname = os.path.basename(os.path.normpath(rdir))
-        if rname == "npz_matrices":
+        if rname in ("npz_matrices", "predict_run", "test_eval"):
             rname = os.path.basename(os.path.dirname(os.path.normpath(rdir))) or rname
         pred_npz_dir, train_dir, npz_files = _resolve_npz_and_train_dirs(rdir)
         if not npz_files:
@@ -1334,6 +1561,7 @@ def compare_runs_leaderboard(
         for meta_cand in (
             os.path.join(train_dir, "hicgan_metadata.pkl"),
             os.path.join(rdir, "hicgan_metadata.pkl"),
+            os.path.join(os.path.dirname(pred_npz_dir), "predictions.pkl"),
             os.path.join(rdir, "predictions.pkl"),
         ):
             if os.path.exists(meta_cand):
@@ -1352,10 +1580,16 @@ def compare_runs_leaderboard(
 
         # Check best val loss from training history if available
         df_loss = parse_training_losses(train_dir)
+        if df_loss.empty and rdir != train_dir:
+            df_loss = parse_training_losses(rdir)
+        model_type = _detect_model_type(rdir, train_dir=train_dir, df_loss=df_loss)
+
         if not df_loss.empty:
             if ep == 0:
                 ep = int(len(df_loss))
-            if "val_pixel" in df_loss and not df_loss["val_pixel"].isna().all():
+            if "val_total" in df_loss and not df_loss["val_total"].isna().all():
+                best_val_loss = float(df_loss["val_total"].min())
+            elif "val_pixel" in df_loss and not df_loss["val_pixel"].isna().all():
                 best_val_loss = float(df_loss["val_pixel"].min())
             elif "val_gen_total" in df_loss and not df_loss["val_gen_total"].isna().all():
                 best_val_loss = float(df_loss["val_gen_total"].min())
@@ -1377,6 +1611,8 @@ def compare_runs_leaderboard(
                     crow = evaluate_chromosome_pair(gt_sp.toarray(), pr_sp.toarray(), chrom=chrom, include_baseline=True)
                     chrom_rows.append(crow)
                     chrom_names.append(f"chr{chrom}")
+                    if chrom not in baseline_ref_chroms:
+                        baseline_ref_chroms.append(chrom)
             except Exception as exc:
                 log.debug("Skipping %s in %s: %s", pfile, rname, str(exc))
 
@@ -1386,6 +1622,7 @@ def compare_runs_leaderboard(
         dfc = pd.DataFrame(chrom_rows)
         leaderboard_rows.append({
             "Run Adı": rname,
+            "Model Tipi": model_type,
             "Girdi Modu": input_mode,
             "Pencere Modu": window_mode,
             "WS": ws,
@@ -1405,6 +1642,42 @@ def compare_runs_leaderboard(
 
     if not leaderboard_rows:
         return pd.DataFrame()
+
+    if include_baseline_row and baseline_ref_chroms:
+        base_rows = []
+        base_chrom_names = []
+        for chrom in baseline_ref_chroms:
+            try:
+                gt_sp, _ = utils.getMatrixFromNpz(npz_data_dir, chrom, pBinSizeInt=bin_size)
+                gt_dense = gt_sp.toarray()
+                base_dense = build_distance_decay_baseline(gt_dense)
+                brow = evaluate_chromosome_pair(gt_dense, base_dense, chrom=chrom, include_baseline=False)
+                base_rows.append(brow)
+                base_chrom_names.append(f"chr{chrom}")
+            except Exception:
+                pass
+        if base_rows:
+            dfb = pd.DataFrame(base_rows)
+            bscore = float(dfb["Composite_Score_100"].mean())
+            leaderboard_rows.append({
+                "Run Adı": "Baseline: P(d) Mesafe Ortalaması",
+                "Model Tipi": "Baseline P(d)",
+                "Girdi Modu": "-",
+                "Pencere Modu": "-",
+                "WS": 0,
+                "Epoch": 0,
+                "Kromozomlar": ",".join(base_chrom_names),
+                "Bileşik Skor (0-100)": bscore,
+                "Baz Skor (0-100)": bscore,
+                "Skor Farkı (Δ vs Baz)": 0.0,
+                "AUPRC (GT>0)": float(dfb["AUPRC_GTpos"].mean()),
+                "AUPRC (Top %10)": float(dfb["AUPRC_Top10pct"].mean()),
+                "Katmanlı Spearman ρ(d)": float(dfb["DistStrat_Spearman_log1p"].mean()),
+                "Aktif Hücre r (GT>0)": float(dfb["Pearson_GTpos_log1p"].mean()),
+                "1B Marjinal Profil r": float(dfb["Marginal1D_Pearson_log1p"].mean()),
+                "SSIM (log1p)": float(dfb["SSIM_log1p"].mean()),
+                "Min Val Loss": np.nan,
+            })
 
     df_lb = pd.DataFrame(leaderboard_rows).sort_values("Bileşik Skor (0-100)", ascending=False).reset_index(drop=True)
     df_lb.insert(0, "Sıra", np.arange(1, len(df_lb) + 1))
@@ -1478,4 +1751,630 @@ def compare_runs_leaderboard(
         plt.close(fig)
 
     return df_lb
+
+
+def _resolve_model_run_artifacts(run_or_npz_dir: str, chroms=None):
+    """
+    Given a run root dir (containing train_run / predict_run / test_eval / npz_matrices)
+    or an npz_matrices / predict_run / test_eval dir,
+    resolve (chrom_to_npz_path, train_dir, predict_dir, metadata_dict).
+    """
+    import json
+    import pickle
+
+    d = os.path.abspath(run_or_npz_dir)
+    npz_dir = None
+    for cand in (
+        os.path.join(d, "predict_run", "npz_matrices"),
+        os.path.join(d, "test_eval", "npz_matrices"),
+        os.path.join(d, "npz_matrices"),
+        d,
+    ):
+        if glob.glob(os.path.join(cand, "chr*.npz")):
+            npz_dir = cand
+            break
+    if npz_dir is None:
+        raise FileNotFoundError(f"Predicted chr*.npz matrices not found under: {run_or_npz_dir}")
+
+    predict_dir = os.path.dirname(npz_dir) if os.path.basename(npz_dir) == "npz_matrices" else d
+    parent_of_pred = os.path.dirname(predict_dir)
+    if os.path.isdir(os.path.join(d, "train_run")):
+        train_dir = os.path.join(d, "train_run")
+    elif os.path.isdir(os.path.join(parent_of_pred, "train_run")):
+        train_dir = os.path.join(parent_of_pred, "train_run")
+    elif any(
+        os.path.exists(os.path.join(d, fn))
+        for fn in ("hicgan_metadata.pkl", "training.log", "target_value_range.json")
+    ):
+        train_dir = d
+    elif os.path.basename(predict_dir) in ("predict_run", "test_eval") and any(
+        os.path.exists(os.path.join(parent_of_pred, fn))
+        for fn in ("hicgan_metadata.pkl", "training.log", "target_value_range.json")
+    ):
+        train_dir = parent_of_pred
+    else:
+        train_dir = d
+
+    chrom_filter = {str(c).lstrip("chr") for c in chroms} if chroms else None
+    chrom_map = {}
+    for pfile in sorted(glob.glob(os.path.join(npz_dir, "chr*.npz"))):
+        chrom = os.path.splitext(os.path.basename(pfile))[0].lstrip("chr")
+        if chrom_filter is not None and chrom not in chrom_filter:
+            continue
+        chrom_map[chrom] = pfile
+
+    meta = {}
+    for pkl_cand in (
+        os.path.join(train_dir, "hicgan_metadata.pkl"),
+        os.path.join(d, "hicgan_metadata.pkl"),
+        os.path.join(predict_dir, "predictions.pkl"),
+        os.path.join(d, "predictions.pkl"),
+    ):
+        if os.path.exists(pkl_cand):
+            try:
+                with open(pkl_cand, "rb") as fh:
+                    obj = pickle.load(fh)
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k not in meta and v is not None:
+                            meta[k] = v
+            except Exception:
+                pass
+
+    for json_cand in (
+        os.path.join(train_dir, "target_value_range.json"),
+        os.path.join(d, "target_value_range.json"),
+    ):
+        if os.path.exists(json_cand):
+            try:
+                with open(json_cand, "r", encoding="utf-8") as fh:
+                    jobj = json.load(fh)
+                if isinstance(jobj, dict):
+                    if "targetNorm" not in meta and jobj.get("method"):
+                        meta["targetNorm"] = jobj.get("method")
+                    if "target_range_hi" not in meta and jobj.get("hi", jobj.get("max")) is not None:
+                        meta["target_range_hi"] = float(jobj.get("hi", jobj.get("max")))
+                    if "target_range_scale_factor" not in meta and jobj.get("scale_factor") is not None:
+                        meta["target_range_scale_factor"] = float(jobj.get("scale_factor"))
+            except Exception:
+                pass
+
+    return {
+        "root_dir": d,
+        "npz_dir": npz_dir,
+        "predict_dir": predict_dir,
+        "train_dir": train_dir,
+        "chrom_map": chrom_map,
+        "meta": meta,
+    }
+
+
+def _audit_comparison_fairness(cgan_info: dict, diff_info: dict, common_chroms: list, bin_size: int) -> dict:
+    """
+    Audit configuration parity between Phase 1 cGAN and Phase 2 Diffusion runs
+    so any discrepancy in splits, binSize, windowSize, gridStride, normalization,
+    SAT filtering, blendMode, dropout, or feature representation is explicitly logged.
+    """
+    m1 = cgan_info.get("meta", {})
+    m2 = diff_info.get("meta", {})
+    fields = [
+        "binSize",
+        "windowSize",
+        "windowMode",
+        "gridStride",
+        "inputMode",
+        "featureSet",
+        "usePairFeatures",
+        "filterEmptyWindows",
+        "targetNorm",
+        "target_range_hi",
+        "logTransformTarget",
+        "flankPadChromosomes",
+        "flankPadMaxBins",
+        "flankPadMinRatio",
+        "blendMode",
+        "dropout",
+        "seed",
+    ]
+    float_fields = {"target_range_hi", "dropout", "flankPadMinRatio"}
+    checks = {}
+    warnings = []
+    for k in fields:
+        v1 = m1.get(k)
+        v2 = m2.get(k)
+        if v1 is None and v2 is None:
+            status = "missing_both"
+        elif v1 is None or v2 is None:
+            status = "partial"
+            warnings.append(f"Field '{k}' only recorded in one run: cGAN={v1!r}, Diffusion={v2!r}")
+        else:
+            if k in float_fields:
+                try:
+                    is_eq = bool(np.isclose(float(v1), float(v2), rtol=1e-4, atol=1e-6))
+                except Exception:
+                    is_eq = (v1 == v2)
+            else:
+                is_eq = (v1 == v2)
+            if is_eq:
+                status = "match"
+            else:
+                status = "mismatch"
+                warnings.append(f"Mismatch on '{k}': cGAN={v1!r} vs Diffusion={v2!r}")
+        checks[k] = {"cgan": v1, "diffusion": v2, "status": status}
+
+    c_only = sorted(set(cgan_info["chrom_map"].keys()) - set(diff_info["chrom_map"].keys()))
+    d_only = sorted(set(diff_info["chrom_map"].keys()) - set(cgan_info["chrom_map"].keys()))
+    if c_only or d_only:
+        warnings.append(
+            f"Predicted chromosome sets differ (cGAN-only={c_only}, Diff-only={d_only}); "
+            f"strictly evaluating on intersection={common_chroms}."
+        )
+
+    has_mismatch = any(v["status"] == "mismatch" for v in checks.values())
+    return {
+        "fair_comparison": (not has_mismatch) and bool(common_chroms),
+        "bin_size_requested": int(bin_size),
+        "evaluated_chromosomes": [f"chr{c}" for c in common_chroms],
+        "cgan_only_chroms": [f"chr{c}" for c in c_only],
+        "diffusion_only_chroms": [f"chr{c}" for c in d_only],
+        "field_checks": checks,
+        "warnings": warnings,
+    }
+
+
+def compare_two_models(
+    cgan_dir: str,
+    diffusion_dir: str,
+    npz_data_dir: str,
+    eval_out_dir: str,
+    bin_size: int = 250000,
+    chroms=None,
+    cgan_name: str = "Phase 1: cGAN (rna-cgan-clean)",
+    diffusion_name: str = "Phase 2: Diffusion (rna-diffusion-clean)",
+    baseline_name: str = "Baseline: P(d) Mesafe Ortalaması",
+    chromatin_dir: str = None,
+    feature_set: str = "representative",
+    use_pair_features: bool = True,
+    max_heatmap_chroms: int = 4,
+) -> dict:
+    """
+    Fair head-to-head comparison between Phase 1 cGAN (`cgan_dir`),
+    Phase 2 Diffusion (`diffusion_dir`), and the `P(d)` Distance-Decay Baseline
+    on the exact chromosome intersection.
+
+    Writes:
+      - `fairness_audit.json`
+      - `per_chromosome_comparison.csv`
+      - `comparison_leaderboard.csv`
+      - `comparison_radar_and_bars.png`
+      - `comparison_per_chrom_scores.png`
+      - `comparison_distance_curves.png`
+      - `comparison_heatmaps_chr{c}.png` (for up to `max_heatmap_chroms`)
+    """
+    import json
+    from . import utils, featurePack
+
+    os.makedirs(eval_out_dir, exist_ok=True)
+    has_feature_pack = bool(chromatin_dir and featurePack.is_feature_pack_source(chromatin_dir))
+    cgan_info = _resolve_model_run_artifacts(cgan_dir, chroms=chroms)
+    diff_info = _resolve_model_run_artifacts(diffusion_dir, chroms=chroms)
+
+    common_chroms = sorted(
+        set(cgan_info["chrom_map"].keys()) & set(diff_info["chrom_map"].keys()),
+        key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+    )
+    if not common_chroms:
+        raise ValueError(
+            f"No overlapping predicted chr*.npz chromosomes found between cGAN ({cgan_info['npz_dir']}) "
+            f"and Diffusion ({diff_info['npz_dir']})."
+        )
+
+    fairness = _audit_comparison_fairness(cgan_info, diff_info, common_chroms, bin_size=bin_size)
+    fairness_path = os.path.join(eval_out_dir, "fairness_audit.json")
+    with open(fairness_path, "w", encoding="utf-8") as fh:
+        json.dump(fairness, fh, indent=2, default=str)
+
+    df_loss_cgan = parse_training_losses(cgan_info["train_dir"])
+    df_loss_diff = parse_training_losses(diff_info["train_dir"])
+
+    def _best_ep_and_loss(dfl):
+        if dfl is None or dfl.empty:
+            return 0, np.nan
+        col = "val_total" if ("val_total" in dfl.columns and not dfl["val_total"].isna().all()) else (
+            "val_pixel" if ("val_pixel" in dfl.columns and not dfl["val_pixel"].isna().all()) else "val_gen_total"
+        )
+        if col not in dfl.columns or dfl[col].isna().all():
+            return int(len(dfl)), np.nan
+        idx = int(dfl[col].idxmin())
+        return int(dfl.loc[idx, "epoch"]), float(dfl.loc[idx, col])
+
+    cgan_best_ep, cgan_best_loss = _best_ep_and_loss(df_loss_cgan)
+    diff_best_ep, diff_best_loss = _best_ep_and_loss(df_loss_diff)
+
+    per_chrom_rows = []
+    base_chrom_rows = []
+    cgan_chrom_rows = []
+    diff_chrom_rows = []
+    dist_curves_cgan = []
+    dist_curves_diff = []
+    heatmap_files = []
+
+    core_cols = [
+        "Composite_Score_100",
+        "AUPRC_GTpos",
+        "AUPRC_Top10pct",
+        "DistStrat_Spearman_log1p",
+        "DistStrat_Pearson_log1p",
+        "Pearson_GTpos_log1p",
+        "Marginal1D_Pearson_log1p",
+        "SSIM_log1p",
+        "Cosine_log1p",
+        "MAE_raw",
+        "RMSE_raw",
+        "Spearman_all_raw",
+    ]
+
+    for idx_c, chrom in enumerate(common_chroms):
+        gt_sp, _ = utils.getMatrixFromNpz(npz_data_dir, chrom, pBinSizeInt=bin_size)
+        cgan_sp = sparse.load_npz(cgan_info["chrom_map"][chrom])
+        diff_sp = sparse.load_npz(diff_info["chrom_map"][chrom])
+
+        if gt_sp.shape != cgan_sp.shape or gt_sp.shape != diff_sp.shape:
+            raise ValueError(
+                f"Shape mismatch on chr{chrom}: GT={gt_sp.shape}, cGAN={cgan_sp.shape}, Diffusion={diff_sp.shape}"
+            )
+
+        gt_dense = gt_sp.toarray()
+        cgan_dense = cgan_sp.toarray()
+        diff_dense = diff_sp.toarray()
+        base_dense = build_distance_decay_baseline(gt_dense)
+
+        row_base = evaluate_chromosome_pair(gt_dense, base_dense, chrom=chrom, include_baseline=False)
+        row_cgan = evaluate_chromosome_pair(gt_dense, cgan_dense, chrom=chrom, include_baseline=False)
+        row_diff = evaluate_chromosome_pair(gt_dense, diff_dense, chrom=chrom, include_baseline=False)
+        base_chrom_rows.append(row_base)
+        cgan_chrom_rows.append(row_cgan)
+        diff_chrom_rows.append(row_diff)
+
+        merged = {"Chromosome": f"chr{chrom}", "N_bins": int(gt_dense.shape[0])}
+        for k in core_cols:
+            merged[f"Baseline_{k}"] = float(row_base[k])
+            merged[f"cGAN_{k}"] = float(row_cgan[k])
+            merged[f"Diffusion_{k}"] = float(row_diff[k])
+            merged[f"Delta_Diff_minus_cGAN_{k}"] = float(row_diff[k] - row_cgan[k])
+        per_chrom_rows.append(merged)
+
+        dist_curves_cgan.append(compute_distance_curves(gt_dense, cgan_dense))
+        dist_curves_diff.append(compute_distance_curves(gt_dense, diff_dense))
+
+        if idx_c < max_heatmap_chroms:
+            input_mat = None
+            input_title = f"Girdi (Input) chr{chrom}"
+            input_xlabel = "Bin"
+            input_ylabel = "Bin"
+            if has_feature_pack:
+                try:
+                    n_bins = int(gt_dense.shape[0])
+                    pair_sp = None
+                    if use_pair_features:
+                        pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                    if pair_sp is not None and pair_sp.nnz > 0:
+                        input_mat = np.asarray(pair_sp.toarray(), dtype=np.float64)
+                        input_title = f"Girdi (Input)\n2D kmer7_revcomp_cosine chr{chrom}"
+                    else:
+                        feat_arr, _ = featurePack.get_chrom_bin_features(
+                            chromatin_dir, chrom, pFeatureSet=feature_set, pNumBins=n_bins
+                        )
+                        if feat_arr is not None and feat_arr.size > 0:
+                            input_mat = np.asarray(feat_arr, dtype=np.float64)
+                            input_title = f"Girdi (Input)\n1D {feature_set} ({feat_arr.shape[1]} ch) chr{chrom}"
+                            input_xlabel = "Feature Kanalı"
+                except Exception as exc:
+                    log.warning("Could not load comparison input features for chr%s: %s", chrom, str(exc))
+
+            fig = None
+            try:
+                gt_log = np.log1p(np.maximum(gt_dense, 0.0))
+                base_log = np.log1p(np.maximum(base_dense, 0.0))
+                cgan_log = np.log1p(np.maximum(cgan_dense, 0.0))
+                diff_log = np.log1p(np.maximum(diff_dense, 0.0))
+                vmax = float(np.percentile(gt_log[gt_log > 0], 99.5)) if np.any(gt_log > 0) else 1.0
+                vmax = max(vmax, 1e-3)
+
+                if input_mat is not None:
+                    fig, axes = plt.subplots(1, 6, figsize=(28, 4.4))
+                    inp_arr = np.asarray(input_mat, dtype=np.float64)
+                    inp_aspect = "equal" if (inp_arr.ndim == 2 and inp_arr.shape[0] == inp_arr.shape[1]) else "auto"
+                    im_in = axes[0].imshow(inp_arr, cmap="viridis", aspect=inp_aspect, origin="upper", interpolation="nearest")
+                    axes[0].set_title(input_title, fontsize=10, fontweight="bold")
+                    axes[0].set_xlabel(input_xlabel)
+                    axes[0].set_ylabel(input_ylabel)
+                    plt.colorbar(im_in, ax=axes[0], fraction=0.046, pad=0.04)
+                    mat_axes = axes[1:5]
+                    diff_ax = axes[5]
+                else:
+                    fig, axes = plt.subplots(1, 5, figsize=(23, 4.4))
+                    mat_axes = axes[:4]
+                    diff_ax = axes[4]
+
+                panels = [
+                    (gt_log, f"chr{chrom} Ground Truth (log1p)", "YlOrRd", 0.0, vmax),
+                    (base_log, f"Baseline P(d)\nScore={row_base['Composite_Score_100']:.1f}", "YlOrRd", 0.0, vmax),
+                    (cgan_log, f"cGAN\nScore={row_cgan['Composite_Score_100']:.1f}, AUPRC={row_cgan['AUPRC_GTpos']:.3f}", "YlOrRd", 0.0, vmax),
+                    (diff_log, f"Diffusion\nScore={row_diff['Composite_Score_100']:.1f}, AUPRC={row_diff['AUPRC_GTpos']:.3f}", "YlOrRd", 0.0, vmax),
+                ]
+                for ax, (mat, ttl, cm, v0, v1) in zip(mat_axes, panels):
+                    im = ax.imshow(mat, cmap=cm, vmin=v0, vmax=v1, origin="upper", interpolation="nearest")
+                    ax.set_title(ttl, fontsize=10, fontweight="bold")
+                    ax.set_xlabel("Bin")
+                    ax.set_ylabel("Bin")
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+                diff_map = diff_log - cgan_log
+                dlim = max(float(np.percentile(np.abs(diff_map), 99.5)), 1e-3)
+                im_d = diff_ax.imshow(diff_map, cmap="coolwarm", vmin=-dlim, vmax=dlim, origin="upper", interpolation="nearest")
+                diff_ax.set_title(f"Diff - cGAN (log1p)\nΔScore={row_diff['Composite_Score_100'] - row_cgan['Composite_Score_100']:+.2f}", fontsize=10, fontweight="bold")
+                diff_ax.set_xlabel("Bin")
+                plt.colorbar(im_d, ax=diff_ax, fraction=0.046, pad=0.04)
+
+                fig.suptitle(f"Model Karşılaştırma Isı Haritası — chr{chrom} ({bin_size // 1000} kb)", fontsize=12.5, fontweight="bold")
+                plt.tight_layout()
+                hm_path = os.path.join(eval_out_dir, f"comparison_heatmaps_chr{chrom}.png")
+                fig.savefig(hm_path, dpi=250, bbox_inches="tight")
+                heatmap_files.append(hm_path)
+            except Exception as exc:
+                log.warning("Could not generate comparison heatmap for chr%s: %s", chrom, str(exc))
+                print(f"[COMPARE-PLOT-WARN] comparison_heatmaps_chr{chrom}: {exc}", flush=True)
+            finally:
+                if fig is not None:
+                    plt.close(fig)
+
+    df_per_chrom = pd.DataFrame(per_chrom_rows)
+    per_chrom_csv = os.path.join(eval_out_dir, "per_chromosome_comparison.csv")
+    df_per_chrom.to_csv(per_chrom_csv, index=False)
+
+    df_b = pd.DataFrame(base_chrom_rows)
+    df_c = pd.DataFrame(cgan_chrom_rows)
+    df_d = pd.DataFrame(diff_chrom_rows)
+    base_score_mean = float(df_b["Composite_Score_100"].mean())
+    cgan_score_mean = float(df_c["Composite_Score_100"].mean())
+    diff_score_mean = float(df_d["Composite_Score_100"].mean())
+    chrom_label = ",".join(f"chr{c}" for c in common_chroms)
+
+    def _lb_row(name, mtype, dff, ep, vloss):
+        sc = float(dff["Composite_Score_100"].mean())
+        return {
+            "Model Adı": name,
+            "Model Tipi": mtype,
+            "Kromozomlar": chrom_label,
+            "Best Epoch": ep,
+            "Min Val Loss": vloss,
+            "Bileşik Skor (0-100)": sc,
+            "Δ vs P(d) Baz": sc - base_score_mean,
+            "Δ vs cGAN": sc - cgan_score_mean,
+            "AUPRC (GT>0)": float(dff["AUPRC_GTpos"].mean()),
+            "AUPRC (Top %10)": float(dff["AUPRC_Top10pct"].mean()),
+            "Katmanlı Spearman ρ(d)": float(dff["DistStrat_Spearman_log1p"].mean()),
+            "Aktif Hücre r (GT>0)": float(dff["Pearson_GTpos_log1p"].mean()),
+            "1B Marjinal Profil r": float(dff["Marginal1D_Pearson_log1p"].mean()),
+            "SSIM (log1p)": float(dff["SSIM_log1p"].mean()),
+            "MAE (raw)": float(dff["MAE_raw"].mean()),
+            "RMSE (raw)": float(dff["RMSE_raw"].mean()),
+        }
+
+    df_lb = pd.DataFrame([
+        _lb_row(diffusion_name, "Diffusion", df_d, diff_best_ep, diff_best_loss),
+        _lb_row(cgan_name, "cGAN", df_c, cgan_best_ep, cgan_best_loss),
+        _lb_row(baseline_name, "Baseline P(d)", df_b, 0, np.nan),
+    ]).sort_values("Bileşik Skor (0-100)", ascending=False).reset_index(drop=True)
+    df_lb.insert(0, "Sıra", np.arange(1, len(df_lb) + 1))
+    lb_csv = os.path.join(eval_out_dir, "comparison_leaderboard.csv")
+    df_lb.to_csv(lb_csv, index=False)
+
+    # Plot 1: Radar & Composite Score Bar Chart
+    radar_path = None
+    fig_radar = None
+    try:
+        labels = ["AUPRC\n(GT>0)", "AUPRC\n(Top %10)", "Katmanlı\nρ(d)", "Aktif Hücre\nr (GT>0)", "1B Marjinal\nProfil r", "SSIM\n(log1p)"]
+        angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
+        angles_closed = angles + [angles[0]]
+        fig_radar = plt.figure(figsize=(16, 6.2))
+        ax_radar = fig_radar.add_subplot(1, 2, 1, polar=True)
+        ax_bar = fig_radar.add_subplot(1, 2, 2)
+        palette = {"Diffusion": "#1f77b4", "cGAN": "#ff7f0e", "Baseline P(d)": "#7f7f7f"}
+
+        for _, r in df_lb.iterrows():
+            vals = [
+                float(np.clip(r["AUPRC (GT>0)"], 0.0, 1.0)),
+                float(np.clip(r["AUPRC (Top %10)"], 0.0, 1.0)),
+                float(np.clip(r["Katmanlı Spearman ρ(d)"], 0.0, 1.0)),
+                float(np.clip(r["Aktif Hücre r (GT>0)"], 0.0, 1.0)),
+                float(np.clip(r["1B Marjinal Profil r"], 0.0, 1.0)),
+                float(np.clip(r["SSIM (log1p)"], 0.0, 1.0)),
+            ]
+            col = palette.get(r["Model Tipi"], "#2ca02c")
+            ls = "--" if r["Model Tipi"] == "Baseline P(d)" else "-"
+            ax_radar.plot(angles_closed, vals + [vals[0]], "o" + ls, lw=2.2, color=col, label=f"#{int(r['Sıra'])} {r['Model Adı']}")
+            ax_radar.fill(angles_closed, vals + [vals[0]], color=col, alpha=0.08)
+
+        ax_radar.set_thetagrids(np.degrees(angles), labels, fontsize=9.5)
+        ax_radar.set_ylim(0.0, 1.0)
+        ax_radar.set_title("Model Radar Karşılaştırması", pad=18, fontsize=12, fontweight="bold")
+        ax_radar.legend(loc="upper right", bbox_to_anchor=(1.35, 1.15), fontsize=8.5)
+
+        y_pos = np.arange(len(df_lb))
+        scores = df_lb["Bileşik Skor (0-100)"].values
+        bar_cols = [palette.get(mt, "#2ca02c") for mt in df_lb["Model Tipi"]]
+        ax_bar.barh(y_pos, scores, height=0.52, color=bar_cols, alpha=0.88)
+        ax_bar.axvline(base_score_mean, color="#333333", ls="--", lw=1.4, label=f"P(d) Baz ({base_score_mean:.2f})")
+        for i, sc in enumerate(scores):
+            ax_bar.text(sc + 0.8, i, f"{sc:.2f}/100", va="center", ha="left", fontsize=9.5, fontweight="bold")
+        ax_bar.set_yticks(y_pos)
+        ax_bar.set_yticklabels([f"#{int(r['Sıra'])} {r['Model Adı']}" for _, r in df_lb.iterrows()], fontsize=9.5)
+        ax_bar.invert_yaxis()
+        ax_bar.set_xlim(0, max(float(np.max(scores)), base_score_mean, 50.0) * 1.25)
+        ax_bar.set_xlabel("Bileşik Kalite Skoru (0 - 100)")
+        ax_bar.set_title(f"Adil Karşılaştırma Liderlik Tablosu (Δ Diff-cGAN = {diff_score_mean - cgan_score_mean:+.2f})", fontsize=12, fontweight="bold")
+        ax_bar.grid(True, axis="x", alpha=0.3)
+        ax_bar.legend(loc="lower right")
+        plt.tight_layout()
+        cand_radar = os.path.join(eval_out_dir, "comparison_radar_and_bars.png")
+        fig_radar.savefig(cand_radar, dpi=250, bbox_inches="tight")
+        radar_path = cand_radar
+    except Exception as exc:
+        log.warning("Could not generate comparison plot 'comparison_radar_and_bars': %s", str(exc))
+        print(f"[COMPARE-PLOT-WARN] comparison_radar_and_bars: {exc}", flush=True)
+    finally:
+        if fig_radar is not None:
+            plt.close(fig_radar)
+
+    # Plot 2: Per-chromosome comparison bars + delta
+    per_chrom_png = None
+    fig_pc = None
+    try:
+        fig_pc, (ax_sc, ax_dl) = plt.subplots(1, 2, figsize=(15, 5.2))
+        x = np.arange(len(df_per_chrom))
+        w = 0.25
+        ax_sc.bar(x - w, df_per_chrom["Baseline_Composite_Score_100"], width=w, color="#7f7f7f", label="Baseline P(d)")
+        ax_sc.bar(x, df_per_chrom["cGAN_Composite_Score_100"], width=w, color="#ff7f0e", label="cGAN")
+        ax_sc.bar(x + w, df_per_chrom["Diffusion_Composite_Score_100"], width=w, color="#1f77b4", label="Diffusion")
+        ax_sc.set_xticks(x)
+        ax_sc.set_xticklabels(df_per_chrom["Chromosome"])
+        ax_sc.set_ylabel("Bileşik Skor (0-100)")
+        ax_sc.set_title("Kromozom Bazlı Bileşik Skor")
+        ax_sc.grid(True, axis="y", alpha=0.3)
+        ax_sc.legend()
+
+        deltas = df_per_chrom["Delta_Diff_minus_cGAN_Composite_Score_100"].values
+        dcols = ["#2ca02c" if d >= 0 else "#d62728" for d in deltas]
+        ax_dl.bar(x, deltas, width=0.45, color=dcols, alpha=0.85)
+        ax_dl.axhline(0.0, color="#333333", lw=1.1)
+        for i, dval in enumerate(deltas):
+            ax_dl.text(i, dval + (0.4 if dval >= 0 else -0.8), f"{dval:+.2f}", ha="center", va="bottom" if dval >= 0 else "top", fontsize=9, fontweight="bold")
+        ax_dl.set_xticks(x)
+        ax_dl.set_xticklabels(df_per_chrom["Chromosome"])
+        ax_dl.set_ylabel("Skor Farkı (Diffusion - cGAN)")
+        ax_dl.set_title("Kromozom Bazlı Δ (Diffusion - cGAN)")
+        ax_dl.grid(True, axis="y", alpha=0.3)
+        plt.tight_layout()
+        cand_pc = os.path.join(eval_out_dir, "comparison_per_chrom_scores.png")
+        fig_pc.savefig(cand_pc, dpi=250, bbox_inches="tight")
+        per_chrom_png = cand_pc
+    except Exception as exc:
+        log.warning("Could not generate comparison plot 'comparison_per_chrom_scores': %s", str(exc))
+        print(f"[COMPARE-PLOT-WARN] comparison_per_chrom_scores: {exc}", flush=True)
+    finally:
+        if fig_pc is not None:
+            plt.close(fig_pc)
+
+    # Plot 3: Mean Distance Decay & Distance-Stratified Correlation
+    dist_png = None
+    fig_dist = None
+    try:
+        min_len = min(min(len(dc["distances"]) for dc in dist_curves_cgan), min(len(dc["distances"]) for dc in dist_curves_diff))
+        min_len = min(min_len, 80)
+        if min_len >= 2:
+            dists = dist_curves_cgan[0]["distances"][:min_len]
+            gt_d = np.nanmean([dc["gt_pd_raw"][:min_len] for dc in dist_curves_cgan], axis=0)
+            cgan_d = np.nanmean([dc["pred_pd_raw"][:min_len] for dc in dist_curves_cgan], axis=0)
+            diff_d = np.nanmean([dc["pred_pd_raw"][:min_len] for dc in dist_curves_diff], axis=0)
+
+            def _safe_nanmean(arrays):
+                stacked = np.vstack(arrays)
+                out = np.full(stacked.shape[1], np.nan, dtype=np.float64)
+                valid = ~np.all(np.isnan(stacked), axis=0)
+                if np.any(valid):
+                    out[valid] = np.nanmean(stacked[:, valid], axis=0)
+                return out
+
+            cgan_rho = _safe_nanmean([dc["spearman_by_d"][:min_len] for dc in dist_curves_cgan])
+            diff_rho = _safe_nanmean([dc["spearman_by_d"][:min_len] for dc in dist_curves_diff])
+
+            fig_dist, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5.2))
+            ax1.plot(dists, gt_d, "k-", lw=2.2, label="Ground Truth (GT)")
+            ax1.plot(dists, cgan_d, "--", color="#ff7f0e", lw=2.0, label="Phase 1: cGAN")
+            ax1.plot(dists, diff_d, "-", color="#1f77b4", lw=2.0, label="Phase 2: Diffusion")
+            if np.any(gt_d > 0) or np.any(cgan_d > 0) or np.any(diff_d > 0):
+                ax1.set_yscale("log")
+            ax1.set_xlabel("Genomik Mesafe d (bin)")
+            ax1.set_ylabel("Ortalama Kontak P(d)")
+            ax1.set_title("Mesafe Bozunma Eğrisi P(d)")
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+
+            ax2.plot(dists, cgan_rho, "--", color="#ff7f0e", lw=2.0, label="Phase 1: cGAN")
+            ax2.plot(dists, diff_rho, "-", color="#1f77b4", lw=2.0, label="Phase 2: Diffusion")
+            ax2.axhline(0.0, color="#666666", lw=0.9, ls=":")
+            ax2.set_xlabel("Genomik Mesafe d (bin)")
+            ax2.set_ylabel("Spearman ρ(d)")
+            ax2.set_title("Mesafeye Göre Katmanlı Spearman Korelasyonu")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+            plt.tight_layout()
+            cand_dist = os.path.join(eval_out_dir, "comparison_distance_curves.png")
+            fig_dist.savefig(cand_dist, dpi=250, bbox_inches="tight")
+            dist_png = cand_dist
+    except Exception as exc:
+        log.warning("Could not generate comparison plot 'comparison_distance_curves': %s", str(exc))
+        print(f"[COMPARE-PLOT-WARN] comparison_distance_curves: {exc}", flush=True)
+    finally:
+        if fig_dist is not None:
+            plt.close(fig_dist)
+
+    print(f"[COMPARE] Adil Karşılaştırma tamamlandı -> {eval_out_dir}")
+    print(f"[COMPARE] Fairness check: fair_comparison={fairness['fair_comparison']} | warnings={len(fairness['warnings'])}")
+    print(df_lb.to_string(index=False))
+
+    return {
+        "leaderboard": df_lb,
+        "per_chromosome": df_per_chrom,
+        "fairness_audit": fairness,
+        "summary_metrics": {
+            "baseline_composite": base_score_mean,
+            "cgan_composite": cgan_score_mean,
+            "diffusion_composite": diff_score_mean,
+            "delta_diff_minus_cgan": diff_score_mean - cgan_score_mean,
+        },
+        "files": {
+            "fairness_audit": fairness_path,
+            "leaderboard_csv": lb_csv,
+            "per_chromosome_csv": per_chrom_csv,
+            "radar_bar_png": radar_path,
+            "per_chrom_png": per_chrom_png,
+            "distance_curves_png": dist_png,
+            "heatmap_pngs": heatmap_files,
+        },
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare Phase 1 cGAN and Phase 2 Diffusion predictions fairly.")
+    parser.add_argument("--cganDir", required=True, help="cGAN run directory or predict_run/npz_matrices directory")
+    parser.add_argument("--diffusionDir", required=True, help="Diffusion run directory or predict_run/npz_matrices directory")
+    parser.add_argument("--gtDir", required=True, help="Ground-truth .npz matrices directory")
+    parser.add_argument("--outDir", required=True, help="Output directory for comparison CSVs, JSON audit, and plots")
+    parser.add_argument("--chroms", nargs="*", default=None, help="Optional chromosome filter (e.g. 2 6 12)")
+    parser.add_argument("--binSize", type=int, default=250000, help="Bin size in bp (default: 250000)")
+    parser.add_argument("--cganName", default="Phase 1: cGAN (rna-cgan-clean)", help="Display name for cGAN")
+    parser.add_argument("--diffusionName", default="Phase 2: Diffusion (rna-diffusion-clean)", help="Display name for Diffusion")
+    parser.add_argument("--chromatinDir", default=None, help="Optional chromatin feature pack directory")
+    parser.add_argument("--featureSet", default="representative", help="Feature set name")
+    parser.add_argument("--noPairFeatures", action="store_true", help="Disable pair features flag")
+    args = parser.parse_args()
+
+    compare_two_models(
+        cgan_dir=args.cganDir,
+        diffusion_dir=args.diffusionDir,
+        npz_data_dir=args.gtDir,
+        eval_out_dir=args.outDir,
+        bin_size=args.binSize,
+        chroms=args.chroms,
+        cgan_name=args.cganName,
+        diffusion_name=args.diffusionName,
+        chromatin_dir=args.chromatinDir,
+        feature_set=args.featureSet,
+        use_pair_features=(not args.noPairFeatures),
+    )
+
 

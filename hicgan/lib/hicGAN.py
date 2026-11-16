@@ -8,10 +8,8 @@ from tqdm import tqdm
 from . import utils
 import re
 
-#implementation of adapted pix2pix cGAN
-#modified from tensorflow tutorial https://www.tensorflow.org/tutorials/generative/pix
-#also see: https://machinelearningmastery.com/how-to-implement-pix2pix-gan-models-from-scratch-with-keras/
-
+# Conditional DDPM / DDIM Diffusion model sharing the Phase 1 1D->2D chromatin condition encoder
+# and U-Net backbone for fair comparison against Pix2Pix cGAN (rna-cgan-clean).
 
 import logging
 log = logging.getLogger(__name__)
@@ -110,24 +108,45 @@ def build_condition_encoder(
     return model
 
 
+@tf.keras.utils.register_keras_serializable(package="hicgan")
+class SpatialTimeEncoding(tf.keras.layers.Layer):
+    """Broadcast normalized diffusion timestep t / T into a (batch, W, W, 1) spatial map."""
+    def __init__(self, timesteps: int = 1000, **kwargs):
+        super().__init__(**kwargs)
+        self.timesteps = float(timesteps)
+
+    def call(self, inputs):
+        ref_tensor, t = inputs
+        t_scaled = tf.cast(t, ref_tensor.dtype) / tf.cast(self.timesteps, ref_tensor.dtype)
+        t_expanded = tf.reshape(t_scaled, [-1, 1, 1, 1])
+        ref_shape = tf.shape(ref_tensor)
+        return tf.broadcast_to(t_expanded, [ref_shape[0], ref_shape[1], ref_shape[2], 1])
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"timesteps": self.timesteps})
+        return cfg
+
+
 class HiCGAN():
-    def __init__(self, log_dir: str, 
+    def __init__(self, log_dir: str,
                     number_factors: int,
-                    loss_weight_pixel: float = 100, #factor for L1/L2 loss, like Isola et al. 2017
-                    loss_weight_adversarial: float = 1.0, #factor for adversarial loss in generator
-                    loss_weight_discriminator: float = 0.5, #factor for disc loss, like Isola et al. 2017
-                    loss_weight_tv: float = 1e-10, #factor for TV loss
-                    loss_type_pixel: str = "L1", #type of per-pixel error (L1, L2)
-                    foreground_loss_weight: float = 10.0, #extra weight for non-zero foreground contacts (target > 0)
-                    underpred_boost_factor: float = 1.5, #multiplier for under-predicting active contacts (gen_output < target)
-                    dropout_rate: float = 0.0, #U-Net upsampling dropout rate (default 0.0 for deterministic regression)
-                    decay_steps: int = None, #total optimizer steps for CosineDecay LR schedule
-                    lr_alpha: float = 0.05, #final LR fraction for CosineDecay
+                    timesteps: int = 1000,
+                    sample_steps: int = 25,
+                    loss_weight_pixel: float = 1.0,
+                    foreground_loss_weight: float = 15.0,
+                    peak_loss_weight: float = 10.0,
+                    x0_loss_weight: float = 1.0,
+                    bg_l1_weight: float = 0.5,
+                    leaky_clip_slope: float = 0.25,
+                    dropout_rate: float = 0.0,
+                    decay_steps: int = None,
+                    lr_alpha: float = 0.05,
                     input_size: int = 256,
                     plot_frequency: int = 20,
                     plot_type: str = "png",
-                    learning_rate_generator: float = 2e-5,
-                    learning_rate_discriminator: float = 1e-6,
+                    learning_rate: float = 2e-5,
+                    learning_rate_generator: float = None,
                     adam_beta_1: float = 0.5,
                     pretrained_model_path: str = "",
                     scope=None,
@@ -137,10 +156,6 @@ class HiCGAN():
                     enforce_symmetry: bool = True,
                     use_pair_features: bool = False):
         super().__init__()
-        # When True, optimizers are wrapped for loss scaling and the loss
-        # functions cast their inputs to float32. The global mixed_float16
-        # policy itself is set by the caller (training.main) before this model
-        # is constructed so that all layers pick it up.
         self.mixed_precision = mixed_precision
         self.use_embedding = bool(use_embedding)
         self.enforce_symmetry = bool(enforce_symmetry)
@@ -149,94 +164,102 @@ class HiCGAN():
         self.INPUT_CHANNELS = 1
         self.EMBEDDING_CHANNELS = 16
         self.input_size = 256
-        if input_size in [64,128,256, 512, 768, 1024]:
+        if input_size in [64, 128, 256, 512, 768, 1024]:
             self.input_size = input_size
         self.number_factors = number_factors
         self.use_pair_features = bool(use_pair_features) and (self.number_factors > self.input_size)
-        self.loss_weight_pixel = loss_weight_pixel
-        self.loss_weight_discriminator = loss_weight_discriminator
-        self.loss_weight_adversarial = loss_weight_adversarial
-        self.loss_weight_tv = loss_weight_tv
-        self.loss_type_pixel = loss_type_pixel
-        self.foreground_loss_weight = float(foreground_loss_weight)
-        self.underpred_boost_factor = float(underpred_boost_factor)
+
+        # Forward DDPM diffusion schedule: beta_0 = 0.0 (alpha_bar_0 = 1.0), linear betas for t = 1..T
+        self.timesteps = max(1, int(timesteps))
+        self.sample_steps = max(1, int(sample_steps))
+        beta_start = 1e-4
+        beta_end = 0.02
+        betas_steps = tf.cast(tf.linspace(beta_start, beta_end, self.timesteps), tf.float32)
+        self.betas = tf.concat([[0.0], betas_steps], axis=0)
+        self.alphas = 1.0 - self.betas
+        self.alphas_bar = tf.math.cumprod(self.alphas)
+
+        self.loss_weight_pixel = float(loss_weight_pixel)
+        self.fg_weight = float(foreground_loss_weight)
+        self.peak_weight = float(peak_loss_weight)
+        self.x0_loss_weight = float(x0_loss_weight)
+        self.bg_l1_weight = float(bg_l1_weight)
+        self.leaky_clip_slope = float(leaky_clip_slope)
         self.dropout_rate = float(dropout_rate)
         self.decay_steps = int(decay_steps) if (decay_steps is not None and int(decay_steps) > 0) else None
         self.lr_alpha = float(lr_alpha)
 
+        eff_lr = float(learning_rate_generator if learning_rate_generator is not None else learning_rate)
+
         init_msg = (
-            f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
+            f"[MODEL-INIT] HiCGAN-Diffusion configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
+            f"timesteps={self.timesteps}, sample_steps={self.sample_steps}, "
             f"use_embedding={self.use_embedding} ({'1D -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
             f"use_pair_features={self.use_pair_features}, enforce_symmetry={self.enforce_symmetry}, "
-            f"loss_type_pixel={self.loss_type_pixel}, foreground_loss_weight={self.foreground_loss_weight}, "
-            f"underpred_boost_factor={self.underpred_boost_factor}, dropout_rate={self.dropout_rate}, "
-            f"decay_steps={self.decay_steps}, mixed_precision={self.mixed_precision}"
+            f"fg_weight={self.fg_weight}, peak_weight={self.peak_weight}, x0_loss_weight={self.x0_loss_weight}, "
+            f"bg_l1_weight={self.bg_l1_weight}, leaky_clip_slope={self.leaky_clip_slope}, "
+            f"dropout_rate={self.dropout_rate}, lr={eff_lr:.2e}, decay_steps={self.decay_steps}, mixed_precision={self.mixed_precision}"
         )
         log.info(init_msg)
         print(init_msg)
 
         if self.decay_steps is not None:
-            gen_lr = tf.keras.optimizers.schedules.CosineDecay(
-                initial_learning_rate=float(learning_rate_generator),
-                decay_steps=self.decay_steps,
-                alpha=self.lr_alpha,
-            )
-            disc_lr = tf.keras.optimizers.schedules.CosineDecay(
-                initial_learning_rate=float(learning_rate_discriminator),
+            opt_lr = tf.keras.optimizers.schedules.CosineDecay(
+                initial_learning_rate=eff_lr,
                 decay_steps=self.decay_steps,
                 alpha=self.lr_alpha,
             )
         else:
-            gen_lr = float(learning_rate_generator)
-            disc_lr = float(learning_rate_discriminator)
+            opt_lr = eff_lr
 
-        self.generator_optimizer = tf.keras.optimizers.Adam(learning_rate=gen_lr, beta_1=adam_beta_1, name="Adam_Generator")
-        self.discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=disc_lr, beta_1=adam_beta_1, name="Adam_Discriminator")
+        self.denoiser_optimizer = tf.keras.optimizers.Adam(learning_rate=opt_lr, beta_1=adam_beta_1, name="Adam_Denoiser")
         if self.mixed_precision:
-            # Dynamic loss scaling to keep float16 gradients from underflowing.
-            self.generator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.generator_optimizer)
-            self.discriminator_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.discriminator_optimizer)
+            self.denoiser_optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.denoiser_optimizer)
 
         if self.use_embedding:
             self.condition_encoder = self.build_condition_encoder()
-            self.generator_embedding = self.condition_encoder
-            self.discriminator_embedding = self.build_condition_encoder()
+            cond_channels = self.EMBEDDING_CHANNELS
         else:
             self.condition_encoder = None
-            self.generator_embedding = None
-            self.discriminator_embedding = None
-        self.generator = self.Generator()
-        self.discriminator = self.Discriminator()
+            cond_channels = self.INPUT_CHANNELS
 
-        self.log_dir=log_dir
-        
+        self.unet_denoiser = self._build_unet_denoiser(cond_channels=cond_channels)
+        self.denoiser = self.Denoiser()
+
+        self.log_dir = log_dir
         self.checkpoint_dir = os.path.join(self.log_dir, 'training_checkpoints')
         self.checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
-        self.checkpoint = tf.train.Checkpoint(generator_optimizer=self.generator_optimizer,
-                                    discriminator_optimizer=self.discriminator_optimizer,
-                                    generator=self.generator,
-                                    discriminator=self.discriminator)
+        self.checkpoint = tf.train.Checkpoint(
+            denoiser_optimizer=self.denoiser_optimizer,
+            denoiser=self.denoiser,
+            ckpt_epoch=tf.Variable(0, trainable=False, dtype=tf.int64, name="ckpt_epoch"),
+        )
+        self.ckpt_epoch = self.checkpoint.ckpt_epoch
         self.start_epoch = 0
         if restore_checkpoint:
             latest_checkpoint = tf.train.latest_checkpoint(self.checkpoint_dir)
             print(f"Current checkpoint directory: {self.checkpoint_dir}")
             if latest_checkpoint:
                 print(f"Restoring from checkpoint: {latest_checkpoint}")
-                self.checkpoint.restore(latest_checkpoint)
-                basename = os.path.basename(latest_checkpoint)
-                m = re.search(r'ckpt-(\d+)$', basename)
-                if m:
-                    ckpt_num = int(m.group(1))
+                self.checkpoint.restore(latest_checkpoint).expect_partial()
+                stored_ep = int(self.ckpt_epoch.numpy())
+                if stored_ep > 0:
+                    ckpt_num = stored_ep
                 else:
-                    try:
-                        ckpt_num = int(basename.split('-')[-1])
-                    except Exception:
-                        ckpt_num = 0
-                # self.__epoch_counter = ckpt_num
+                    basename = os.path.basename(latest_checkpoint)
+                    m = re.search(r'ckpt-(\d+)$', basename)
+                    if m:
+                        ckpt_num = int(m.group(1))
+                    else:
+                        try:
+                            ckpt_num = int(basename.split('-')[-1])
+                        except Exception:
+                            ckpt_num = 0
                 self.start_epoch = ckpt_num
-                print(f"Resuming from checkpoint #{ckpt_num}.")
+                print(f"Resuming from checkpoint epoch #{ckpt_num}.")
             else:
                 print("No checkpoint found. Starting from scratch.")
+
         self.plot_type = plot_type
         if self.plot_type not in ["png", "pdf", "svg"]:
             self.plot_type = "png"
@@ -245,34 +268,31 @@ class HiCGAN():
         self.progress_plot_frequency = plot_frequency
         self.example_plot_frequency = 5
 
-        #losses per epochs
-        self.__gen_train_loss_epochs = []
-        self.__gen_train_pixel_loss_epochs = []
-        self.__gen_train_adv_loss_epochs = []
-        self.__gen_train_tv_loss_epochs = []
-        self.__disc_train_loss_true_epochs = []
-        self.__disc_train_loss_fake_epochs = []
-        self.__gen_val_loss_epochs = []
-        self.__gen_val_pixel_loss_epochs = []
-        self.__gen_val_adv_loss_epochs = []
-        self.__gen_val_tv_loss_epochs = []
-        self.__disc_val_loss_epochs = []
-        #losses per batch
-        self.__gen_train_loss_batches = []
-        self.__gen_train_pixel_loss_batches = []
-        self.__gen_train_adv_loss_batches = []
-        self.__gen_train_tv_loss_batches = []
-        self.__disc_train_loss_true_batches = []
-        self.__disc_train_loss_fake_batches = []
-        self.__gen_val_loss_batches = []
-        self.__gen_val_pixel_loss_batches = []
-        self.__gen_val_adv_loss_batches = []
-        self.__gen_val_tv_loss_batches = []
-        self.__disc_val_loss_batches = []
+        # Losses per epoch
+        self.__diff_train_loss_epochs = []
+        self.__diff_train_noise_loss_epochs = []
+        self.__diff_train_x0_loss_epochs = []
+        self.__diff_train_bg_loss_epochs = []
+        self.__diff_val_loss_epochs = []
+        self.__diff_val_noise_loss_epochs = []
+        self.__diff_val_x0_loss_epochs = []
+        self.__diff_val_bg_loss_epochs = []
+
+        # Losses per batch
+        self.__diff_train_loss_batches = []
+        self.__diff_train_noise_loss_batches = []
+        self.__diff_train_x0_loss_batches = []
+        self.__diff_train_bg_loss_batches = []
+        self.__diff_val_loss_batches = []
+        self.__diff_val_noise_loss_batches = []
+        self.__diff_val_x0_loss_batches = []
+        self.__diff_val_bg_loss_batches = []
 
         self.__epoch_counter = 0
         self.__batch_counter = 0
 
+        if scope is None:
+            scope = tf.distribute.get_strategy()
         self.scope = scope
 
     def build_condition_encoder(self, nr_filters_list=[128, 128, 64, 32], kernel_width_list=[5, 5, 5, 5], apply_dropout: bool = False):
@@ -299,7 +319,7 @@ class HiCGAN():
         initializer = tf.random_normal_initializer(0., 0.02)
         result = tf.keras.Sequential()
         result.add(Conv2D(filters, size, strides=2, padding='same',
-                                kernel_initializer=initializer, use_bias=False))
+                          kernel_initializer=initializer, use_bias=False))
         if apply_batchnorm:
             n_groups = min(32, max(1, filters // 8))
             result.add(GroupNormalization(groups=n_groups, axis=-1))
@@ -311,9 +331,9 @@ class HiCGAN():
         initializer = tf.random_normal_initializer(0., 0.02)
         result = tf.keras.Sequential()
         result.add(Conv2DTranspose(filters, size, strides=2,
-                                            padding='same',
-                                            kernel_initializer=initializer,
-                                            use_bias=False))
+                                   padding='same',
+                                   kernel_initializer=initializer,
+                                   use_bias=False))
         n_groups = min(32, max(1, filters // 8))
         result.add(GroupNormalization(groups=n_groups, axis=-1))
         if apply_dropout and dropout_rate > 0.0:
@@ -321,15 +341,20 @@ class HiCGAN():
         result.add(ReLU())
         return result
 
+    def _build_unet_denoiser(self, cond_channels: int):
+        """
+        Core U-Net denoiser operating on [noisy_target (W,W,1), cond_emb (W,W,C_emb), time_step (1,)].
+        Matches Phase 1 Generator U-Net depth, widths, GroupNormalization, and Dropout exactly,
+        replacing the final Symmetrize2DLayer + sigmoid head with unconstrained linear noise prediction.
+        Separating this sub-model allows `condition_encoder` to be computed ONCE and cached across
+        all 25 DDIM reverse diffusion steps during inference.
+        """
+        noisy_target = tf.keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="noisy_target_core")
+        cond_emb = tf.keras.layers.Input(shape=[self.input_size, self.input_size, cond_channels], name="cond_emb_core")
+        time_step = tf.keras.layers.Input(shape=[1], name="time_step_core")
 
-    def Generator(self):
-        if self.use_embedding:
-            inputs = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name="factorData")
-            x_emb = self.generator_embedding(inputs)
-        else:
-            inputs = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name="factorData")
-            x_emb = inputs
-        x = x_emb
+        time_map = SpatialTimeEncoding(timesteps=self.timesteps, name="spatial_time_encoding")([noisy_target, time_step])
+        x = tf.keras.layers.Concatenate(axis=-1, name="diff_concat_inputs")([noisy_target, cond_emb, time_map])
 
         num_downsamples = int(np.round(np.log2(self.input_size)))
         down_filters = [min(64 * (2 ** i), 512) for i in range(num_downsamples)]
@@ -352,7 +377,6 @@ class HiCGAN():
 
         initializer = tf.random_normal_initializer(0., 0.02)
 
-        # Downsampling through the model
         skips = []
         for down in down_stack:
             x = down(x)
@@ -360,172 +384,192 @@ class HiCGAN():
 
         skips = reversed(skips[:-1])
 
-        # Upsampling and establishing the skip connections
         for up, skip in zip(up_stack, skips):
             x = up(x)
             x = tf.keras.layers.Concatenate()([x, skip])
 
-        # Upsample to full (W, W) resolution and fuse with full-resolution pairwise & distance embedding x_emb
+        # Upsample to full (W, W) resolution and fuse with full-resolution condition embedding `cond_emb`
         x = tf.keras.layers.Conv2DTranspose(32, 4, strides=2, padding='same', kernel_initializer=initializer, use_bias=False)(x)
         x = GroupNormalization(groups=8, axis=-1)(x)
         x = LeakyReLU(alpha=0.2)(x)
-        x = tf.keras.layers.Concatenate()([x, x_emb])
+        x = tf.keras.layers.Concatenate()([x, cond_emb])
         x = Conv2D(32, 3, strides=1, padding='same', kernel_initializer=initializer)(x)
         x = LeakyReLU(alpha=0.2)(x)
+        # Unconstrained linear noise prediction epsilon_hat (no Symmetrize2DLayer, no sigmoid)
         x = Conv2D(self.OUTPUT_CHANNELS, 1, strides=1, padding='same', kernel_initializer=initializer)(x)
 
-        #enforce symmetry only in diagonal window mode
-        if self.enforce_symmetry:
-            x = Symmetrize2DLayer(name="gen_symmetrize")(x)
-        x = tf.keras.layers.Activation("sigmoid")(x)
+        return tf.keras.Model(inputs=[noisy_target, cond_emb, time_step], outputs=x, name="UNet_Diffusion_Core")
 
-        return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
-
-
-    def generator_loss(self, disc_generated_output, gen_output, target):
-        # Compute the loss in float32 (no-op without mixed precision; required
-        # for numerical stability and dtype matching when float16 is active).
-        disc_generated_output = tf.cast(disc_generated_output, tf.float32)
-        gen_output = tf.cast(gen_output, tf.float32)
-        target = tf.cast(target, tf.float32)
-        advers_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_generated_output), logits=disc_generated_output) )
-        # Per-pixel error (L1 or L2) with Foreground-Weighted + Peak-Proportional + Under-Prediction Penalty
-        if self.loss_type_pixel == "L1":
-            per_pixel_err = tf.abs(target - gen_output)
-        else: 
-            per_pixel_err = tf.square(target - gen_output)
-
-        if self.foreground_loss_weight > 0.0:
-            fg_mask = tf.cast(target > 1e-5, tf.float32)
-            # Active contacts (target > 0) receive (1 + foreground_loss_weight * (1 + 2 * target)) weight
-            # so sparse peaks in P99 log-scaled space are not squashed toward 0.
-            pixel_weights = 1.0 + float(self.foreground_loss_weight) * fg_mask * (
-                1.0 + 2.0 * tf.clip_by_value(target, 0.0, 1.0)
-            )
-            # Penalize under-predicting active contacts (gen_output < target) by underpred_boost_factor
-            underpred_boost = 1.0 + (self.underpred_boost_factor - 1.0) * fg_mask * tf.cast(gen_output < target, tf.float32)
-            pixel_loss = tf.reduce_mean(pixel_weights * underpred_boost * per_pixel_err)
-        else:
-            pixel_loss = tf.reduce_mean(per_pixel_err)
-
-        tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
-        total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
-        return total_gen_loss, advers_loss, pixel_loss, tv_loss
-
-
-    def Discriminator(self):
-        initializer = tf.random_normal_initializer(0., 0.02)
-
-        def _maybe_symmetrize(tensor):
-            if not self.enforce_symmetry:
-                return tensor
-            return Symmetrize2DLayer()(tensor)
-
+    def Denoiser(self):
+        noisy_target = tf.keras.layers.Input(shape=[self.input_size, self.input_size, 1], name="noisy_target")
         if self.use_embedding:
-            inp = tf.keras.layers.Input(shape=[3*self.input_size, self.number_factors], name='input_image')
-            d = self.discriminator_embedding(inp)
+            factor_input = tf.keras.layers.Input(shape=[3 * self.input_size, self.number_factors], name="factorData")
+            cond_emb = self.condition_encoder(factor_input)
         else:
-            inp = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name='input_image')
-            d = inp
+            factor_input = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.INPUT_CHANNELS], name="factorData")
+            cond_emb = factor_input
+        time_step = tf.keras.layers.Input(shape=[1], name="time_step")
+        pred_noise = self.unet_denoiser([noisy_target, cond_emb, time_step])
+        return tf.keras.Model(inputs=[noisy_target, factor_input, time_step], outputs=pred_noise, name="UNet_Diffusion")
 
-        tar = tf.keras.layers.Input(shape=[self.input_size, self.input_size, self.OUTPUT_CHANNELS], name='target_image')
-        #Patch-GAN (Isola et al.)
-        d = tf.keras.layers.Concatenate()([d, tar])
-        if self.input_size > 64:
-            #downsample and symmetrize 1 
-            d = HiCGAN.downsample(64, 4, False)(d) # (bs, inp.size/2, inp.size/2, 64)
-            d = _maybe_symmetrize(d)
-            #downsample and symmetrize 2
-            d = HiCGAN.downsample(128, 4)(d)# (bs, inp.size/4, inp.size/4, 128)
-            d = _maybe_symmetrize(d)
-        else:    
-            #downsample and symmetrize 3
-            d = HiCGAN.downsample(256, 4)(d)
-            d = _maybe_symmetrize(d)
-        #downsample and symmetrize 4
-        d = HiCGAN.downsample(256, 4)(d) # (bs, inp.size/8, inp.size/8, 256)
-        d = _maybe_symmetrize(d)
-        d = Conv2D(512, 4, strides=1, padding="same", kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 512)
-        d = _maybe_symmetrize(d)
-        # d = BatchNormalization()(d)
-        d = LeakyReLU(alpha=0.2)(d)
-        d = Conv2D(1, 4, strides=1, padding="same",
-                        kernel_initializer=initializer)(d) #(bs, inp.size/8, inp.size/8, 1)
-        d = _maybe_symmetrize(d)
-        #d = tf.keras.layers.Activation("sigmoid")(d) #sigmoid will be done in the loss function itself
-        return tf.keras.Model(inputs=[inp, tar], outputs=d, name="Discriminator")
+    def diffusion_loss(self, target, noise, predicted_noise, noisy_target, alpha_bar_t):
+        target = tf.cast(target, tf.float32)
+        noise = tf.cast(noise, tf.float32)
+        predicted_noise = tf.cast(predicted_noise, tf.float32)
+        noisy_target = tf.cast(noisy_target, tf.float32)
+        alpha_bar_t = tf.cast(alpha_bar_t, tf.float32)
 
-    def discriminator_loss(self, disc_real_output, disc_generated_output):
-        disc_real_output = tf.cast(disc_real_output, tf.float32)
-        disc_generated_output = tf.cast(disc_generated_output, tf.float32)
-        real_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.ones_like(disc_real_output), logits=disc_real_output) )
-        generated_loss = tf.reduce_mean( tf.nn.sigmoid_cross_entropy_with_logits(labels=tf.zeros_like(disc_generated_output), logits=disc_generated_output) )
-        total_disc_loss = self.loss_weight_discriminator * (real_loss + generated_loss)
-        return total_disc_loss, real_loss, generated_loss
+        fg_mask = tf.cast(target > 1e-5, tf.float32)
+        pixel_weights = (
+            1.0
+            + self.fg_weight * fg_mask
+            + self.peak_weight * tf.clip_by_value(target, 0.0, 1.0)
+        )
+        noise_loss = tf.reduce_mean(pixel_weights * tf.square(noise - predicted_noise))
+
+        sqrt_ab = tf.sqrt(tf.maximum(alpha_bar_t, 1e-8))
+        sqrt_one_minus_ab = tf.sqrt(tf.maximum(1.0 - alpha_bar_t, 1e-8))
+        x0_pred_raw = (noisy_target - sqrt_one_minus_ab * predicted_noise) / sqrt_ab
+        x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
+        x0_pred = x0_pred_clipped + self.leaky_clip_slope * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
+        x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(target - x0_pred))
+
+        zero_mask = 1.0 - fg_mask
+        bg_l1_loss = tf.reduce_mean(alpha_bar_t * zero_mask * tf.abs(x0_pred))
+
+        total_loss = self.loss_weight_pixel * (
+            noise_loss
+            + self.x0_loss_weight * x0_loss
+            + self.bg_l1_weight * bg_l1_loss
+        )
+        return total_loss, noise_loss, x0_loss, bg_l1_loss
 
     @tf.function
     def distributed_train_step(self, input_data):
         input_image, target = input_data[0]["factorData"], input_data[1]["out_matrixData"]
         per_replica_losses = self.scope.run(self.train_step, args=(input_image, target, ))
         return self.scope.reduce(tf.distribute.ReduceOp.MEAN, per_replica_losses, axis=None)
-    
+
     @tf.function
     def train_step(self, input_image, target):
-        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-            gen_output = self.generator(input_image, training=True)
+        target = tf.cast(target, tf.float32)
+        batch_size = tf.shape(target)[0]
 
-            disc_real_output = self.discriminator([input_image, target], training=True)
-            disc_generated_output = self.discriminator([input_image, gen_output], training=True)
+        t = tf.random.uniform(shape=[batch_size, 1], minval=1, maxval=self.timesteps + 1, dtype=tf.int32)
+        noise = tf.random.normal(shape=tf.shape(target), dtype=tf.float32)
 
-            gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
-            disc_loss, disc_real_loss, disc_gen_loss = self.discriminator_loss(disc_real_output, disc_generated_output)
+        alpha_bar_t = tf.gather(self.alphas_bar, t)
+        alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
+        noisy_target = tf.sqrt(alpha_bar_t) * target + tf.sqrt(1.0 - alpha_bar_t) * noise
 
+        with tf.GradientTape() as tape:
+            predicted_noise = self.denoiser([noisy_target, input_image, tf.cast(t, tf.float32)], training=True)
+            total_loss, noise_loss, x0_loss, bg_l1_loss = self.diffusion_loss(
+                target, noise, predicted_noise, noisy_target, alpha_bar_t
+            )
             if self.mixed_precision:
-                # scaled loss must be computed inside the tape
-                scaled_gen_loss = self.generator_optimizer.get_scaled_loss(gen_total_loss)
-                scaled_disc_loss = self.discriminator_optimizer.get_scaled_loss(disc_loss)
+                if hasattr(self.denoiser_optimizer, "get_scaled_loss"):
+                    scaled_loss = self.denoiser_optimizer.get_scaled_loss(total_loss)
+                elif hasattr(self.denoiser_optimizer, "scale_loss"):
+                    scaled_loss = self.denoiser_optimizer.scale_loss(total_loss)
+                else:
+                    scaled_loss = total_loss
 
         if self.mixed_precision:
-            generator_gradients = self.generator_optimizer.get_unscaled_gradients(
-                gen_tape.gradient(scaled_gen_loss, self.generator.trainable_variables))
-            discriminator_gradients = self.discriminator_optimizer.get_unscaled_gradients(
-                disc_tape.gradient(scaled_disc_loss, self.discriminator.trainable_variables))
+            scaled_gradients = tape.gradient(scaled_loss, self.denoiser.trainable_variables)
+            if hasattr(self.denoiser_optimizer, "get_unscaled_gradients"):
+                gradients = self.denoiser_optimizer.get_unscaled_gradients(scaled_gradients)
+            else:
+                gradients = scaled_gradients
         else:
-            generator_gradients = gen_tape.gradient(gen_total_loss,
-                                                    self.generator.trainable_variables)
-            discriminator_gradients = disc_tape.gradient(disc_loss,
-                                                        self.discriminator.trainable_variables)
+            gradients = tape.gradient(total_loss, self.denoiser.trainable_variables)
 
-        self.generator_optimizer.apply_gradients(zip(generator_gradients,
-                                                self.generator.trainable_variables))
-        self.discriminator_optimizer.apply_gradients(zip(discriminator_gradients,
-                                                    self.discriminator.trainable_variables))
-        return gen_total_loss, disc_loss, disc_real_loss, disc_gen_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
+        self.denoiser_optimizer.apply_gradients(zip(gradients, self.denoiser.trainable_variables))
+        return total_loss, noise_loss, x0_loss, bg_l1_loss
 
     @tf.function
     def validationStep(self, input_image, target):
-        gen_output = self.generator(input_image, training=False)
+        target = tf.cast(target, tf.float32)
+        batch_size = tf.shape(target)[0]
 
-        disc_real_output = self.discriminator([input_image, target], training=False)
-        disc_generated_output = self.discriminator([input_image, gen_output], training=False)
+        # Deterministic stratified timesteps + stateless noise for noise-free EarlyStopping monitoring
+        t_lin = tf.linspace(1.0, tf.cast(self.timesteps, tf.float32), tf.maximum(batch_size, 1))
+        t = tf.reshape(tf.cast(tf.round(t_lin), tf.int32)[:batch_size], [batch_size, 1])
+        noise = tf.random.stateless_normal(shape=tf.shape(target), seed=[42, 42], dtype=tf.float32)
 
-        gen_total_loss, gen_adv_loss, gen_pixel_loss, gen_tv_loss = self.generator_loss(disc_generated_output, gen_output, target)
-        disc_loss, _, _ = self.discriminator_loss(disc_real_output, disc_generated_output)
-        return gen_total_loss, disc_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
+        alpha_bar_t = tf.gather(self.alphas_bar, t)
+        alpha_bar_t = tf.reshape(alpha_bar_t, [-1, 1, 1, 1])
+        noisy_target = tf.sqrt(alpha_bar_t) * target + tf.sqrt(1.0 - alpha_bar_t) * noise
+
+        predicted_noise = self.denoiser([noisy_target, input_image, tf.cast(t, tf.float32)], training=False)
+        return self.diffusion_loss(target, noise, predicted_noise, noisy_target, alpha_bar_t)
+
+    @tf.function
+    def predictionStep(self, input_batch, training=False, sample_steps: int = None):
+        """
+        Deterministic DDIM reverse sampling (default 25 steps, seed=[42, 42]) with [0, 1]-clipped x_0
+        effective noise correction. Caches `self.condition_encoder(input_batch)` ONCE per batch
+        across all DDIM steps.
+        """
+        steps = self.sample_steps if sample_steps is None else int(sample_steps)
+        inp = tf.cast(input_batch, tf.float32)
+        if not self.use_embedding and inp.shape.rank == 3:
+            inp = tf.expand_dims(inp, axis=-1)
+        batch_size = tf.shape(inp)[0]
+
+        if self.use_embedding and self.condition_encoder is not None:
+            cond_emb = self.condition_encoder(inp, training=False)
+        else:
+            cond_emb = inp
+
+        x_t = tf.random.stateless_normal(
+            shape=(batch_size, self.input_size, self.input_size, 1),
+            seed=[42, 42],
+            dtype=tf.float32,
+        )
+        stride = tf.maximum(1, self.timesteps // tf.maximum(steps, 1))
+
+        for t_step in tf.range(self.timesteps, 0, -stride):
+            t_batch = tf.fill([batch_size, 1], tf.cast(t_step, tf.float32))
+            t_prev = tf.maximum(0, t_step - stride)
+
+            predicted_noise = tf.cast(
+                self.unet_denoiser([x_t, cond_emb, t_batch], training=False),
+                tf.float32,
+            )
+
+            alpha_bar_t = self.alphas_bar[t_step]
+            alpha_bar_prev = self.alphas_bar[t_prev]
+
+            sqrt_ab_t = tf.sqrt(tf.maximum(alpha_bar_t, 1e-8))
+            sqrt_one_minus_ab_t = tf.sqrt(tf.maximum(1.0 - alpha_bar_t, 1e-8))
+
+            x0_pred = (x_t - sqrt_one_minus_ab_t * predicted_noise) / sqrt_ab_t
+            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
+            pred_eps = (x_t - sqrt_ab_t * x0_pred) / sqrt_one_minus_ab_t
+            x_t = (
+                tf.sqrt(alpha_bar_prev) * x0_pred
+                + tf.sqrt(tf.maximum(1.0 - alpha_bar_prev, 0.0)) * pred_eps
+            )
+
+        x_t = tf.clip_by_value(x_t, 0.0, 1.0)
+        if self.enforce_symmetry:
+            x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
+        return x_t
 
     def generate_images(self, model, test_input, tar, epoch: int):
         from . import evaluation
 
         inp_tensor = test_input["factorData"] if isinstance(test_input, dict) else test_input
-        prediction = model(inp_tensor, training=False)
+        prediction = self.predictionStep(inp_tensor[:1], training=False)
         tar_img = tf.cast(tar["out_matrixData"][0], tf.float32)
         pred_img = tf.cast(prediction[0], tf.float32)
 
         tar_raw = np.squeeze(np.asarray(tar_img, dtype=np.float64))
         pred_raw = np.squeeze(np.asarray(pred_img, dtype=np.float64))
         pred_mse = float(np.mean(np.square(tar_raw - pred_raw)))
-        gt_disp = tar_raw * 0.5 + 0.5
-        pred_disp = pred_raw * 0.5 + 0.5
+        gt_disp = np.clip(tar_raw, 0.0, 1.0)
+        pred_disp = np.clip(pred_raw, 0.0, 1.0)
         mae_val = float(np.mean(np.abs(pred_disp - gt_disp)))
 
         inp_sample = np.asarray(inp_tensor[0], dtype=np.float64)
@@ -561,9 +605,9 @@ class HiCGAN():
             input_mat=inp_disp,
             input_title=inp_title,
             gt_title="Gerçek (Ground Truth) [norm]",
-            pred_title=f"Tahmin (Predicted) [MSE={pred_mse:.5f}]",
+            pred_title=f"Diffusion Tahmin (DDIM {self.sample_steps}s) [MSE={pred_mse:.5f}]",
             residual_title=f"Fark / Residual (Pred - GT) [MAE={mae_val:.4f}]",
-            suptitle=f"Epoch {epoch:05d} — Örnek Girdi, Gerçek, Tahmin ve Fark Haritası",
+            suptitle=f"Epoch {epoch:05d} — Diffusion DDIM Örnek Girdi, Gerçek, Tahmin ve Fark Haritası",
             input_xlabel=inp_xlabel,
             input_ylabel=inp_ylabel,
             dpi=150,
@@ -571,211 +615,217 @@ class HiCGAN():
 
     def fit(self, train_ds, epochs, test_ds, steps_per_epoch: int,
             validation_steps: int = 0, early_stopping_patience: int = 10):
-        """validation_steps > 0 evaluates only that many validation batches.
-
-        Monitors deterministic validation pixel reconstruction loss (`val_pixel_loss`)
+        """
+        Train the conditional DDPM denoiser, monitoring deterministic `val_total_loss`
         for EarlyStopping (`patience=early_stopping_patience`, `min_delta=1e-6`),
-        saves `generator_best.keras` whenever `val_pixel_loss` improves, and
-        restores the best generator weights at the end of training (`generator_final.keras`).
+        saving `denoiser_best.keras` on improvement and restoring the best weights
+        before saving `denoiser_final.keras`.
         """
         distributed_dataset = self.scope.experimental_distribute_dataset(train_ds)
-        
+
         if self.start_epoch > 0 and self.start_epoch < epochs:
             print(f"Resuming training from epoch {self.start_epoch}.")
         elif self.start_epoch >= epochs:
-            print(f"Checkpoint epoch {self.start_epoch} is greater than or equal to total epochs {epochs}. Starting from scratch.")
-            exit(1)
+            print(f"Checkpoint epoch {self.start_epoch} is greater than or equal to total epochs {epochs}. Nothing to train.")
+            return
 
-        best_val_pixel_loss = float("inf")
+        vis_sample_input = None
+        vis_sample_target = None
+        for test_in, test_tar in test_ds:
+            targets = test_tar["out_matrixData"]
+            sums = tf.reduce_sum(tf.abs(targets), axis=[1, 2, 3])
+            max_idx = int(tf.argmax(sums))
+            if float(sums[max_idx]) > 0.0:
+                vis_sample_input = {k: v[max_idx:max_idx + 1] for k, v in test_in.items()}
+                vis_sample_target = {k: v[max_idx:max_idx + 1] for k, v in test_tar.items()}
+                break
+        if vis_sample_input is None:
+            for test_in, test_tar in test_ds.take(1):
+                vis_sample_input = {k: v[:1] for k, v in test_in.items()}
+                vis_sample_target = {k: v[:1] for k, v in test_tar.items()}
+
+        best_val_loss = float("inf")
         best_epoch = -1
         patience_counter = 0
         best_weights = None
         last_epoch = self.start_epoch
 
         def _save_loss_files(ep_idx):
-            disc_train_tot_epochs = [
-                float(self.loss_weight_discriminator * (f + t))
-                for f, t in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)
-            ]
             np.savez(
                 os.path.join(self.log_dir, "lossValues_{:05d}.npz".format(ep_idx)),
-                genLossTrain=self.__gen_train_loss_batches,
-                genLossVal=self.__gen_val_loss_batches,
-                discLossTrain_True=self.__disc_train_loss_true_batches,
-                discLossTrain_Fake=self.__disc_train_loss_fake_batches,
-                discLossVal=self.__disc_val_loss_batches,
-                genLossTrainEpochs=self.__gen_train_loss_epochs,
-                genPixelLossTrainEpochs=self.__gen_train_pixel_loss_epochs,
-                genAdvLossTrainEpochs=self.__gen_train_adv_loss_epochs,
-                genTvLossTrainEpochs=self.__gen_train_tv_loss_epochs,
-                discLossTrainEpochs=disc_train_tot_epochs,
-                discLossTrainTrueEpochs=self.__disc_train_loss_true_epochs,
-                discLossTrainFakeEpochs=self.__disc_train_loss_fake_epochs,
-                genLossValEpochs=self.__gen_val_loss_epochs,
-                genPixelLossValEpochs=self.__gen_val_pixel_loss_epochs,
-                genAdvLossValEpochs=self.__gen_val_adv_loss_epochs,
-                genTvLossValEpochs=self.__gen_val_tv_loss_epochs,
-                discLossValEpochs=self.__disc_val_loss_epochs,
+                diffLossTrain=self.__diff_train_loss_batches,
+                diffLossVal=self.__diff_val_loss_batches,
+                diffLossTrainEpochs=self.__diff_train_loss_epochs,
+                diffNoiseLossTrainEpochs=self.__diff_train_noise_loss_epochs,
+                diffX0LossTrainEpochs=self.__diff_train_x0_loss_epochs,
+                diffBgLossTrainEpochs=self.__diff_train_bg_loss_epochs,
+                diffLossValEpochs=self.__diff_val_loss_epochs,
+                diffNoiseLossValEpochs=self.__diff_val_noise_loss_epochs,
+                diffX0LossValEpochs=self.__diff_val_x0_loss_epochs,
+                diffBgLossValEpochs=self.__diff_val_bg_loss_epochs,
+                # Compatible aliases for shared tools
+                genLossTrain=self.__diff_train_loss_batches,
+                genLossVal=self.__diff_val_loss_batches,
+                genLossTrainEpochs=self.__diff_train_loss_epochs,
+                genLossValEpochs=self.__diff_val_loss_epochs,
             )
 
         for epoch in range(self.start_epoch, epochs):
             last_epoch = epoch
-            #generate sample output
-            if epoch % self.example_plot_frequency == 0:
-                for example_input, example_target in test_ds.take(1):
-                    self.generate_images(self.generator, example_input, example_target, epoch)
-            
-            
+            if epoch % self.example_plot_frequency == 0 and vis_sample_input is not None:
+                self.generate_images(self.denoiser, vis_sample_input, vis_sample_target, epoch)
+
             train_pbar = tqdm(total=steps_per_epoch)
-            train_pbar.set_description("Epoch {:05d}".format(epoch+1))
+            train_pbar.set_description("Epoch {:05d}".format(epoch + 1))
             train_samples_in_epoch = 0
 
             for distributed_input in distributed_dataset:
-               
                 train_samples_in_epoch += 1
-                gen_loss, _, disc_loss_real, disc_loss_fake, gen_pixel, gen_adv, gen_tv = self.distributed_train_step(distributed_input)
+                total_l, noise_l, x0_l, bg_l = self.distributed_train_step(distributed_input)
 
-                self.__disc_train_loss_true_batches.append(float(disc_loss_real))
-                self.__disc_train_loss_fake_batches.append(float(disc_loss_fake))
-                self.__gen_train_loss_batches.append(float(gen_loss))
-                self.__gen_train_pixel_loss_batches.append(float(gen_pixel))
-                self.__gen_train_adv_loss_batches.append(float(gen_adv))
-                self.__gen_train_tv_loss_batches.append(float(gen_tv))
-                train_bar_postfixDict= {"g": "{:.4f}".format(self.__gen_train_loss_batches[-1]),
-                                         "dt": "{:.3f}".format(self.__disc_train_loss_true_batches[-1]),
-                                         "df": "{:.3f}".format(self.__disc_train_loss_fake_batches[-1])}
-                if len(self.__gen_val_loss_epochs) > 0:
-                    train_bar_postfixDict["v"] = "{:.3f}".format(self.__gen_val_loss_epochs[-1])
-                train_pbar.set_postfix( train_bar_postfixDict )
+                self.__diff_train_loss_batches.append(float(total_l))
+                self.__diff_train_noise_loss_batches.append(float(noise_l))
+                self.__diff_train_x0_loss_batches.append(float(x0_l))
+                self.__diff_train_bg_loss_batches.append(float(bg_l))
+
+                running_mean = float(np.mean(self.__diff_train_loss_batches[-train_samples_in_epoch:]))
+                train_bar_postfixDict = {
+                    "loss": "{:.4f}".format(running_mean),
+                    "eps": "{:.3f}".format(self.__diff_train_noise_loss_batches[-1]),
+                    "x0": "{:.3f}".format(self.__diff_train_x0_loss_batches[-1]),
+                }
+                if len(self.__diff_val_loss_epochs) > 0:
+                    train_bar_postfixDict["val"] = "{:.3f}".format(self.__diff_val_loss_epochs[-1])
+                train_pbar.set_postfix(train_bar_postfixDict)
                 train_pbar.update(1)
                 self.__batch_counter += 1
             train_pbar.close()
-            self.__gen_train_loss_epochs.append(float(np.mean(self.__gen_train_loss_batches[-train_samples_in_epoch:])))
-            self.__gen_train_pixel_loss_epochs.append(float(np.mean(self.__gen_train_pixel_loss_batches[-train_samples_in_epoch:])))
-            self.__gen_train_adv_loss_epochs.append(float(np.mean(self.__gen_train_adv_loss_batches[-train_samples_in_epoch:])))
-            self.__gen_train_tv_loss_epochs.append(float(np.mean(self.__gen_train_tv_loss_batches[-train_samples_in_epoch:])))
-            self.__disc_train_loss_true_epochs.append(float(np.mean(self.__disc_train_loss_true_batches[-train_samples_in_epoch:])))
-            self.__disc_train_loss_fake_epochs.append(float(np.mean(self.__disc_train_loss_fake_batches[-train_samples_in_epoch:])))
 
-            # Validation (deterministic, training=False)
+            if train_samples_in_epoch > 0:
+                self.__diff_train_loss_epochs.append(float(np.mean(self.__diff_train_loss_batches[-train_samples_in_epoch:])))
+                self.__diff_train_noise_loss_epochs.append(float(np.mean(self.__diff_train_noise_loss_batches[-train_samples_in_epoch:])))
+                self.__diff_train_x0_loss_epochs.append(float(np.mean(self.__diff_train_x0_loss_batches[-train_samples_in_epoch:])))
+                self.__diff_train_bg_loss_epochs.append(float(np.mean(self.__diff_train_bg_loss_batches[-train_samples_in_epoch:])))
+            else:
+                self.__diff_train_loss_epochs.append(float("nan"))
+                self.__diff_train_noise_loss_epochs.append(float("nan"))
+                self.__diff_train_x0_loss_epochs.append(float("nan"))
+                self.__diff_train_bg_loss_epochs.append(float("nan"))
+
+            # Deterministic validation
             validation_samples_in_epoch = 0
             vds = test_ds.take(validation_steps) if validation_steps else test_ds
             for input_image, target in vds:
-                gen_loss_val, disc_loss_val, gen_pixel_val, gen_adv_val, gen_tv_val = self.validationStep(input_image["factorData"], target["out_matrixData"])
-                self.__gen_val_loss_batches.append(float(gen_loss_val))
-                self.__gen_val_pixel_loss_batches.append(float(gen_pixel_val))
-                self.__gen_val_adv_loss_batches.append(float(gen_adv_val))
-                self.__gen_val_tv_loss_batches.append(float(gen_tv_val))
-                self.__disc_val_loss_batches.append(float(disc_loss_val))
+                val_tot, val_noise, val_x0, val_bg = self.validationStep(input_image["factorData"], target["out_matrixData"])
+                self.__diff_val_loss_batches.append(float(val_tot))
+                self.__diff_val_noise_loss_batches.append(float(val_noise))
+                self.__diff_val_x0_loss_batches.append(float(val_x0))
+                self.__diff_val_bg_loss_batches.append(float(val_bg))
                 validation_samples_in_epoch += 1
-            self.__disc_val_loss_epochs.append(float(np.mean(self.__disc_val_loss_batches[-validation_samples_in_epoch:])))
-            self.__gen_val_loss_epochs.append(float(np.mean(self.__gen_val_loss_batches[-validation_samples_in_epoch:])))
-            self.__gen_val_pixel_loss_epochs.append(float(np.mean(self.__gen_val_pixel_loss_batches[-validation_samples_in_epoch:])))
-            self.__gen_val_adv_loss_epochs.append(float(np.mean(self.__gen_val_adv_loss_batches[-validation_samples_in_epoch:])))
-            self.__gen_val_tv_loss_epochs.append(float(np.mean(self.__gen_val_tv_loss_batches[-validation_samples_in_epoch:])))
 
-            val_pixel_ep = self.__gen_val_pixel_loss_epochs[-1]
-            disc_train_total_ep = float(self.loss_weight_discriminator * (self.__disc_train_loss_true_epochs[-1] + self.__disc_train_loss_fake_epochs[-1]))
+            if validation_samples_in_epoch > 0:
+                self.__diff_val_loss_epochs.append(float(np.mean(self.__diff_val_loss_batches[-validation_samples_in_epoch:])))
+                self.__diff_val_noise_loss_epochs.append(float(np.mean(self.__diff_val_noise_loss_batches[-validation_samples_in_epoch:])))
+                self.__diff_val_x0_loss_epochs.append(float(np.mean(self.__diff_val_x0_loss_batches[-validation_samples_in_epoch:])))
+                self.__diff_val_bg_loss_epochs.append(float(np.mean(self.__diff_val_bg_loss_batches[-validation_samples_in_epoch:])))
+            else:
+                self.__diff_val_loss_epochs.append(self.__diff_train_loss_epochs[-1])
+                self.__diff_val_noise_loss_epochs.append(self.__diff_train_noise_loss_epochs[-1])
+                self.__diff_val_x0_loss_epochs.append(self.__diff_train_x0_loss_epochs[-1])
+                self.__diff_val_bg_loss_epochs.append(self.__diff_train_bg_loss_epochs[-1])
+
+            val_tot_ep = self.__diff_val_loss_epochs[-1]
             log.info(
-                "[EPOCH-LOSS] epoch=%d/%d | train_gen_total=%.6f, train_pixel=%.6f, train_adv=%.6f, train_tv=%.6f, train_disc_total=%.6f, train_disc_true=%.6f, train_disc_fake=%.6f | "
-                "val_gen_total=%.6f, val_pixel=%.6f, val_adv=%.6f, val_tv=%.6f, val_disc_total=%.6f",
+                "[EPOCH-LOSS] epoch=%d/%d | train_total=%.6f, train_noise=%.6f, train_x0=%.6f, train_bg=%.6f | "
+                "val_total=%.6f, val_noise=%.6f, val_x0=%.6f, val_bg=%.6f",
                 epoch + 1, epochs,
-                self.__gen_train_loss_epochs[-1], self.__gen_train_pixel_loss_epochs[-1], self.__gen_train_adv_loss_epochs[-1], self.__gen_train_tv_loss_epochs[-1],
-                disc_train_total_ep, self.__disc_train_loss_true_epochs[-1], self.__disc_train_loss_fake_epochs[-1],
-                self.__gen_val_loss_epochs[-1], val_pixel_ep, self.__gen_val_adv_loss_epochs[-1], self.__gen_val_tv_loss_epochs[-1],
-                self.__disc_val_loss_epochs[-1]
+                self.__diff_train_loss_epochs[-1], self.__diff_train_noise_loss_epochs[-1],
+                self.__diff_train_x0_loss_epochs[-1], self.__diff_train_bg_loss_epochs[-1],
+                val_tot_ep, self.__diff_val_noise_loss_epochs[-1],
+                self.__diff_val_x0_loss_epochs[-1], self.__diff_val_bg_loss_epochs[-1],
             )
 
-            #count the epoch
             self.__epoch_counter += 1
 
-            # EarlyStopping & best checkpoint tracking on deterministic val_pixel_loss
-            if val_pixel_ep < best_val_pixel_loss - 1e-6:
-                best_val_pixel_loss = val_pixel_ep
+            # EarlyStopping & best checkpoint tracking on deterministic val_total_loss
+            if val_tot_ep < best_val_loss - 1e-6:
+                best_val_loss = val_tot_ep
                 best_epoch = epoch + 1
                 patience_counter = 0
-                best_weights = self.generator.get_weights()
-                best_path = os.path.join(self.log_dir, "generator_best.keras")
-                self.generator.save(filepath=best_path, save_format="keras")
-                msg_best = f"[CHECKPOINT] Epoch {epoch + 1}: val_pixel_loss improved to {best_val_pixel_loss:.6f} -> saved {best_path}"
+                best_weights = self.denoiser.get_weights()
+                best_path = os.path.join(self.log_dir, "denoiser_best.keras")
+                self.denoiser.save(filepath=best_path, save_format="keras")
+                msg_best = f"[CHECKPOINT] Epoch {epoch + 1}: val_total_loss improved to {best_val_loss:.6f} -> saved {best_path}"
                 log.info(msg_best)
                 print(msg_best)
             else:
                 patience_counter += 1
                 msg_pat = (
-                    f"[EARLY-STOPPING] Epoch {epoch + 1}: val_pixel_loss={val_pixel_ep:.6f} did not improve over "
-                    f"best={best_val_pixel_loss:.6f} (epoch {best_epoch}); patience={patience_counter}/{early_stopping_patience}"
+                    f"[EARLY-STOPPING] Epoch {epoch + 1}: val_total_loss={val_tot_ep:.6f} did not improve over "
+                    f"best={best_val_loss:.6f} (epoch {best_epoch}); patience={patience_counter}/{early_stopping_patience}"
                 )
                 log.info(msg_pat)
                 print(msg_pat)
 
-            # saving the model every plot_frequency epochs
-            if (epoch + 1) % self.progress_plot_frequency == 0:
-                utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
-                              pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
-                                                    self.__disc_train_loss_true_epochs, 
-                                                    self.__disc_train_loss_fake_epochs, 
-                                                    self.__disc_val_loss_epochs],
-                              pGeneratorLossNameList=["training", "validation"],
-                              pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
-                              pFilename=self.progress_plot_name,
-                              useLogscaleList=[True, False])
+            if self.progress_plot_frequency and self.progress_plot_frequency > 0 and (epoch + 1) % self.progress_plot_frequency == 0:
+                utils.plotLoss(
+                    pGeneratorLossValueLists=[self.__diff_train_loss_epochs, self.__diff_val_loss_epochs],
+                    pDiscLossValueLists=[],
+                    pGeneratorLossNameList=["training", "validation"],
+                    pDiscLossNameList=[],
+                    pFilename=self.progress_plot_name,
+                    useLogscaleList=[True, False],
+                    pYLabel="diffusion loss",
+                    pLegendTitle="Denoiser",
+                )
                 _save_loss_files(epoch)
-                self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(epoch)), save_format="keras")
-                self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(epoch)), save_format="keras")
+                self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_{:05d}.keras".format(epoch)), save_format="keras")
+                self.ckpt_epoch.assign(epoch + 1)
                 self.checkpoint.save(file_prefix=self.checkpoint_prefix)
 
             if early_stopping_patience is not None and early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
                 stop_msg = (
                     f"[EARLY-STOPPING] Stopping early at epoch {epoch + 1}/{epochs} "
-                    f"(no improvement in val_pixel_loss for {patience_counter} epochs; best={best_val_pixel_loss:.6f} at epoch {best_epoch})."
+                    f"(no improvement in val_total_loss for {patience_counter} epochs; best={best_val_loss:.6f} at epoch {best_epoch})."
                 )
                 log.info(stop_msg)
                 print(stop_msg)
                 break
 
+        if int(self.ckpt_epoch.numpy()) != (last_epoch + 1):
+            self.ckpt_epoch.assign(last_epoch + 1)
+            self.checkpoint.save(file_prefix=self.checkpoint_prefix)
+
         if best_weights is not None:
-            self.generator.set_weights(best_weights)
-            restore_msg = f"[MODEL-RESTORE] Restored best generator weights from epoch {best_epoch} (val_pixel_loss={best_val_pixel_loss:.6f})."
+            self.denoiser.set_weights(best_weights)
+            restore_msg = f"[MODEL-RESTORE] Restored best denoiser weights from epoch {best_epoch} (val_total_loss={best_val_loss:.6f})."
             log.info(restore_msg)
             print(restore_msg)
 
-        utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
-                              pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
-                                                    self.__disc_train_loss_true_epochs, 
-                                                    self.__disc_train_loss_fake_epochs, 
-                                                    self.__disc_val_loss_epochs],
-                              pGeneratorLossNameList=["training", "validation"],
-                              pDiscLossNameList=["train total", "train real", "train gen.", "valid. total"],
-                              pFilename=self.progress_plot_name,
-                              useLogscaleList=[True, False])
+        utils.plotLoss(
+            pGeneratorLossValueLists=[self.__diff_train_loss_epochs, self.__diff_val_loss_epochs],
+            pDiscLossValueLists=[],
+            pGeneratorLossNameList=["training", "validation"],
+            pDiscLossNameList=[],
+            pFilename=self.progress_plot_name,
+            useLogscaleList=[True, False],
+            pYLabel="diffusion loss",
+            pLegendTitle="Denoiser",
+        )
         _save_loss_files(last_epoch)
-        self.generator.save(filepath=os.path.join(self.log_dir, "generator_{:05d}.keras".format(last_epoch)), save_format="keras")
-        self.generator.save(filepath=os.path.join(self.log_dir, "generator_final.keras"), save_format="keras")
-        self.discriminator.save(filepath=os.path.join(self.log_dir, "discriminator_{:05d}.keras".format(last_epoch)), save_format="keras")
+        self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_{:05d}.keras".format(last_epoch)), save_format="keras")
+        self.denoiser.save(filepath=os.path.join(self.log_dir, "denoiser_final.keras"), save_format="keras")
 
     def plotModels(self, pOutputPath: str, pFigureFileFormat: str):
-        generatorPlotName = "generatorModel.{:s}".format(pFigureFileFormat)
-        generatorPlotName = os.path.join(pOutputPath, generatorPlotName)
-        discriminatorPlotName = "discriminatorModel.{:s}".format(pFigureFileFormat)
-        discriminatorPlotName = os.path.join(pOutputPath, discriminatorPlotName)
-        generatorEmbeddingPlotName = "generatorEmbeddingModel.{:s}".format(pFigureFileFormat)
-        generatorEmbeddingPlotName = os.path.join(pOutputPath, generatorEmbeddingPlotName)
-        discriminatorEmbeddingPlotName = "discriminatorEmbeddingModel.{:s}".format(pFigureFileFormat)
-        discriminatorEmbeddingPlotName = os.path.join(pOutputPath, discriminatorEmbeddingPlotName)
-        #Architecture diagrams are a nicety, and they need pydot plus a graphviz
-        #binary. Without them keras raises ImportError, which used to abort the
-        #whole training run before a single step -- losing the job over a
-        #picture. Warn and carry on instead.
+        denoiserPlotName = os.path.join(pOutputPath, "denoiserModel.{:s}".format(pFigureFileFormat))
+        unetCorePlotName = os.path.join(pOutputPath, "unetCoreModel.{:s}".format(pFigureFileFormat))
+        condEmbPlotName = os.path.join(pOutputPath, "conditionEncoderModel.{:s}".format(pFigureFileFormat))
         modelsToPlot = [
-            (self.generator, generatorPlotName),
-            (self.discriminator, discriminatorPlotName),
+            (self.denoiser, denoiserPlotName),
+            (self.unet_denoiser, unetCorePlotName),
         ]
-        if self.use_embedding and self.generator_embedding is not None and self.discriminator_embedding is not None:
-            modelsToPlot.extend([
-                (self.generator_embedding, generatorEmbeddingPlotName),
-                (self.discriminator_embedding, discriminatorEmbeddingPlotName),
-            ])
+        if self.use_embedding and self.condition_encoder is not None:
+            modelsToPlot.append((self.condition_encoder, condEmbPlotName))
         for model, name in modelsToPlot:
             try:
                 tf.keras.utils.plot_model(model, show_shapes=True, to_file=name)
@@ -786,125 +836,43 @@ class HiCGAN():
                 print(msg)
                 break
 
-    # def predict(self, test_ds, steps_per_record):
-    #     predictedArray = []
-    #     for batch in tqdm(test_ds, desc="Predicting", total=steps_per_record):
-    #         predBatch = self.predictionStep(input_batch=batch, training=False)
-    #         # Extract and append only the needed slice to reduce memory copies
-    #         predictedArray.append(predBatch[:, :, :, 0].numpy())
-    #         # Free memory from the prediction batch
-    #         del predBatch
-    #     # Concatenate along batch dimension instead of converting list
-    #     predictedArray = np.concatenate(predictedArray, axis=0)
-    #     return predictedArray
     def predict(self, test_ds, steps_per_record):
         predictedArray = []
-
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
-
-        # Debug print to verify request
-        print(f"DEBUG: Starting prediction. Steps arg: {steps_per_record}.")
-
-        # Iterate over dataset
-        # We don't use 'total=steps_per_record' to avoid confusing tqdm if steps is wrong
-        for i, batch in tqdm(enumerate(test_ds), desc="Predicting"):
-            
-            # --- 1. Robust Input Extraction ---
-            input_data = None
-            
-            # Check for Tuple/List (common in tf.data: (input, target))
-            if isinstance(batch, (tuple, list)):
-                # If the first element is a dict (feature dict), use that
-                if isinstance(batch[0], dict) and "factorData" in batch[0]:
-                    input_data = batch[0]["factorData"]
-                else:
-                    input_data = batch[0] # Assume index 0 is input
-            # Check for Dict (direct feature dict)
-            elif isinstance(batch, dict):
-                input_data = batch.get("factorData", batch)
-            # Fallback (tensor)
-            else:
-                input_data = batch
-
-            # --- 2. Prediction ---
-            # training=False is critical
+        if self.denoiser is None:
+            raise ValueError("Denoiser is None. Please call load_denoiser() first.")
+        print(f"DEBUG: Starting DDIM prediction ({self.sample_steps} steps). Steps arg: {steps_per_record}.")
+        for i, batch in tqdm(enumerate(test_ds), desc="Predicting (DDIM)"):
+            input_data = HiCGAN._inputFromBatch(batch)
             predBatch = self.predictionStep(input_batch=input_data, training=False)
-            
-            # --- 3. Cleaning & Formatting ---
             val = predBatch.numpy()
-            
-            # Debug first batch shape to ensure model is outputting what we expect
             if i == 0:
                 print(f"DEBUG: First batch raw output shape: {val.shape}")
-
-            # Squeeze channel dimension if present: (Batch, 64, 64, 1) -> (Batch, 64, 64)
             if val.ndim == 4 and val.shape[-1] == 1:
                 val = np.squeeze(val, axis=-1)
-            
             predictedArray.append(val)
-
-            # Cleanup
-            del predBatch
-            del val
-
-        # --- 4. Aggregation ---
+            del predBatch, val
         if len(predictedArray) == 0:
             print("WARNING: predictedArray is empty!")
             return np.array([])
-
-        # Concatenate all batches into one large array: (Total_Samples, 64, 64)
         total_prediction = np.concatenate(predictedArray, axis=0)
-        
         print(f"DEBUG: Final Reference Shape returned: {total_prediction.shape}")
-        
         return total_prediction
-    
-    def predict_stream(self, test_ds):
-        '''
-        Memory-bounded streaming prediction.
 
-        Iterates the dataset exactly once and yields the (squeezed) prediction
-        for one batch at a time as a numpy array of shape (batch, W, W). The
-        caller is expected to reduce each batch immediately (e.g. extract the
-        upper triangle as float16), so the full-chromosome float32 stack is
-        never materialised. This avoids both the giant concatenation in
-        predict() and the quadratic dataset.skip() re-decoding used by the old
-        save-memory prediction loop.
-        '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+    def predict_stream(self, test_ds):
+        '''Memory-bounded streaming DDIM prediction.'''
+        if self.denoiser is None:
+            raise ValueError("Denoiser is None. Please call load_denoiser() first.")
         for batch in test_ds:
-            # robust input extraction (mirrors predict())
-            if isinstance(batch, (tuple, list)):
-                if isinstance(batch[0], dict) and "factorData" in batch[0]:
-                    input_data = batch[0]["factorData"]
-                else:
-                    input_data = batch[0]
-            elif isinstance(batch, dict):
-                input_data = batch.get("factorData", batch)
-            else:
-                input_data = batch
+            input_data = HiCGAN._inputFromBatch(batch)
             val = self.predictionStep(input_batch=input_data, training=False).numpy()
             if val.ndim == 4 and val.shape[-1] == 1:
                 val = np.squeeze(val, axis=-1)
             yield val
 
     def predict_stream_triu(self, test_ds, window_size):
-        '''Stream predictions already reduced to the upper triangle, float16.
-
-        predict_stream() copies the whole (batch, W, W) float32 tensor to the
-        host and leaves the caller to gather the upper triangle there. Both the
-        transfer and the gather happen between two GPU calls, so the card waits
-        through them: measured utilisation was 49% with a quarter of samples
-        below 5%.
-
-        Doing the gather inside the graph halves the bytes transferred, since
-        only the triangle crosses the bus and it crosses as float16 rather than
-        float32, and removes the host-side gather entirely.
-        '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        '''Stream predictions already reduced to the upper triangle, float16.'''
+        if self.denoiser is None:
+            raise ValueError("Denoiser is None. Please call load_denoiser() first.")
         r, c = np.triu_indices(window_size)
         flat = tf.constant(r * window_size + c, dtype=tf.int32)
 
@@ -917,15 +885,7 @@ class HiCGAN():
             return tf.cast(tf.gather(out, flat, axis=1), tf.float16)
 
         for batch in test_ds:
-            if isinstance(batch, (tuple, list)):
-                if isinstance(batch[0], dict) and "factorData" in batch[0]:
-                    input_data = batch[0]["factorData"]
-                else:
-                    input_data = batch[0]
-            elif isinstance(batch, dict):
-                input_data = batch.get("factorData", batch)
-            else:
-                input_data = batch
+            input_data = HiCGAN._inputFromBatch(batch)
             yield _step(input_data).numpy()
 
     @staticmethod
@@ -940,49 +900,18 @@ class HiCGAN():
 
     def predict_band(self, test_ds, window_size, matrix_size, flanking_size,
                      window_starts=None):
-        '''Predict a chromosome and sum the overlapping windows on the GPU.
-
-        The rebuilt matrix is banded: a window of W bins places nothing further
-        than W-1 off the diagonal, so the whole chromosome is a (W,
-        matrix_size) float32 array. Each window contributes to it and is then
-        finished with -- which is why shipping the windows themselves to the
-        host is so wasteful. Every cell of the band is covered by up to W
-        windows, so the per-window triangles are up to W redundant copies of
-        the same result: for a genome at 2 kb, 397 GB of them against 3 GB of
-        band.
-
-        Summing where the values are produced removes that entirely. Only the
-        band crosses the bus, once per chromosome, and no per-window file is
-        written at all. For chromosome 1 at 2 kb the band is 248 MB, which fits
-        on the card next to the generator with room to spare.
-
-        The scatter is a constant index pattern shifted along the chromosome:
-        the cell a window's (r, c) entry lands in is ((c-r), r + j), where j is
-        the window's start. So the flat indices are one precomputed vector plus
-        j, and duplicate targets within a batch are summed by the atomic add.
-
-        `window_starts` are the sliding-window positions the samples came from,
-        in the order the dataset yields them, or None when every position was
-        predicted and they are simply 0, 1, 2, ... The flanking size is added
-        here. Returns the band as (W, matrix_size) float32 together with the
-        number of windows summed into it.
-        '''
-        if self.generator is None:
-            raise ValueError("Generator is None. Please call loadGenerator() first.")
+        '''Predict a chromosome via DDIM and sum the overlapping windows on the GPU.'''
+        if self.denoiser is None:
+            raise ValueError("Denoiser is None. Please call load_denoiser() first.")
         W = int(window_size)
         matrixSize = int(matrix_size)
         flanking = int(flanking_size)
         starts = None if window_starts is None else np.asarray(window_starts, dtype=np.int32)
         r, c = np.triu_indices(W)
-        #where within a window's flattened WxW output each triangle entry sits
         flatWindow = tf.constant((r * W + c).astype(np.int32))
-        #and where it lands in the flattened (W, matrix_size) band, before the
-        #window's own offset along the chromosome is added
-        flatBase = tf.constant(((c - r).astype(np.int64) * matrixSize
-                                + r).astype(np.int32))
+        flatBase = tf.constant(((c - r).astype(np.int64) * matrixSize + r).astype(np.int32))
 
-        band = tf.Variable(tf.zeros([W * matrixSize], dtype=tf.float32),
-                           trainable=False)
+        band = tf.Variable(tf.zeros([W * matrixSize], dtype=tf.float32), trainable=False)
 
         @tf.function
         def _step(inp, offsets):
@@ -990,9 +919,6 @@ class HiCGAN():
             if out.shape.rank == 4 and out.shape[-1] == 1:
                 out = tf.squeeze(out, axis=-1)
             out = tf.reshape(out, [tf.shape(out)[0], W * W])
-            #a generator trained under mixed precision emits float16; the band
-            #is summed in float32 regardless, since up to windowSize windows
-            #land on the same cell
             tri = tf.cast(tf.gather(out, flatWindow, axis=1), tf.float32)
             idx = flatBase[tf.newaxis, :] + offsets[:, tf.newaxis]
             band.scatter_nd_add(tf.reshape(idx, [-1, 1]), tf.reshape(tri, [-1]))
@@ -1010,9 +936,6 @@ class HiCGAN():
                         "more samples in the dataset ({:d}+) than window starts ({:d})".format(
                             pos + n, starts.shape[0]))
                 offsets = starts[pos:pos + n] + flanking
-            #a window at offset j writes columns j .. j+W-1; past the end of the
-            #chromosome the flat scatter would wrap into the next diagonal
-            #instead of failing, so it is checked rather than trusted
             if int(offsets.max()) + W > matrixSize:
                 raise ValueError(
                     "window at {:d} exceeds the {:d} bins of the chromosome".format(
@@ -1029,78 +952,83 @@ class HiCGAN():
                      else np.zeros(0, dtype=np.int32))
         return result, allStarts
 
-    @tf.function
-    def predictionStep(self, input_batch, training=False):
-        return self.generator(input_batch, training=training)
-  
-    
-    # def loadGenerator(self, trainedModelPath: str):
-    #     '''
-    #         load a trained generator model for prediction
-    #     '''
-    #     try:
-    #         trainedModel = tf.keras.models.load_model(filepath=trainedModelPath, 
-    #                                               custom_objects={"CustomReshapeLayer": CustomReshapeLayer(self.input_size)}, safe_mode=False)
-    #         self.generator = trainedModel
-    #     except Exception as e:
-    #         msg = str(e)
-    #         msg += "\nError: failed to load trained model"
-    #         raise ValueError(msg)
-    def loadGenerator(self, trainedModelPath: str):
-        '''
-        Load a trained generator model for prediction with detailed diagnostics.
-        '''
+    def load_denoiser(self, trainedModelPath: str):
+        '''Load a trained diffusion denoiser model (.keras or checkpoint dir) and rebind cached sub-models.'''
         try:
-            print(f"Attempting to load model from: {trainedModelPath}")
-            
-            # 1. Define custom layers
+            print(f"Attempting to load denoiser model from: {trainedModelPath}")
+            resolved_path = trainedModelPath
+            if resolved_path and os.path.isdir(resolved_path):
+                for cand_name in ("denoiser_best.keras", "denoiser_final.keras"):
+                    cand_p = os.path.join(resolved_path, cand_name)
+                    if os.path.exists(cand_p):
+                        resolved_path = cand_p
+                        break
+
             custom_layers = {
                 "CustomReshapeLayer": CustomReshapeLayer,
                 "SplitChromatinStreamsLayer": SplitChromatinStreamsLayer,
                 "Pairwise2DEmbeddingLayer": Pairwise2DEmbeddingLayer,
                 "Symmetrize2DLayer": Symmetrize2DLayer,
+                "SpatialTimeEncoding": SpatialTimeEncoding,
+                "GroupNormalization": tf.keras.layers.GroupNormalization,
             }
-            
-            # 2. Add GroupNormalization
-            # Try native Keras (TF 2.12+)
-            # if hasa?ttr(tf.keras.layers, "GroupNormalization"):
-            custom_layers["GroupNormalization"] = tf.keras.layers.GroupNormalization
-            # else:
-            #     # Fallback for older TF versions using addons
-            #     try:
-            #         import tensorflow_addons as tfa
-            #         custom_layers["GroupNormalization"] = tfa.layers.GroupNormalization
-            #     except ImportError:
-            #         print("Warning: Could not import GroupNormalization from keras or addons.")
 
-            # 3. Load the model
-            self.generator = tf.keras.models.load_model(
-                filepath=trainedModelPath, 
-                custom_objects=custom_layers, 
-                safe_mode=False
-            )
-            print("Model loaded successfully. Running diagnostics...")
+            if os.path.isdir(resolved_path) or "ckpt" in os.path.basename(resolved_path):
+                ckpt = tf.train.Checkpoint(denoiser=self.denoiser)
+                latest = tf.train.latest_checkpoint(resolved_path) if os.path.isdir(resolved_path) else resolved_path
+                if latest:
+                    print(f"Restoring denoiser from checkpoint: {latest}")
+                    ckpt.restore(latest).expect_partial()
+                else:
+                    raise FileNotFoundError(f"No denoiser model or checkpoint found at {resolved_path}")
+            else:
+                self.denoiser = tf.keras.models.load_model(
+                    filepath=resolved_path,
+                    custom_objects=custom_layers,
+                    safe_mode=False,
+                )
 
-            # --- DIAGNOSTICS ---
-            # Check 1: Are weights all zeros or NaNs?
-            all_weights = self.generator.get_weights()
+            # Rebind condition_encoder & unet_denoiser sub-models so predictionStep caches condition_encoder
+            try:
+                self.unet_denoiser = self.denoiser.get_layer("UNet_Diffusion_Core")
+            except ValueError:
+                pass
+            if self.use_embedding:
+                try:
+                    self.condition_encoder = self.denoiser.get_layer("CNN-embedding")
+                except ValueError:
+                    pass
+            try:
+                ste_layer = self.unet_denoiser.get_layer("spatial_time_encoding")
+                loaded_t = max(1, int(round(float(ste_layer.timesteps))))
+                if loaded_t != self.timesteps:
+                    log.info("[MODEL-LOAD] Syncing diffusion timesteps from %d -> %d based on saved SpatialTimeEncoding.", self.timesteps, loaded_t)
+                    self.timesteps = loaded_t
+                    betas_steps = tf.cast(tf.linspace(1e-4, 0.02, self.timesteps), tf.float32)
+                    self.betas = tf.concat([[0.0], betas_steps], axis=0)
+                    self.alphas = 1.0 - self.betas
+                    self.alphas_bar = tf.math.cumprod(self.alphas)
+            except Exception:
+                pass
+
+            print("Denoiser model loaded successfully. Running diagnostics...")
+            all_weights = self.denoiser.get_weights()
             if len(all_weights) > 0:
                 total_weight_sum = np.sum([np.sum(np.abs(w)) for w in all_weights])
                 has_nan = np.any([np.isnan(np.sum(w)) for w in all_weights])
-                
                 print(f" -> Total sum of weights: {total_weight_sum}")
-                
                 if has_nan:
-                    raise ValueError("CRITICAL: The loaded model contains NaN (Not a Number) weights. Training failed. Decreasing learning rate or increasing GroupNorm epsilon might help.")
-                
+                    raise ValueError("CRITICAL: The loaded model contains NaN weights.")
                 if total_weight_sum == 0:
-                    raise ValueError("CRITICAL: All model weights are ZERO. The model did not learn or was not saved correctly.")
-            
+                    raise ValueError("CRITICAL: All model weights are ZERO.")
             print(" -> Diagnostics passed. Weights look valid.")
-
         except Exception as e:
-            msg = f"Failed to load generator.\nDetail: {str(e)}"
+            msg = f"Failed to load denoiser.\nDetail: {str(e)}"
             raise ValueError(msg)
+
+    # Alias for backward compatibility
+    loaddenoiser = load_denoiser
+    loadGenerator = load_denoiser
 
 
 @tf.keras.utils.register_keras_serializable(package="hicgan")
@@ -1250,25 +1178,23 @@ class Pairwise2DEmbeddingLayer(tf.keras.layers.Layer):
 
 class CustomReshapeLayer(tf.keras.layers.Layer):
     '''
-    reshape a 1D tensor such that it represents 
+    reshape a 1D tensor such that it represents
     the upper triangular part of a square 2D matrix with shape (matsize, matsize)
-    #example: 
-     [1,2,3,4,5,6] => [[1,2,3],
-                       [0,4,5],
-                       [0,0,6]]
     '''
     def __init__(self, matsize, **kwargs):
         super(CustomReshapeLayer, self).__init__(**kwargs)
         self.matsize = matsize
-        self.triu_indices = [ [x,y] for x,y in zip(np.triu_indices(self.matsize)[0], np.triu_indices(self.matsize)[1]) ]
+        self.triu_indices = [[x, y] for x, y in zip(np.triu_indices(self.matsize)[0], np.triu_indices(self.matsize)[1])]
 
-    def call(self, inputs):      
+    def call(self, inputs):
         return tf.map_fn(self.pickItems, inputs, parallel_iterations=20, swap_memory=True)
-        
+
     def pickItems(self, inputVec):
-        sparseTriuTens = tf.SparseTensor(self.triu_indices, 
-                                        values=inputVec, 
-                                        dense_shape=[self.matsize, self.matsize] )
+        sparseTriuTens = tf.SparseTensor(
+            self.triu_indices,
+            values=inputVec,
+            dense_shape=[self.matsize, self.matsize],
+        )
         return tf.sparse.to_dense(sparseTriuTens)
 
     def get_config(self):

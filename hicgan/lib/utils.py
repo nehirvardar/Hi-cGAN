@@ -733,24 +733,34 @@ def plotMatrix(pMatrix, pFilename, pTitle):
     plt.close(fig1)
     del fig1, ax1
 
-def plotLoss(pGeneratorLossValueLists, pDiscLossValueLists, pGeneratorLossNameList, pDiscLossNameList, pFilename, useLogscaleList=[False, False]):
+def plotLoss(pGeneratorLossValueLists, pDiscLossValueLists, pGeneratorLossNameList, pDiscLossNameList, pFilename, useLogscaleList=[False, False], pYLabel="loss", pLegendTitle="Model"):
     #plot loss and validation loss over epoch numbers
-    fig1, ax1 = plt.subplots(figsize=(6,4.5))
-    nr_epochs = len(pGeneratorLossValueLists[0])
+    fig1, ax1 = plt.subplots(figsize=(6, 4.5))
+    nr_epochs = len(pGeneratorLossValueLists[0]) if pGeneratorLossValueLists else 0
+    if nr_epochs == 0:
+        plt.close(fig1)
+        return
     x_vals = np.arange(nr_epochs) + 1
+    has_positive = False
     for generatorLossVals, _ in zip(pGeneratorLossValueLists, pGeneratorLossNameList):
+        arr = np.asarray(generatorLossVals, dtype=float)
+        if np.any(np.isfinite(arr) & (arr > 0)):
+            has_positive = True
         ax1.plot(x_vals, generatorLossVals)
     ax1.set_title('model loss')
-    ax1.set_ylabel('generator loss')
+    ax1.set_ylabel(pYLabel)
     ax1.set_xlabel('epoch')
-    if useLogscaleList[0]:
+    if useLogscaleList[0] and has_positive:
         ax1.set_yscale('log')
-    ax2 = ax1.twinx()
-    for discLossVals, _ in zip(pDiscLossValueLists, pDiscLossNameList):
-        ax2.plot(x_vals, discLossVals, ":")
-    ax2.set_ylabel("discriminator loss")
-    if useLogscaleList[1]:
-        ax2.set_yscale('log')
+    has_disc = bool(pDiscLossValueLists) and bool(pDiscLossNameList)
+    ax2 = None
+    if has_disc:
+        ax2 = ax1.twinx()
+        for discLossVals, _ in zip(pDiscLossValueLists, pDiscLossNameList):
+            ax2.plot(x_vals, discLossVals, ":")
+        ax2.set_ylabel("discriminator loss")
+        if len(useLogscaleList) > 1 and useLogscaleList[1]:
+            ax2.set_yscale('log')
     locVal = 0
     if nr_epochs <= 25:
         locVal = 1
@@ -771,8 +781,8 @@ def plotLoss(pGeneratorLossValueLists, pDiscLossValueLists, pGeneratorLossNameLi
     ax1.xaxis.set_major_locator(MultipleLocator(locVal))
     ax1.grid(True, which="both")
     if len(pGeneratorLossNameList) > 1:
-        ax1.legend(pGeneratorLossNameList, loc='upper right', title="Generator")
-    if len(pDiscLossNameList) > 1:
+        ax1.legend(pGeneratorLossNameList, loc='upper right', title=pLegendTitle)
+    if has_disc and len(pDiscLossNameList) > 1:
         ax2.legend(pDiscLossNameList, loc="lower right", title="Discriminator")
     fig1.tight_layout()
     fig1.savefig(pFilename)

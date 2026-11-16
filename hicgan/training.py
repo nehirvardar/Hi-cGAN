@@ -117,53 +117,53 @@ def parse_arguments(args=None):
                         help="Number of epochs for training (default: 50).")
     parser.add_argument("--earlyStoppingPatience", "--earlyStop", "-es", dest="earlyStoppingPatience",
                         required=False, type=int, default=10,
-                        help="EarlyStopping patience on deterministic validation pixel reconstruction loss (default: 10; set 0 to disable).")
+                        help="EarlyStopping patience on deterministic validation diffusion loss (default: 10; set 0 to disable).")
     parser.add_argument("--dropout", "-drop", required=False,
                         type=float, default=0.0,
-                        help="U-Net upsampling dropout rate in Generator (default: 0.0 for deterministic regression).")
-    parser.add_argument("--underpredBoost", "-upb", required=False,
-                        type=float, default=1.5,
-                        help="Under-prediction penalty multiplier for active foreground contacts where gen_output < target (default: 1.5).")
+                        help="U-Net upsampling dropout rate in Diffusion Denoiser (default: 0.0 for Phase 1 parity).")
+    parser.add_argument("--timesteps", "-T", required=False,
+                        type=int, default=1000,
+                        help="Number of DDPM diffusion timesteps (default: 1000).")
+    parser.add_argument("--sampleSteps", "-ss", required=False,
+                        type=int, default=25,
+                        help="Number of deterministic DDIM sampling steps used during inference (default: 25).")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
                         help="Batch size for training.")
     parser.add_argument("--lossWeightPixel", "-lwp", required=False,
                         type=float,
-                        default=100.0,
-                        help="Loss weight for L1/L2 error of generator.")
-    parser.add_argument("--lossWeightDiscriminator", "-lwd", required=False,
-                        type=float,
-                        default=0.5,
-                        help="Loss weight (multiplicator) for the discriminator loss.")
-    parser.add_argument("--lossTypePixel", "-ltp", required=False,
-                        type=str, choices=["L1", "L2"],
-                        default="L1",
-                        help="Type of per-pixel loss to use for the generator.")
+                        default=1.0,
+                        help="Loss weight for weighted epsilon/noise prediction MSE in Diffusion loss (default: 1.0).")
     parser.add_argument("--foregroundLossWeight", "-flw", required=False,
                         type=float,
-                        default=10.0,
-                        help="Extra loss multiplier for non-zero foreground contacts (target > 0) in pixel loss "
-                             "to prevent sparse matrices from collapsing predictions into [0, 1]. Set 0 for unweighted L1/L2.")
-    parser.add_argument("--lossWeightTV", "-lwt", required=False,
+                        default=15.0,
+                        help="Extra epsilon-noise loss multiplier for non-zero foreground targets (x0 > 0) (default: 15.0).")
+    parser.add_argument("--peakLossWeight", "-plw", required=False,
                         type=float,
-                        default=1e-10,
-                        help="Loss weight for Total-Variation-loss of generator.")
-    parser.add_argument("--lossWeightAdversarial", "-lwa", required=False,
+                        default=10.0,
+                        help="Additional intensity-proportional epsilon-noise loss multiplier scaled by x0 (default: 10.0).")
+    parser.add_argument("--x0LossWeight", "-xlw", required=False,
                         type=float,
                         default=1.0,
-                        help="Loss weight for adversarial loss in generator.")
-    parser.add_argument("--learningRateGenerator", "-lrg", required=False,
+                        help="Loss weight for alpha_bar_t-weighted leaky-clipped x0 reconstruction MSE loss (default: 1.0).")
+    parser.add_argument("--bgL1Weight", "-bglw", required=False,
+                        type=float,
+                        default=0.5,
+                        help="Loss weight for silent background L1 penalty on (x0 == 0) pixels (default: 0.5).")
+    parser.add_argument("--leakyClipSlope", "-lcs", required=False,
+                        type=float,
+                        default=0.25,
+                        help="Leaky clip slope outside [0, 1] for x0 reconstruction stabilization (default: 0.25).")
+    parser.add_argument("--learningRate", "--learningRateGenerator", "-lr", "-lrg",
+                        dest="learningRate",
+                        required=False,
                         type=float,
                         default=2e-5,
-                        help="Learning rate for Adam optimizer of generator.")
-    parser.add_argument("--learningRateDiscriminator", "-lrd", required=False,
-                        type=float,
-                        default=1e-6,
-                        help="Learning rate for Adam optimizer of discriminator.")
+                        help="Learning rate for Adam optimizer of Diffusion Denoiser (default: 2e-5).")
     parser.add_argument("--beta1", "-b1", required=False,
                         type=float,
                         default=0.5,
-                        help="Beta1 parameter for Adam optimizers (gen. and disc.)")
+                        help="Beta1 parameter for Adam optimizer.")
     parser.add_argument("--flipSamples", "-fs", required=False,
                         action='store_true',
                         help="Flip training matrices and chromatin features (data augmentation).")
@@ -575,12 +575,7 @@ def training(pTfRecordFilenames,
              pOutputFolder,
              pEpochs,
              pLossWeightPixel,
-             pLossWeightDiscriminator,
-             pLossWeightAdversarial,
-             pLossTypePixel,
-             pLossWeightTV,
-             pLearningRateGenerator,
-             pLearningRateDiscriminator,
+             pLearningRate,
              pBeta1,
              pFigureFileFormat,
              pPlotFrequency,
@@ -598,11 +593,16 @@ def training(pTfRecordFilenames,
              pInputMode="feature_pack",
              pWindowMode="grid",
              pLogTransformTarget=False,
-             pForegroundLossWeight=10.0,
-             pUnderpredBoost=1.5,
+             pForegroundLossWeight=15.0,
+             pPeakLossWeight=10.0,
+             pX0LossWeight=1.0,
+             pBgL1Weight=0.5,
+             pLeakyClipSlope=0.25,
              pDropout=0.0,
              pEarlyStoppingPatience=10,
-             pUsePairFeatures=True
+             pUsePairFeatures=True,
+             pTimesteps=1000,
+             pSampleSteps=25
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -676,8 +676,9 @@ def training(pTfRecordFilenames,
             has_pair = bool(pUsePairFeatures) and (pInputMode == "feature_pack")
             flippedDs = trainDs.map(lambda a,b: records.mirror_function(a["factorData"], b["out_matrixData"], is_2d_input=is_2d_inp, is_grid_mode=is_grid_m, has_pair_2d=has_pair))
             trainDs = trainDs.concatenate(flippedDs)
+        total_train_samples = int(nr_trainingSamples) * (2 if pFlipSamples else 1)
         trainDs = trainDs.shuffle(buffer_size=shuffleBufferSize, reshuffle_each_iteration=True)
-        trainDs = trainDs.batch(pBatchSize, drop_remainder=True)
+        trainDs = trainDs.batch(pBatchSize, drop_remainder=(total_train_samples >= pBatchSize))
         trainDs = trainDs.prefetch(tf.data.experimental.AUTOTUNE)
         #build the input streams for validation
         validationDs = tf.data.TFRecordDataset(valdataRecords,
@@ -690,9 +691,7 @@ def training(pTfRecordFilenames,
         validationDs = validationDs.batch(pBatchSize)
         validationDs = validationDs.prefetch(tf.data.experimental.AUTOTUNE)
         
-        steps_per_epoch = max(1, int(np.floor(nr_trainingSamples / pBatchSize)))
-        if pFlipSamples:
-            steps_per_epoch *= 2
+        steps_per_epoch = max(1, int(np.floor(total_train_samples / pBatchSize)))
         decay_steps = max(1, int(pEpochs) * int(steps_per_epoch))
 
         use_embedding = (pInputMode in ("bigwig", "feature_pack"))
@@ -702,29 +701,29 @@ def training(pTfRecordFilenames,
             if stored_shape is not None and len(stored_shape) >= 2:
                 pNumberOfFactors = int(stored_shape[1])
 
-        hicGanModel = hicGAN.HiCGAN(log_dir=pOutputFolder, 
-                                        number_factors=pNumberOfFactors,
-                                        loss_weight_pixel=pLossWeightPixel,
-                                        loss_weight_adversarial=pLossWeightAdversarial,
-                                        loss_weight_discriminator=pLossWeightDiscriminator, 
-                                        loss_type_pixel=pLossTypePixel,
-                                        foreground_loss_weight=pForegroundLossWeight,
-                                        underpred_boost_factor=pUnderpredBoost,
-                                        dropout_rate=pDropout,
-                                        decay_steps=decay_steps,
-                                        loss_weight_tv=pLossWeightTV, 
-                                        input_size=pWindowSize,
-                                        learning_rate_generator=pLearningRateGenerator,
-                                        learning_rate_discriminator=pLearningRateDiscriminator,
-                                        adam_beta_1=pBeta1,
-                                        plot_type=pFigureFileFormat,
-                                        plot_frequency=pPlotFrequency,
-                                        scope=pScope,
-                                        mixed_precision=pMixedPrecision,
-                                        restore_checkpoint=pResume,
-                                        use_embedding=use_embedding,
-                                        enforce_symmetry=enforce_symmetry,
-                                        use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
+        hicGanModel = hicGAN.HiCGAN(log_dir=pOutputFolder,
+                                    number_factors=pNumberOfFactors,
+                                    timesteps=pTimesteps,
+                                    sample_steps=pSampleSteps,
+                                    loss_weight_pixel=pLossWeightPixel,
+                                    foreground_loss_weight=pForegroundLossWeight,
+                                    peak_loss_weight=pPeakLossWeight,
+                                    x0_loss_weight=pX0LossWeight,
+                                    bg_l1_weight=pBgL1Weight,
+                                    leaky_clip_slope=pLeakyClipSlope,
+                                    dropout_rate=pDropout,
+                                    decay_steps=decay_steps,
+                                    input_size=pWindowSize,
+                                    learning_rate=pLearningRate,
+                                    adam_beta_1=pBeta1,
+                                    plot_type=pFigureFileFormat,
+                                    plot_frequency=pPlotFrequency,
+                                    scope=pScope,
+                                    mixed_precision=pMixedPrecision,
+                                    restore_checkpoint=pResume,
+                                    use_embedding=use_embedding,
+                                    enforce_symmetry=enforce_symmetry,
+                                    use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
         
         hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
@@ -826,12 +825,12 @@ def main(args=None):
     randomSeed = args.seed if args.seed is not None else (loaded_meta.get("seed", 42) if loaded_meta else 42)
 
     log.info(
-        "[MAIN] Starting hicTraining: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
-        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, dropout=%s, underpredBoost=%s, "
+        "[MAIN] Starting hicTraining (Diffusion): inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
+        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, timesteps=%d, sampleSteps=%d, dropout=%s, "
         "earlyStoppingPatience=%s, binSize=%d, logTransformTarget=%s, seed=%s",
         inputMode, windowMode, str(args.gridStride), args.windowSize,
-        featureSet, str(usePairFeatures), str(args.targetNorm), str(args.dropout),
-        str(args.underpredBoost), str(args.earlyStoppingPatience),
+        featureSet, str(usePairFeatures), str(args.targetNorm), args.timesteps, args.sampleSteps,
+        str(args.dropout), str(args.earlyStoppingPatience),
         args.binSize, str(args.logTransformTarget), str(args.seed)
     )
 
@@ -1022,8 +1021,10 @@ def main(args=None):
                 "filterEmptyWindows": args.filterEmptyWindows,
                 "featureSet": featureSet,
                 "usePairFeatures": usePairFeatures,
+                "modelType": "diffusion",
+                "timesteps": int(args.timesteps),
+                "sampleSteps": int(args.sampleSteps),
                 "dropout": args.dropout,
-                "underpredBoost": args.underpredBoost,
                 "earlyStoppingPatience": args.earlyStoppingPatience,
                 "seed": randomSeed,
                 "created_at": datetime.utcnow().isoformat()
@@ -1056,12 +1057,7 @@ def main(args=None):
                 pOutputFolder=args.outputFolder,
                 pEpochs=args.epochs,
                 pLossWeightPixel=args.lossWeightPixel,
-                pLossWeightDiscriminator=args.lossWeightDiscriminator,
-                pLossWeightAdversarial=args.lossWeightAdversarial,
-                pLossTypePixel=args.lossTypePixel,
-                pLossWeightTV=args.lossWeightTV,
-                pLearningRateGenerator=args.learningRateGenerator,
-                pLearningRateDiscriminator=args.learningRateDiscriminator,
+                pLearningRate=args.learningRate,
                 pBeta1=args.beta1,
                 pFigureFileFormat=args.figureFileFormat,
                 pPlotFrequency=args.plotFrequency,
@@ -1080,10 +1076,15 @@ def main(args=None):
                 pWindowMode=windowMode,
                 pLogTransformTarget=args.logTransformTarget,
                 pForegroundLossWeight=args.foregroundLossWeight,
-                pUnderpredBoost=args.underpredBoost,
+                pPeakLossWeight=args.peakLossWeight,
+                pX0LossWeight=args.x0LossWeight,
+                pBgL1Weight=args.bgL1Weight,
+                pLeakyClipSlope=args.leakyClipSlope,
                 pDropout=args.dropout,
                 pEarlyStoppingPatience=args.earlyStoppingPatience,
-                pUsePairFeatures=usePairFeatures
+                pUsePairFeatures=usePairFeatures,
+                pTimesteps=args.timesteps,
+                pSampleSteps=args.sampleSteps
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)

@@ -21,7 +21,7 @@ def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--trainedModel", "-trm", required=False,
                         type=str,
-                        help="Trained generator model to predict from (or directory containing generator_best.keras)")
+                        help="Trained Diffusion Denoiser model to predict from (or directory containing denoiser_best.keras)")
     parser.add_argument("--dataDir", "-d", required=False,
                         type=str, default=None,
                         help="Directory containing ground-truth/reference .npz matrices (used for chromosome bin sizes and --runEval).")
@@ -154,6 +154,12 @@ def parse_arguments(args=None):
                                 "'predict' (run prediction using the trained model; requires GPU), "
                                 "'make-matrix' (build final matrix from existing predictions; CPU only), "
                                 "'all' (run all steps sequentially)")
+    parser.add_argument("--timesteps", "-T", required=False,
+                        type=int, default=None,
+                        help="Number of DDPM diffusion timesteps (auto-loaded from hicgan_metadata.pkl or default 1000).")
+    parser.add_argument("--sampleSteps", "-ss", required=False,
+                        type=int, default=None,
+                        help="Number of deterministic DDIM inference steps (auto-loaded from hicgan_metadata.pkl or default 25).")
     parser.add_argument('--version', action='version',
                            version='%(prog)s {}'.format(__version__))
     return parser
@@ -292,7 +298,7 @@ def createDataContainer(pChromNameList, pOutputFolder, pChromatinFolder, pBinSiz
         windowCoordsList,
     )
 
-def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="grid", pGridStride=16, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None, pFeatureSet=None, pUsePairFeatures=None, pDataDir=None, pSplitFile=None, pSplit="test", pBlendMode=None, pRunEval=False, pGtDir=None):
+def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromosomes, pOutputFolder, pMultiplier, pBinSize, pBatchSize, pWindowSize, pMatrixOutputName, pParameterOutputFile, pSaveMemory=False, pNumberOfBatches=20, pScope=None, pMode="all", pIncludeRegions=None, pTargetValueRange=None, pRebuildProcesses=0, pInputMode=None, pWindowMode="grid", pGridStride=16, pChromSizesPath=None, pSeed=42, pLogTransformTarget=False, pNpzOutputFolder=None, pFlankPadChromosomes=None, pFlankPadMaxBins=None, pFlankPadMinRatio=None, pFeatureSet=None, pUsePairFeatures=None, pDataDir=None, pSplitFile=None, pSplit="test", pBlendMode=None, pRunEval=False, pGtDir=None, pTimesteps=None, pSampleSteps=None):
     trainedmodel = pTrainedModel
     predictionChromosomesFolders = pPredictionChromosomesFolders
     predictionChromosomes = pPredictionChromosomes
@@ -333,7 +339,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             windowSize = int(preloaded_vars["windowSize"])
 
     if trainedmodel and os.path.isdir(trainedmodel):
-        for cand_name in ("generator_best.keras", "generator_final.keras"):
+        for cand_name in ("denoiser_best.keras", "denoiser_final.keras", "generator_best.keras", "generator_final.keras"):
             cand_p = os.path.join(trainedmodel, cand_name)
             if os.path.exists(cand_p):
                 trainedmodel = cand_p
@@ -410,8 +416,15 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                         featureSet = meta_obj.get("featureSet")
                     if usePairFeatures is None and meta_obj.get("usePairFeatures") is not None:
                         usePairFeatures = bool(meta_obj.get("usePairFeatures"))
+                    if pTimesteps is None and meta_obj.get("timesteps") is not None:
+                        pTimesteps = int(meta_obj.get("timesteps"))
+                    if pSampleSteps is None and meta_obj.get("sampleSteps") is not None:
+                        pSampleSteps = int(meta_obj.get("sampleSteps"))
             except Exception as exc:
                 log.debug("Could not read metadata from %s: %s", candidateMeta, str(exc))
+
+    resolvedTimesteps = int(pTimesteps) if pTimesteps is not None else 1000
+    resolvedSampleSteps = int(pSampleSteps) if pSampleSteps is not None else 25
 
     if pFlankPadChromosomes is None and pFlankPadMaxBins is None and pFlankPadMinRatio is None:
         pFlankPadChromosomes = ["all"]
@@ -595,13 +608,15 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
         trained_GAN = hicGAN.HiCGAN(
             log_dir=outputFolder,
             number_factors=nr_factors,
+            timesteps=resolvedTimesteps,
+            sample_steps=resolvedSampleSteps,
             input_size=windowSize,
             scope=pScope,
             use_embedding=use_embedding,
             enforce_symmetry=enforce_symmetry,
             use_pair_features=bool(usePairFeatures) and (inputMode == "feature_pack"),
         )
-        trained_GAN.loadGenerator(trainedModelPath=trainedmodel)
+        trained_GAN.load_denoiser(trainedModelPath=trainedmodel)
         predictionFiles = []
         predictedChroms = []
 
@@ -1052,7 +1067,7 @@ def _run_unified_eval(
         chroms=chromNameList,
         eval_out_dir=eval_out_dir,
         bin_size=binSize,
-        run_name=os.path.basename(os.path.normpath(outputFolder)) or "rna-cgan-clean",
+        run_name=os.path.basename(os.path.normpath(outputFolder)) or "rna-diffusion-clean",
         make_plots=True,
         chromatin_dir=chromatin_dir,
         feature_set=feature_set,
@@ -1120,7 +1135,9 @@ def main(args=None):
         pSplit=args.split,
         pBlendMode=args.blendMode,
         pRunEval=args.runEval,
-        pGtDir=args.gtDir)
+        pGtDir=args.gtDir,
+        pTimesteps=args.timesteps,
+        pSampleSteps=args.sampleSteps)
 
 
 if __name__ == "__main__":
