@@ -577,20 +577,27 @@ class HiCGAN():
         inp_xlabel = "Genomik Bin (j)"
         inp_ylabel = "Genomik Bin (i)"
         if inp_sample.ndim == 3 and inp_sample.shape[-1] == 1:
-            inp_disp = inp_sample[:, :, 0]
-            inp_title = "Girdi (Input 2D)"
-        elif (
+            inp_sample = inp_sample[:, :, 0]
+        if (
             inp_sample.ndim == 2
+            and self.use_embedding
             and self.use_pair_features
             and inp_sample.shape[0] == 3 * self.input_size
             and inp_sample.shape[1] >= self.input_size
         ):
             inp_disp = inp_sample[self.input_size : 2 * self.input_size, -self.input_size :]
             inp_title = "Girdi (2D Pair Window)"
-        elif inp_sample.ndim == 2 and inp_sample.shape[0] == 3 * self.input_size:
+        elif (
+            inp_sample.ndim == 2
+            and self.use_embedding
+            and inp_sample.shape[0] == 3 * self.input_size
+        ):
             inp_disp = inp_sample[self.input_size : 2 * self.input_size, :]
             inp_title = f"Girdi (1D Features, {inp_sample.shape[1]} ch)"
             inp_xlabel = "Feature Kanalı"
+        elif inp_sample.ndim == 2:
+            inp_disp = inp_sample
+            inp_title = "Girdi (Input 2D)"
         else:
             inp_disp = np.squeeze(inp_sample)
             if inp_disp.ndim > 2:

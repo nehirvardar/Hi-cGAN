@@ -1369,7 +1369,11 @@ def evaluate_predictions_dir(
                 n_bins = int(gt_dense.shape[0])
                 pair_sp = None
                 if use_pair_features:
-                    pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                    try:
+                        pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                    except Exception as pair_exc:
+                        log.debug("2D pair features unavailable for chr%s, falling back to 1D: %s", chrom, str(pair_exc))
+                        pair_sp = None
                 if pair_sp is not None and pair_sp.nnz > 0:
                     input_mat = np.asarray(pair_sp.toarray(), dtype=np.float64)
                     input_title = f"Girdi (2D kmer7_revcomp_cosine) chr{chrom}"
@@ -2057,7 +2061,11 @@ def compare_two_models(
                     n_bins = int(gt_dense.shape[0])
                     pair_sp = None
                     if use_pair_features:
-                        pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                        try:
+                            pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                        except Exception as pair_exc:
+                            log.debug("2D pair features unavailable for chr%s in comparison, falling back to 1D: %s", chrom, str(pair_exc))
+                            pair_sp = None
                     if pair_sp is not None and pair_sp.nnz > 0:
                         input_mat = np.asarray(pair_sp.toarray(), dtype=np.float64)
                         input_title = f"Girdi (Input)\n2D kmer7_revcomp_cosine chr{chrom}"

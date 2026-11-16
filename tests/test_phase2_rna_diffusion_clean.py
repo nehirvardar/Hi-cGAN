@@ -296,6 +296,15 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         v2 = [float(x) for x in model.validationStep(cond_inp_4d, tf.constant(tgt))]
         np.testing.assert_allclose(v1, v2, atol=1e-6)
 
+        # generate_images slices center (64, 64) 2D pair window from 4D (B, 192, 92, 1) feature_pack tensor
+        from unittest import mock
+        with mock.patch("hicgan.lib.evaluation.render_comparison_panels") as mock_rcp:
+            model.generate_images(model.denoiser, {"factorData": cond_inp_4d}, {"out_matrixData": tf.constant(tgt)}, epoch=0)
+            mock_rcp.assert_called_once()
+            _, rcp_kw = mock_rcp.call_args
+            self.assertEqual(rcp_kw["input_mat"].shape, (64, 64))
+            self.assertEqual(rcp_kw["input_title"], "Girdi (2D Pair Window)")
+
     def test_05_ddim_caching_determinism_and_save_load(self):
         out_dir = os.path.join(self.tmp_root, "ddim_cache_test")
         os.makedirs(out_dir, exist_ok=True)
@@ -619,6 +628,44 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         w_6panel_1d = mpimg.imread(hm6_1d_path).shape[1]
         self.assertGreater(w_6panel_1d, w_5panel)
         self.assertTrue(os.path.exists(res_6_1d["files"]["leaderboard_csv"]))
+
+        # 2c-bis) Fallback to 1D bin features when use_pair_features=True but get_chrom_pair_matrix fails
+        cmp_6_fallback = os.path.join(self.tmp_root, "two_model_cmp_6panel_fallback")
+        from unittest import mock
+        with mock.patch("hicgan.lib.featurePack.get_chrom_pair_matrix", side_effect=FileNotFoundError("no pair")):
+            res_fb = evaluation.compare_two_models(
+                cgan_dir=cgan_root,
+                diffusion_dir=diff_root,
+                npz_data_dir=self.gt_dir,
+                eval_out_dir=cmp_6_fallback,
+                bin_size=self.bin_size,
+                chroms=["21"],
+                chromatin_dir=self.fp_dir,
+                feature_set="representative",
+                use_pair_features=True,
+            )
+        hm6_fb_path = os.path.join(cmp_6_fallback, "comparison_heatmaps_chr21.png")
+        self.assertTrue(os.path.exists(hm6_fb_path))
+        self.assertGreater(mpimg.imread(hm6_fb_path).shape[1], w_5panel)
+
+        # 2c-ter) Multi-chromosome comparison (chr1 + chr21)
+        gt_1, _ = utils.getMatrixFromNpz(self.gt_dir, "1", pBinSizeInt=self.bin_size)
+        sparse.save_npz(os.path.join(cgan_npz_dir, "chr1.npz"), gt_1)
+        sparse.save_npz(os.path.join(diff_npz_dir, "chr1.npz"), gt_1)
+        cmp_multi = os.path.join(self.tmp_root, "two_model_cmp_multi")
+        res_multi = evaluation.compare_two_models(
+            cgan_dir=cgan_root,
+            diffusion_dir=diff_root,
+            npz_data_dir=self.gt_dir,
+            eval_out_dir=cmp_multi,
+            bin_size=self.bin_size,
+            chroms=["1", "21"],
+            chromatin_dir=self.fp_dir,
+        )
+        self.assertEqual(res_multi["fairness_audit"]["evaluated_chromosomes"], ["chr1", "chr21"])
+        self.assertEqual(len(res_multi["files"]["heatmap_pngs"]), 2)
+        self.assertTrue(os.path.exists(res_multi["files"]["per_chrom_png"]))
+        self.assertTrue(os.path.exists(res_multi["files"]["distance_curves_png"]))
 
         # 2d) Verify plot exception isolation in compare_two_models
         from unittest import mock
