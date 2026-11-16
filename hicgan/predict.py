@@ -413,6 +413,10 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             except Exception as exc:
                 log.debug("Could not read metadata from %s: %s", candidateMeta, str(exc))
 
+    rawTargetMode = False
+    if meta_obj_ref := (locals().get("meta_obj") if isinstance(locals().get("meta_obj"), dict) else None):
+        rawTargetMode = bool(meta_obj_ref.get("rawTargetMode", False) or (meta_obj_ref.get("targetNorm") == "none"))
+
     if pFlankPadChromosomes is None and pFlankPadMaxBins is None and pFlankPadMinRatio is None:
         pFlankPadChromosomes = ["all"]
     if featureSet is None:
@@ -435,7 +439,13 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
     if pTargetValueRange:
         if os.path.exists(str(pTargetValueRange)):
             rangeCfg = utils.loadTargetRangeConfig(pTargetValueRange)
-            if str(rangeCfg.get("method", "")).lower() == "p99_log10":
+            method_l = str(rangeCfg.get("method", "")).lower()
+            if method_l == "none":
+                targetValueRange = None
+                rawTargetMode = True
+                logTransformTarget = False
+                msg_sc = "[PREDICT-SCALE] Target normalization disabled (method='none'); predictions stay in raw count space."
+            elif method_l == "p99_log10":
                 targetValueRange = rangeCfg
                 msg_sc = (
                     f"[PREDICT-SCALE] Undoing P99 ln(1+10x) mapping with hi={float(rangeCfg['hi']):.6f}, "
@@ -600,6 +610,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             use_embedding=use_embedding,
             enforce_symmetry=enforce_symmetry,
             use_pair_features=bool(usePairFeatures) and (inputMode == "feature_pack"),
+            raw_target_mode=rawTargetMode,
         )
         trained_GAN.loadGenerator(trainedModelPath=trainedmodel)
         predictionFiles = []
@@ -793,6 +804,7 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             "inputMode": inputMode,
             "windowMode": windowMode,
             "targetValueRange": targetValueRange,
+            "rawTargetMode": rawTargetMode,
             "logTransformTarget": logTransformTarget,
             "blendMode": blendMode,
             "trainedmodel": trainedmodel,

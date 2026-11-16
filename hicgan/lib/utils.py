@@ -686,8 +686,23 @@ def loadTargetRangeConfig(pPath):
     with open(pPath, "r", encoding="utf-8") as fh:
         d = json.load(fh)
     method = str(d.get("method", "minmax_log1p" if d.get("log_transform", False) else "unit_range")).lower()
-    hi = float(d.get("hi", d.get("max", 1.0)))
-    lo = float(d.get("min", 0.0))
+    if method == "none":
+        return {
+            "method": "none",
+            "min": 0.0,
+            "max": None,
+            "hi": None,
+            "scale_factor": 1.0,
+            "clip_percentile": float(d.get("clip_percentile", 99.0)),
+            "log_transform": False,
+            "train_chromosomes": d.get("train_chromosomes"),
+        }
+    raw_hi = d.get("hi")
+    if raw_hi is None:
+        raw_hi = d.get("max")
+    hi = float(raw_hi) if raw_hi is not None else 1.0
+    raw_lo = d.get("min")
+    lo = float(raw_lo) if raw_lo is not None else 0.0
     scale_factor = float(d.get("scale_factor", 10.0))
     log_transform = bool(d.get("log_transform", method.startswith("p99")))
     return {

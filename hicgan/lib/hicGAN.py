@@ -135,7 +135,10 @@ class HiCGAN():
                     restore_checkpoint: bool = False,
                     use_embedding: bool = True,
                     enforce_symmetry: bool = True,
-                    use_pair_features: bool = False):
+                    use_pair_features: bool = False,
+                    bg_l1_weight: float = 0.0,
+                    loss_mode: str = "current",
+                    raw_target_mode: bool = False):
         super().__init__()
         # When True, optimizers are wrapped for loss scaling and the loss
         # functions cast their inputs to float32. The global mixed_float16
@@ -144,6 +147,9 @@ class HiCGAN():
         self.mixed_precision = mixed_precision
         self.use_embedding = bool(use_embedding)
         self.enforce_symmetry = bool(enforce_symmetry)
+        self.bg_l1_weight = float(bg_l1_weight)
+        self.loss_mode = str(loss_mode or "current")
+        self.raw_target_mode = bool(raw_target_mode)
 
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
@@ -168,8 +174,9 @@ class HiCGAN():
             f"[MODEL-INIT] HiCGAN configuration: input_size={self.input_size}, number_factors={self.number_factors}, "
             f"use_embedding={self.use_embedding} ({'1D -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
             f"use_pair_features={self.use_pair_features}, enforce_symmetry={self.enforce_symmetry}, "
+            f"loss_mode={self.loss_mode}, raw_target_mode={self.raw_target_mode}, "
             f"loss_type_pixel={self.loss_type_pixel}, foreground_loss_weight={self.foreground_loss_weight}, "
-            f"underpred_boost_factor={self.underpred_boost_factor}, dropout_rate={self.dropout_rate}, "
+            f"underpred_boost_factor={self.underpred_boost_factor}, bg_l1_weight={self.bg_l1_weight}, dropout_rate={self.dropout_rate}, "
             f"decay_steps={self.decay_steps}, mixed_precision={self.mixed_precision}"
         )
         log.info(init_msg)
@@ -377,7 +384,10 @@ class HiCGAN():
         #enforce symmetry only in diagonal window mode
         if self.enforce_symmetry:
             x = Symmetrize2DLayer(name="gen_symmetrize")(x)
-        x = tf.keras.layers.Activation("sigmoid")(x)
+        if self.raw_target_mode:
+            x = tf.keras.layers.ReLU()(x)
+        else:
+            x = tf.keras.layers.Activation("sigmoid")(x)
 
         return tf.keras.Model(inputs=inputs, outputs=x, name="Generator")
 
@@ -395,8 +405,8 @@ class HiCGAN():
         else: 
             per_pixel_err = tf.square(target - gen_output)
 
+        fg_mask = tf.cast(target > 1e-5, tf.float32)
         if self.foreground_loss_weight > 0.0:
-            fg_mask = tf.cast(target > 1e-5, tf.float32)
             # Active contacts (target > 0) receive (1 + foreground_loss_weight * (1 + 2 * target)) weight
             # so sparse peaks in P99 log-scaled space are not squashed toward 0.
             pixel_weights = 1.0 + float(self.foreground_loss_weight) * fg_mask * (
@@ -407,6 +417,11 @@ class HiCGAN():
             pixel_loss = tf.reduce_mean(pixel_weights * underpred_boost * per_pixel_err)
         else:
             pixel_loss = tf.reduce_mean(per_pixel_err)
+
+        if self.bg_l1_weight > 0.0:
+            zero_mask = 1.0 - fg_mask
+            bg_l1_loss = tf.reduce_mean(zero_mask * tf.abs(gen_output))
+            pixel_loss = pixel_loss + float(self.bg_l1_weight) * bg_l1_loss
 
         tv_loss = tf.reduce_mean(tf.image.total_variation(gen_output))
         total_gen_loss = self.loss_weight_pixel * pixel_loss + self.loss_weight_adversarial * advers_loss + self.loss_weight_tv * tv_loss
@@ -524,8 +539,12 @@ class HiCGAN():
         tar_raw = np.squeeze(np.asarray(tar_img, dtype=np.float64))
         pred_raw = np.squeeze(np.asarray(pred_img, dtype=np.float64))
         pred_mse = float(np.mean(np.square(tar_raw - pred_raw)))
-        gt_disp = tar_raw * 0.5 + 0.5
-        pred_disp = pred_raw * 0.5 + 0.5
+        if self.raw_target_mode:
+            gt_disp = np.maximum(tar_raw, 0.0)
+            pred_disp = np.maximum(pred_raw, 0.0)
+        else:
+            gt_disp = tar_raw * 0.5 + 0.5
+            pred_disp = pred_raw * 0.5 + 0.5
         mae_val = float(np.mean(np.abs(pred_disp - gt_disp)))
 
         inp_sample = np.asarray(inp_tensor[0], dtype=np.float64)
@@ -710,7 +729,7 @@ class HiCGAN():
                 print(msg_pat)
 
             # saving the model every plot_frequency epochs
-            if (epoch + 1) % self.progress_plot_frequency == 0:
+            if self.progress_plot_frequency and self.progress_plot_frequency > 0 and (epoch + 1) % self.progress_plot_frequency == 0:
                 utils.plotLoss(pGeneratorLossValueLists=[self.__gen_train_loss_epochs, self.__gen_val_loss_epochs],
                               pDiscLossValueLists=[ [self.loss_weight_discriminator*sum(x) for x in zip(self.__disc_train_loss_fake_epochs, self.__disc_train_loss_true_epochs)],
                                                     self.__disc_train_loss_true_epochs, 

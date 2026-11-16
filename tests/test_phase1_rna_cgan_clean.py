@@ -433,6 +433,118 @@ def test_blend_modes_and_splitfile_cli():
         utils.rebuildMatrixGrid(preds, coords, W, M, blend_mode="invalid_mode")
 
 
+def test_loss_modes_and_no_logp_norm_toggle():
+    import pickle
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        # 1) All 3 --lossMode presets resolve exact weights
+        for mode_name, exp_fg, exp_upb, exp_bg in (
+            ("current", 10.0, 1.5, 0.0),
+            ("paper", 0.0, 1.0, 0.0),
+            ("balanced", 2.5, 1.0, 0.5),
+        ):
+            parsed = hic_training.parse_arguments().parse_args([
+                "-o", os.path.join(tmpdir, f"lm_{mode_name}"),
+                "--lossMode", mode_name,
+            ])
+            cfg = hic_training.resolve_loss_mode_params(parsed)
+            assert cfg["lossMode"] == mode_name
+            assert abs(cfg["foregroundLossWeight"] - exp_fg) < 1e-6
+            assert abs(cfg["underpredBoost"] - exp_upb) < 1e-6
+            assert abs(cfg["bgL1Weight"] - exp_bg) < 1e-6
+
+        # 2) Verify paper vs balanced pixel loss mechanics
+        m_paper = hicGAN.HiCGAN(
+            log_dir=os.path.join(tmpdir, "m_paper"),
+            number_factors=120,
+            input_size=64,
+            loss_mode="paper",
+            foreground_loss_weight=0.0,
+            underpred_boost_factor=1.0,
+            bg_l1_weight=0.0,
+            use_embedding=True,
+            use_pair_features=True,
+        )
+        m_bal = hicGAN.HiCGAN(
+            log_dir=os.path.join(tmpdir, "m_bal"),
+            number_factors=120,
+            input_size=64,
+            loss_mode="balanced",
+            foreground_loss_weight=2.5,
+            underpred_boost_factor=1.0,
+            bg_l1_weight=0.5,
+            use_embedding=True,
+            use_pair_features=True,
+        )
+        disc_zero = tf.zeros((2, 6, 6, 1), dtype=tf.float32)
+        tar_zero = tf.zeros((2, 64, 64, 1), dtype=tf.float32)
+        gen_half = tf.fill((2, 64, 64, 1), 0.5)
+        _, _, pix_paper, _ = m_paper.generator_loss(disc_zero, gen_half, tar_zero)
+        _, _, pix_bal, _ = m_bal.generator_loss(disc_zero, gen_half, tar_zero)
+        assert abs(float(pix_paper) - 0.5) < 1e-5
+        assert abs(float(pix_bal) - 0.75) < 1e-5  # 0.5 + 0.5 * 0.5
+
+        # 3) Verify --noLogpNorm + --lossMode balanced E2E (raw counts, ReLU Generator)
+        raw_train = os.path.join(tmpdir, "raw_cgan_train")
+        raw_pred = os.path.join(tmpdir, "raw_cgan_pred")
+        hic_training.main([
+            "-tm", "hicgan/data/rna_gt",
+            "-vm", "hicgan/data/rna_gt",
+            "-tchroms", "21",
+            "-vchroms", "22",
+            "-tcp", "data/feature_pack",
+            "-vcp", "data/feature_pack",
+            "-im", "feature_pack",
+            "-fset", "representative",
+            "-upf",
+            "-wm", "grid",
+            "-gs", "64",
+            "-ws", "64",
+            "--lossMode", "balanced",
+            "--noLogpNorm",
+            "-ep", "1",
+            "-bs", "4",
+            "--plotFrequency", "0",
+            "-o", raw_train,
+            "-seed", "42",
+        ])
+        with open(os.path.join(raw_train, "target_value_range.json"), "r", encoding="utf-8") as fh:
+            tvr = json.load(fh)
+        assert tvr["method"] == "none"
+        with open(os.path.join(raw_train, "hicgan_metadata.pkl"), "rb") as fh:
+            meta = pickle.load(fh)
+        assert meta["targetNorm"] == "none"
+        assert meta["logpNorm"] is False
+        assert meta["rawTargetMode"] is True
+        assert meta["lossMode"] == "balanced"
+        assert abs(meta["bgL1Weight"] - 0.5) < 1e-6
+
+        hic_predict.main([
+            "-trm", os.path.join(raw_train, "generator_best.keras"),
+            "-tcp", "data/feature_pack",
+            "-csp", "hicgan/data/rna_gt",
+            "-im", "feature_pack",
+            "-fset", "representative",
+            "-upf",
+            "-wm", "grid",
+            "-gs", "64",
+            "-ws", "64",
+            "-pc", "22",
+            "-bs", "4",
+            "-o", raw_pred,
+        ])
+        assert os.path.exists(os.path.join(raw_pred, "npz_matrices", "chr22.npz"))
+
+        # 4) Verify colab_rna_cgan_clean.ipynb has LOSS_MODE and USE_LOGP_NORM flags
+        with open("colab_rna_cgan_clean.ipynb", "r", encoding="utf-8") as fh:
+            nb = json.load(fh)
+        assert nb["nbformat"] == 4
+        nb_src = "\n".join("".join(c.get("source", [])) for c in nb["cells"])
+        assert "LOSS_MODE" in nb_src
+        assert "USE_LOGP_NORM" in nb_src
+        assert "--noLogpNorm" in nb_src
+
+
 class TestPhase1RnaCganClean(unittest.TestCase):
     def test_01_splits_file_integrity_and_no_leakage(self):
         test_splits_file_integrity_and_no_leakage()
@@ -454,6 +566,9 @@ class TestPhase1RnaCganClean(unittest.TestCase):
 
     def test_07_phased_cdo_trainonly_and_phased_predict_and_windows_paths(self):
         test_phased_cdo_trainonly_and_phased_predict_and_windows_paths()
+
+    def test_08_loss_modes_and_no_logp_norm_toggle(self):
+        test_loss_modes_and_no_logp_norm_toggle()
 
 
 if __name__ == "__main__":

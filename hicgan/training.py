@@ -27,6 +27,45 @@ import pickle
 log = logging.getLogger(__name__)
 
 
+CGAN_LOSS_PRESETS = {
+    "current": {
+        "lossWeightPixel": 100.0,
+        "lossTypePixel": "L1",
+        "foregroundLossWeight": 10.0,
+        "underpredBoost": 1.5,
+        "bgL1Weight": 0.0,
+    },
+    "paper": {
+        "lossWeightPixel": 100.0,
+        "lossTypePixel": "L1",
+        "foregroundLossWeight": 0.0,
+        "underpredBoost": 1.0,
+        "bgL1Weight": 0.0,
+    },
+    "balanced": {
+        "lossWeightPixel": 100.0,
+        "lossTypePixel": "L1",
+        "foregroundLossWeight": 2.5,
+        "underpredBoost": 1.0,
+        "bgL1Weight": 0.5,
+    },
+}
+
+
+def resolve_loss_mode_params(args):
+    """Resolve effective cGAN loss weights from --lossMode and any explicit CLI overrides."""
+    mode = getattr(args, "lossMode", None) or "current"
+    preset = CGAN_LOSS_PRESETS[mode]
+    return {
+        "lossMode": mode,
+        "lossWeightPixel": float(preset["lossWeightPixel"] if args.lossWeightPixel is None else args.lossWeightPixel),
+        "lossTypePixel": str(preset["lossTypePixel"] if args.lossTypePixel is None else args.lossTypePixel),
+        "foregroundLossWeight": float(preset["foregroundLossWeight"] if args.foregroundLossWeight is None else args.foregroundLossWeight),
+        "underpredBoost": float(preset["underpredBoost"] if args.underpredBoost is None else args.underpredBoost),
+        "bgL1Weight": float(preset["bgL1Weight"] if args.bgL1Weight is None else args.bgL1Weight),
+    }
+
+
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataDir", "-d", required=False,
@@ -87,6 +126,12 @@ def parse_arguments(args=None):
                         default="p99_log10",
                         help="Target matrix normalization scheme: 'p99_log10' (default, global P99 clipped ln(1+10x) computed on training chromosomes only), "
                              "'minmax_log1p' (min-max of log1p(x)), 'unit_range' (min-max of raw x), or 'none'.")
+    parser.add_argument("--logpNorm", dest="logpNorm",
+                        action="store_true", default=None,
+                        help="Enable logp (p99_log10: ln(1+10x)/P99) target normalization (default: enabled).")
+    parser.add_argument("--noLogpNorm", "-nlpn", dest="logpNorm",
+                        action="store_false",
+                        help="Disable logp target normalization and keep target matrices as raw unnormalized counts (sets targetNorm='none').")
     parser.add_argument("--logTransformTarget", "-ltt", required=False,
                         action="store_true", default=False,
                         help="Apply log1p(x) transform to target matrices before [0, 1] scaling (inverted via expm1 in hicPredict).")
@@ -121,29 +166,38 @@ def parse_arguments(args=None):
     parser.add_argument("--dropout", "-drop", required=False,
                         type=float, default=0.0,
                         help="U-Net upsampling dropout rate in Generator (default: 0.0 for deterministic regression).")
+    parser.add_argument("--lossMode", "-lm", required=False,
+                        type=str, choices=["current", "paper", "balanced"],
+                        default="current",
+                        help="Loss preset for cGAN: 'current' (fg=10, underpred=1.5, bg_l1=0), "
+                             "'paper' (original Isola/Hi-cGAN unweighted 100*L1 + BCE + TV), or "
+                             "'balanced' (softened fg=2.5, underpred=1.0, bg_l1=0.5 penalty on zeros).")
     parser.add_argument("--underpredBoost", "-upb", required=False,
-                        type=float, default=1.5,
-                        help="Under-prediction penalty multiplier for active foreground contacts where gen_output < target (default: 1.5).")
+                        type=float, default=None,
+                        help="Under-prediction penalty multiplier for active foreground contacts where gen_output < target (defaults to --lossMode preset).")
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
                         help="Batch size for training.")
     parser.add_argument("--lossWeightPixel", "-lwp", required=False,
                         type=float,
-                        default=100.0,
-                        help="Loss weight for L1/L2 error of generator.")
+                        default=None,
+                        help="Loss weight for L1/L2 error of generator (defaults to --lossMode preset).")
     parser.add_argument("--lossWeightDiscriminator", "-lwd", required=False,
                         type=float,
                         default=0.5,
                         help="Loss weight (multiplicator) for the discriminator loss.")
     parser.add_argument("--lossTypePixel", "-ltp", required=False,
                         type=str, choices=["L1", "L2"],
-                        default="L1",
-                        help="Type of per-pixel loss to use for the generator.")
+                        default=None,
+                        help="Type of per-pixel loss to use for the generator (defaults to --lossMode preset).")
     parser.add_argument("--foregroundLossWeight", "-flw", required=False,
                         type=float,
-                        default=10.0,
-                        help="Extra loss multiplier for non-zero foreground contacts (target > 0) in pixel loss "
-                             "to prevent sparse matrices from collapsing predictions into [0, 1]. Set 0 for unweighted L1/L2.")
+                        default=None,
+                        help="Extra loss multiplier for non-zero foreground contacts (target > 0) in pixel loss (defaults to --lossMode preset).")
+    parser.add_argument("--bgL1Weight", "-bglw", required=False,
+                        type=float,
+                        default=None,
+                        help="Background L1 sparsity penalty on true zero target pixels (target == 0) (defaults to --lossMode preset).")
     parser.add_argument("--lossWeightTV", "-lwt", required=False,
                         type=float,
                         default=1e-10,
@@ -430,7 +484,13 @@ def create_data(pTrainingMatrices,
     targetValueRange = None
     useGlobalTargetRange = False
 
-    if pTargetNorm == "p99_log10" and not pScaleTargetToUnitRange and not pLogTransformTarget:
+    if pTargetNorm == "none":
+        import json
+        os.makedirs(pOutputFolder, exist_ok=True)
+        with open(rangePath, "w", encoding="utf-8") as fh:
+            json.dump({"method": "none", "scale_factor": 1.0, "hi": None}, fh, indent=2)
+        paramDict["targetValueRange"] = None
+    elif pTargetNorm == "p99_log10" and not pScaleTargetToUnitRange and not pLogTransformTarget:
         useGlobalTargetRange = True
         p99Cfg = utils.computeGlobalP99TargetRange(
             pTrainingMatrices,
@@ -476,7 +536,7 @@ def create_data(pTrainingMatrices,
     loadParams = {
         "scaleFeatures": True,
         "clampFeatures": False,
-        "scaleTargets": False if useGlobalTargetRange else noScaleNorm,
+        "scaleTargets": False if (useGlobalTargetRange or pTargetNorm == "none") else noScaleNorm,
         "windowSize": pWindowSize,
         "flankingSize": flankingSize,
         "maximumDistance": None,
@@ -602,7 +662,10 @@ def training(pTfRecordFilenames,
              pUnderpredBoost=1.5,
              pDropout=0.0,
              pEarlyStoppingPatience=10,
-             pUsePairFeatures=True
+             pUsePairFeatures=True,
+             pBgL1Weight=0.0,
+             pLossMode="current",
+             pRawTargetMode=False
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -724,7 +787,10 @@ def training(pTfRecordFilenames,
                                         restore_checkpoint=pResume,
                                         use_embedding=use_embedding,
                                         enforce_symmetry=enforce_symmetry,
-                                        use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
+                                        use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"),
+                                        bg_l1_weight=pBgL1Weight,
+                                        loss_mode=pLossMode,
+                                        raw_target_mode=pRawTargetMode)
         
         hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
@@ -825,13 +891,23 @@ def main(args=None):
     usePairFeatures = bool(args.usePairFeatures) and (inputMode == "feature_pack")
     randomSeed = args.seed if args.seed is not None else (loaded_meta.get("seed", 42) if loaded_meta else 42)
 
+    if args.logpNorm is False:
+        args.targetNorm = "none"
+        args.logTransformTarget = False
+    elif args.logpNorm is True and args.targetNorm == "none":
+        args.targetNorm = "p99_log10"
+
+    lossCfg = resolve_loss_mode_params(args)
+
     log.info(
         "[MAIN] Starting hicTraining: inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
-        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, dropout=%s, underpredBoost=%s, "
+        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, logpNorm=%s, lossMode=%s (lwp=%s, flw=%s, upb=%s, bglw=%s), dropout=%s, "
         "earlyStoppingPatience=%s, binSize=%d, logTransformTarget=%s, seed=%s",
         inputMode, windowMode, str(args.gridStride), args.windowSize,
-        featureSet, str(usePairFeatures), str(args.targetNorm), str(args.dropout),
-        str(args.underpredBoost), str(args.earlyStoppingPatience),
+        featureSet, str(usePairFeatures), str(args.targetNorm), str(args.targetNorm != "none"),
+        lossCfg["lossMode"], str(lossCfg["lossWeightPixel"]), str(lossCfg["foregroundLossWeight"]),
+        str(lossCfg["underpredBoost"]), str(lossCfg["bgL1Weight"]), str(args.dropout),
+        str(args.earlyStoppingPatience),
         args.binSize, str(args.logTransformTarget), str(args.seed)
     )
 
@@ -1014,6 +1090,8 @@ def main(args=None):
                 "binSize": args.binSize,
                 "windowSize": args.windowSize,
                 "targetNorm": writeTargetNorm,
+                "logpNorm": (writeTargetNorm != "none"),
+                "rawTargetMode": (writeTargetNorm == "none" and resolvedTargetRange is None),
                 "targetsScaledAtWriteTime": targetsScaledAtWriteTime,
                 "logTransformTarget": args.logTransformTarget,
                 "flankPadChromosomes": args.flankPadChromosomes,
@@ -1022,8 +1100,14 @@ def main(args=None):
                 "filterEmptyWindows": args.filterEmptyWindows,
                 "featureSet": featureSet,
                 "usePairFeatures": usePairFeatures,
+                "modelType": "cgan",
+                "lossMode": lossCfg["lossMode"],
+                "lossWeightPixel": lossCfg["lossWeightPixel"],
+                "lossTypePixel": lossCfg["lossTypePixel"],
+                "foregroundLossWeight": lossCfg["foregroundLossWeight"],
+                "underpredBoost": lossCfg["underpredBoost"],
+                "bgL1Weight": lossCfg["bgL1Weight"],
                 "dropout": args.dropout,
-                "underpredBoost": args.underpredBoost,
                 "earlyStoppingPatience": args.earlyStoppingPatience,
                 "seed": randomSeed,
                 "created_at": datetime.utcnow().isoformat()
@@ -1049,16 +1133,20 @@ def main(args=None):
                     args.windowSize = int(meta["windowSize"])
                 if not args.logTransformTarget and meta.get("logTransformTarget"):
                     args.logTransformTarget = bool(meta["logTransformTarget"])
+            eff_raw_target = bool(
+                meta.get("rawTargetMode", False)
+                or (meta.get("targetNorm") == "none" and not meta.get("targetsScaledAtWriteTime", False))
+            )
             training(
                 pTfRecordFilenames=tfRecordFilenames,
                 pLengthTrainDataContainerList=traindataContainerListLength,
                 pWindowSize=args.windowSize,
                 pOutputFolder=args.outputFolder,
                 pEpochs=args.epochs,
-                pLossWeightPixel=args.lossWeightPixel,
+                pLossWeightPixel=lossCfg["lossWeightPixel"],
                 pLossWeightDiscriminator=args.lossWeightDiscriminator,
                 pLossWeightAdversarial=args.lossWeightAdversarial,
-                pLossTypePixel=args.lossTypePixel,
+                pLossTypePixel=lossCfg["lossTypePixel"],
                 pLossWeightTV=args.lossWeightTV,
                 pLearningRateGenerator=args.learningRateGenerator,
                 pLearningRateDiscriminator=args.learningRateDiscriminator,
@@ -1079,11 +1167,14 @@ def main(args=None):
                 pInputMode=inputMode,
                 pWindowMode=windowMode,
                 pLogTransformTarget=args.logTransformTarget,
-                pForegroundLossWeight=args.foregroundLossWeight,
-                pUnderpredBoost=args.underpredBoost,
+                pForegroundLossWeight=lossCfg["foregroundLossWeight"],
+                pUnderpredBoost=lossCfg["underpredBoost"],
                 pDropout=args.dropout,
                 pEarlyStoppingPatience=args.earlyStoppingPatience,
-                pUsePairFeatures=usePairFeatures
+                pUsePairFeatures=usePairFeatures,
+                pBgL1Weight=lossCfg["bgL1Weight"],
+                pLossMode=lossCfg["lossMode"],
+                pRawTargetMode=eff_raw_target
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)
