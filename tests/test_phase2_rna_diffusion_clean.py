@@ -491,6 +491,15 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         np.testing.assert_allclose(dense_p, dense_p.T, atol=1e-6)
         self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "core_metrics_scorecard.csv")))
         self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "evaluation_metrics_full.csv")))
+        import pandas as pd
+        df_sc = pd.read_csv(os.path.join(pred_out, "evaluation", "core_metrics_scorecard.csv"))
+        for col in ("Kromozom", "Pearson r (raw)", "Spearman ρ (raw)", "Pearson r (log1p)", "Spearman ρ (log1p)", "MAE (raw)", "MSE (raw)", "RMSE (raw)", "SSIM (log1p)", "PSNR (log1p)"):
+            self.assertIn(col, df_sc.columns)
+        self.assertNotIn("Bileşik Skor (0-100)", df_sc.columns)
+        self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "heatmap_triple_chr21.png")))
+        self.assertTrue(os.path.exists(os.path.join(pred_out, "evaluation", "distance_stratified_correlation.png")))
+        for old_png in ("core_metrics_radar_and_baseline.png", "contact_decay_curve_Pd.png", "marginal_1d_profiles.png", "value_distribution_hexbin_hist.png"):
+            self.assertFalse(os.path.exists(os.path.join(pred_out, "evaluation", old_png)))
 
         # Verify phased predict (--mode create-data -> predict -> make-matrix)
         hic_predict.main(predict_args_common + ["--outputFolder", phased_out, "--mode", "create-data"])
@@ -552,7 +561,7 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         cgan_arr = 0.5 * (cgan_arr + cgan_arr.T)
         sparse.save_npz(os.path.join(cgan_npz_dir, "chr21.npz"), sparse.csr_matrix(cgan_arr))
 
-        # 1) Multi-run leaderboard including Baseline P(d) + cGAN + Diffusion
+        # 1) Multi-run leaderboard (cGAN + Diffusion, paper metrics)
         lb_out = os.path.join(self.tmp_root, "leaderboard_out")
         df_lb = evaluation.compare_runs_leaderboard(
             search_root_dirs=[cgan_root, diff_root],
@@ -560,14 +569,15 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
             bin_size=self.bin_size,
             chroms=["21"],
             eval_out_dir=lb_out,
-            include_baseline_row=True,
         )
-        self.assertEqual(len(df_lb), 3)
-        self.assertEqual(set(df_lb["Model Tipi"]), {"cGAN", "Diffusion", "Baseline P(d)"})
+        self.assertEqual(len(df_lb), 2)
+        self.assertEqual(set(df_lb["Model Tipi"]), {"cGAN", "Diffusion"})
+        self.assertIn("Pearson r (log1p)", df_lb.columns)
+        self.assertIn("Spearman ρ (log1p)", df_lb.columns)
         self.assertTrue(os.path.exists(os.path.join(lb_out, "multi_run_leaderboard.csv")))
-        self.assertTrue(os.path.exists(os.path.join(lb_out, "multi_run_comparison_radar.png")))
+        self.assertTrue(os.path.exists(os.path.join(lb_out, "multi_run_comparison.png")))
 
-        # 2) Head-to-head compare_two_models with fair config check (5-panel without chromatin_dir)
+        # 2) Head-to-head compare_two_models with fair config check (4-panel without chromatin_dir)
         cmp_out = os.path.join(self.tmp_root, "two_model_cmp")
         res = evaluation.compare_two_models(
             cgan_dir=cgan_root,
@@ -579,7 +589,9 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         )
         self.assertTrue(res["fairness_audit"]["fair_comparison"])
         self.assertEqual(res["fairness_audit"]["evaluated_chromosomes"], ["chr21"])
-        self.assertEqual(len(res["leaderboard"]), 3)
+        self.assertEqual(len(res["leaderboard"]), 2)
+        self.assertIn("Delta_Diff_minus_cGAN_Pearson_all_log1p", res["per_chromosome"].columns)
+        self.assertIn("delta_pearson_log1p", res["summary_metrics"])
         for key, fpath in res["files"].items():
             if isinstance(fpath, list):
                 for p in fpath:
@@ -588,65 +600,65 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
                 self.assertTrue(os.path.exists(fpath), f"Missing {key}: {fpath}")
 
         import matplotlib.image as mpimg
-        hm5_path = os.path.join(cmp_out, "comparison_heatmaps_chr21.png")
-        self.assertIn(hm5_path, res["files"]["heatmap_pngs"])
-        w_5panel = mpimg.imread(hm5_path).shape[1]
+        hm4_path = os.path.join(cmp_out, "comparison_heatmaps_chr21.png")
+        self.assertIn(hm4_path, res["files"]["heatmap_pngs"])
+        w_4panel = mpimg.imread(hm4_path).shape[1]
 
-        # 2b) 6-panel heatmap with chromatin_dir (2D kmer7_revcomp_cosine Input)
-        cmp_6_2d = os.path.join(self.tmp_root, "two_model_cmp_6panel_2d")
-        res_6_2d = evaluation.compare_two_models(
+        # 2b) 5-panel heatmap with chromatin_dir (2D kmer7_revcomp_cosine Input)
+        cmp_5_2d = os.path.join(self.tmp_root, "two_model_cmp_5panel_2d")
+        res_5_2d = evaluation.compare_two_models(
             cgan_dir=cgan_root,
             diffusion_dir=diff_root,
             npz_data_dir=self.gt_dir,
-            eval_out_dir=cmp_6_2d,
+            eval_out_dir=cmp_5_2d,
             bin_size=self.bin_size,
             chroms=["21"],
             chromatin_dir=self.fp_dir,
             feature_set="representative",
             use_pair_features=True,
         )
-        hm6_2d_path = os.path.join(cmp_6_2d, "comparison_heatmaps_chr21.png")
-        self.assertTrue(os.path.exists(hm6_2d_path))
-        w_6panel_2d = mpimg.imread(hm6_2d_path).shape[1]
-        self.assertGreater(w_6panel_2d, w_5panel)
+        hm5_2d_path = os.path.join(cmp_5_2d, "comparison_heatmaps_chr21.png")
+        self.assertTrue(os.path.exists(hm5_2d_path))
+        w_5panel_2d = mpimg.imread(hm5_2d_path).shape[1]
+        self.assertGreater(w_5panel_2d, w_4panel)
 
-        # 2c) 6-panel heatmap with chromatin_dir and use_pair_features=False (1D bin features fallback)
-        cmp_6_1d = os.path.join(self.tmp_root, "two_model_cmp_6panel_1d")
-        res_6_1d = evaluation.compare_two_models(
+        # 2c) 5-panel heatmap with chromatin_dir and use_pair_features=False (1D bin features fallback)
+        cmp_5_1d = os.path.join(self.tmp_root, "two_model_cmp_5panel_1d")
+        res_5_1d = evaluation.compare_two_models(
             cgan_dir=cgan_root,
             diffusion_dir=diff_root,
             npz_data_dir=self.gt_dir,
-            eval_out_dir=cmp_6_1d,
+            eval_out_dir=cmp_5_1d,
             bin_size=self.bin_size,
             chroms=["21"],
             chromatin_dir=self.fp_dir,
             feature_set="representative",
             use_pair_features=False,
         )
-        hm6_1d_path = os.path.join(cmp_6_1d, "comparison_heatmaps_chr21.png")
-        self.assertTrue(os.path.exists(hm6_1d_path))
-        w_6panel_1d = mpimg.imread(hm6_1d_path).shape[1]
-        self.assertGreater(w_6panel_1d, w_5panel)
-        self.assertTrue(os.path.exists(res_6_1d["files"]["leaderboard_csv"]))
+        hm5_1d_path = os.path.join(cmp_5_1d, "comparison_heatmaps_chr21.png")
+        self.assertTrue(os.path.exists(hm5_1d_path))
+        w_5panel_1d = mpimg.imread(hm5_1d_path).shape[1]
+        self.assertGreater(w_5panel_1d, w_4panel)
+        self.assertTrue(os.path.exists(res_5_1d["files"]["leaderboard_csv"]))
 
         # 2c-bis) Fallback to 1D bin features when use_pair_features=True but get_chrom_pair_matrix fails
-        cmp_6_fallback = os.path.join(self.tmp_root, "two_model_cmp_6panel_fallback")
+        cmp_5_fallback = os.path.join(self.tmp_root, "two_model_cmp_5panel_fallback")
         from unittest import mock
         with mock.patch("hicgan.lib.featurePack.get_chrom_pair_matrix", side_effect=FileNotFoundError("no pair")):
             res_fb = evaluation.compare_two_models(
                 cgan_dir=cgan_root,
                 diffusion_dir=diff_root,
                 npz_data_dir=self.gt_dir,
-                eval_out_dir=cmp_6_fallback,
+                eval_out_dir=cmp_5_fallback,
                 bin_size=self.bin_size,
                 chroms=["21"],
                 chromatin_dir=self.fp_dir,
                 feature_set="representative",
                 use_pair_features=True,
             )
-        hm6_fb_path = os.path.join(cmp_6_fallback, "comparison_heatmaps_chr21.png")
-        self.assertTrue(os.path.exists(hm6_fb_path))
-        self.assertGreater(mpimg.imread(hm6_fb_path).shape[1], w_5panel)
+        hm5_fb_path = os.path.join(cmp_5_fallback, "comparison_heatmaps_chr21.png")
+        self.assertTrue(os.path.exists(hm5_fb_path))
+        self.assertGreater(mpimg.imread(hm5_fb_path).shape[1], w_4panel)
 
         # 2c-ter) Multi-chromosome comparison (chr1 + chr21)
         gt_1, _ = utils.getMatrixFromNpz(self.gt_dir, "1", pBinSizeInt=self.bin_size)
@@ -680,10 +692,10 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
                 chroms=["21"],
             )
         self.assertEqual(res_iso["files"]["heatmap_pngs"], [])
+        self.assertIsNone(res_iso["files"]["radar_bar_png"])
         self.assertIsNone(res_iso["files"]["per_chrom_png"])
         self.assertIsNone(res_iso["files"]["distance_curves_png"])
         self.assertTrue(os.path.exists(res_iso["files"]["leaderboard_csv"]))
-        self.assertTrue(os.path.exists(res_iso["files"]["radar_bar_png"]))
 
         # 3) Edge case: fairness mismatch detection if windowSize differs
         bad_cgan_meta = dict(cgan_meta)
