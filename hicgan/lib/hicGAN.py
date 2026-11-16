@@ -514,26 +514,60 @@ class HiCGAN():
         return gen_total_loss, disc_loss, gen_pixel_loss, gen_adv_loss, gen_tv_loss
 
     def generate_images(self, model, test_input, tar, epoch: int):
+        from . import evaluation
+
         inp_tensor = test_input["factorData"] if isinstance(test_input, dict) else test_input
         prediction = model(inp_tensor, training=False)
         tar_img = tf.cast(tar["out_matrixData"][0], tf.float32)
         pred_img = tf.cast(prediction[0], tf.float32)
-        pred_mse = float(tf.reduce_mean(tf.square(tar_img - pred_img)))
-        figname = "testpred_epoch_{:05d}.png".format(epoch)
-        figname = os.path.join(self.log_dir, figname)
-        inp_sample = np.asarray(inp_tensor[0])
-        if inp_sample.ndim == 3 and inp_sample.shape[-1] == 1:
-            inp_sample = inp_sample[:, :, 0]
-        display_list = [inp_sample, np.squeeze(np.asarray(tar_img)), np.squeeze(np.asarray(pred_img))]
-        titleList = ['Input Feature / 2D Random', 'Ground Truth', 'Predicted Image (MSE: {:.5f})'.format(pred_mse)]
 
-        fig1, axs1 = plt.subplots(1,len(display_list), figsize=(15,15))
-        for i in range(len(display_list)):
-            axs1[i].imshow(display_list[i] * 0.5 + 0.5, aspect='auto')
-            axs1[i].set_title(titleList[i])
-        fig1.savefig(figname)
-        plt.close(fig1)
-        del fig1, axs1
+        tar_raw = np.squeeze(np.asarray(tar_img, dtype=np.float64))
+        pred_raw = np.squeeze(np.asarray(pred_img, dtype=np.float64))
+        pred_mse = float(np.mean(np.square(tar_raw - pred_raw)))
+        gt_disp = tar_raw * 0.5 + 0.5
+        pred_disp = pred_raw * 0.5 + 0.5
+        mae_val = float(np.mean(np.abs(pred_disp - gt_disp)))
+
+        inp_sample = np.asarray(inp_tensor[0], dtype=np.float64)
+        inp_title = "Girdi (Input)"
+        inp_xlabel = "Genomik Bin (j)"
+        inp_ylabel = "Genomik Bin (i)"
+        if inp_sample.ndim == 3 and inp_sample.shape[-1] == 1:
+            inp_disp = inp_sample[:, :, 0]
+            inp_title = "Girdi (Input 2D)"
+        elif (
+            inp_sample.ndim == 2
+            and self.use_pair_features
+            and inp_sample.shape[0] == 3 * self.input_size
+            and inp_sample.shape[1] >= self.input_size
+        ):
+            inp_disp = inp_sample[self.input_size : 2 * self.input_size, -self.input_size :]
+            inp_title = "Girdi (2D Pair Window)"
+        elif inp_sample.ndim == 2 and inp_sample.shape[0] == 3 * self.input_size:
+            inp_disp = inp_sample[self.input_size : 2 * self.input_size, :]
+            inp_title = f"Girdi (1D Features, {inp_sample.shape[1]} ch)"
+            inp_xlabel = "Feature Kanalı"
+        else:
+            inp_disp = np.squeeze(inp_sample)
+            if inp_disp.ndim > 2:
+                inp_disp = np.mean(inp_disp, axis=-1)
+            inp_xlabel = "Kanal / Bin"
+
+        figname = os.path.join(self.log_dir, "testpred_epoch_{:05d}.png".format(epoch))
+        evaluation.render_comparison_panels(
+            gt_mat=gt_disp,
+            pred_mat=pred_disp,
+            out_path=figname,
+            input_mat=inp_disp,
+            input_title=inp_title,
+            gt_title="Gerçek (Ground Truth) [norm]",
+            pred_title=f"Tahmin (Predicted) [MSE={pred_mse:.5f}]",
+            residual_title=f"Fark / Residual (Pred - GT) [MAE={mae_val:.4f}]",
+            suptitle=f"Epoch {epoch:05d} — Örnek Girdi, Gerçek, Tahmin ve Fark Haritası",
+            input_xlabel=inp_xlabel,
+            input_ylabel=inp_ylabel,
+            dpi=150,
+        )
 
     def fit(self, train_ds, epochs, test_ds, steps_per_epoch: int,
             validation_steps: int = 0, early_stopping_patience: int = 10):

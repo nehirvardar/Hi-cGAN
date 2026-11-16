@@ -873,7 +873,18 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
                 dictWriter.writeheader()
                 dictWriter.writerow(paramDict)
             if pRunEval:
-                _run_unified_eval(npzOutDir, outputFolder, chromNameList, binSize, pGtDir, pDataDir, pChromSizesPath)
+                _run_unified_eval(
+                    npzOutDir,
+                    outputFolder,
+                    chromNameList,
+                    binSize,
+                    pGtDir,
+                    pDataDir,
+                    pChromSizesPath,
+                    chromatin_dir=predictionChromosomesFolders,
+                    feature_set=featureSet,
+                    use_pair_features=bool(usePairFeatures),
+                )
             return
 
         if pMode == "all":
@@ -1001,10 +1012,32 @@ def prediction(pTrainedModel, pPredictionChromosomesFolders, pPredictionChromoso
             dictWriter.writerow(paramDict)
 
         if pRunEval:
-            _run_unified_eval(npzOutDir, outputFolder, chromNameList, binSize, pGtDir, pDataDir, pChromSizesPath)
+            _run_unified_eval(
+                npzOutDir,
+                outputFolder,
+                chromNameList,
+                binSize,
+                pGtDir,
+                pDataDir,
+                pChromSizesPath,
+                chromatin_dir=predictionChromosomesFolders,
+                feature_set=featureSet,
+                use_pair_features=bool(usePairFeatures),
+            )
 
 
-def _run_unified_eval(npzOutDir, outputFolder, chromNameList, binSize, pGtDir, pDataDir, pChromSizesPath):
+def _run_unified_eval(
+    npzOutDir,
+    outputFolder,
+    chromNameList,
+    binSize,
+    pGtDir,
+    pDataDir,
+    pChromSizesPath,
+    chromatin_dir=None,
+    feature_set="representative",
+    use_pair_features=True,
+):
     gt_candidates = [pGtDir, pDataDir, pChromSizesPath, "hicgan/data/rna_gt", "data/chrom_npz_homo_sapiens_GRCh38_250kb_tss_count"]
     resolved_gt = next((p for p in gt_candidates if p and os.path.exists(p) and utils.isNpzMatrixSource(p)), None)
     if resolved_gt is None:
@@ -1021,6 +1054,9 @@ def _run_unified_eval(npzOutDir, outputFolder, chromNameList, binSize, pGtDir, p
         bin_size=binSize,
         run_name=os.path.basename(os.path.normpath(outputFolder)) or "rna-cgan-clean",
         make_plots=True,
+        chromatin_dir=chromatin_dir,
+        feature_set=feature_set,
+        use_pair_features=use_pair_features,
     )
     if not df_scorecard.empty:
         print("\n=== UNIFIED EVALUATION SCORECARD ===", flush=True)

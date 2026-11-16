@@ -627,49 +627,113 @@ def compute_distance_curves(gt_dense_raw: np.ndarray, pred_dense_raw: np.ndarray
     }
 
 
+def render_comparison_panels(
+    gt_mat: np.ndarray,
+    pred_mat: np.ndarray,
+    out_path: str,
+    input_mat: np.ndarray = None,
+    input_title: str = "Girdi (Input)",
+    gt_title: str = "Gerçek (Ground Truth)",
+    pred_title: str = "Tahmin Edilen (Predicted)",
+    residual_title: str = None,
+    suptitle: str = "",
+    input_xlabel: str = "Genomik Bin (j)",
+    input_ylabel: str = "Genomik Bin (i)",
+    matrix_xlabel: str = "Genomik Bin (j)",
+    matrix_ylabel: str = "Genomik Bin (i)",
+    dpi: int = 300,
+):
+    """
+    Render a unified 4-panel (Input | Ground Truth | Predicted | Residual) or
+    3-panel (when input_mat is None) heatmap comparison figure.
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    gt_arr = np.asarray(gt_mat, dtype=np.float64)
+    pred_arr = np.asarray(pred_mat, dtype=np.float64)
+    residual = pred_arr - gt_arr
+
+    vmax = float(max(np.max(gt_arr), np.max(pred_arr), 1e-6))
+    rmax = float(max(np.max(np.abs(residual)), 1e-6))
+    mae_l = float(np.mean(np.abs(residual)))
+    if residual_title is None:
+        residual_title = f"Fark / Residual (Pred - GT) [MAE={mae_l:.4f}]"
+
+    if input_mat is not None:
+        inp_arr = np.asarray(input_mat, dtype=np.float64)
+        fig, axes = plt.subplots(1, 4, figsize=(24, 5.4))
+        inp_aspect = "equal" if (inp_arr.ndim == 2 and inp_arr.shape[0] == inp_arr.shape[1]) else "auto"
+        im_in = axes[0].imshow(inp_arr, cmap="viridis", aspect=inp_aspect)
+        axes[0].set_title(input_title)
+        axes[0].set_xlabel(input_xlabel)
+        axes[0].set_ylabel(input_ylabel)
+        plt.colorbar(im_in, ax=axes[0], fraction=0.046, pad=0.04)
+        ax_gt, ax_pred, ax_res = axes[1], axes[2], axes[3]
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5.4))
+        ax_gt, ax_pred, ax_res = axes[0], axes[1], axes[2]
+
+    im0 = ax_gt.imshow(gt_arr, cmap="Reds", vmin=0.0, vmax=vmax)
+    ax_gt.set_title(gt_title)
+    ax_gt.set_xlabel(matrix_xlabel)
+    ax_gt.set_ylabel(matrix_ylabel)
+    plt.colorbar(im0, ax=ax_gt, fraction=0.046, pad=0.04)
+
+    im1 = ax_pred.imshow(pred_arr, cmap="Reds", vmin=0.0, vmax=vmax)
+    ax_pred.set_title(pred_title)
+    ax_pred.set_xlabel(matrix_xlabel)
+    ax_pred.set_ylabel(matrix_ylabel)
+    plt.colorbar(im1, ax=ax_pred, fraction=0.046, pad=0.04)
+
+    im2 = ax_res.imshow(residual, cmap="bwr", vmin=-rmax, vmax=rmax)
+    ax_res.set_title(residual_title)
+    ax_res.set_xlabel(matrix_xlabel)
+    ax_res.set_ylabel(matrix_ylabel)
+    plt.colorbar(im2, ax=ax_res, fraction=0.046, pad=0.04)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def plot_triple_heatmaps(chrom_data_dict: dict, eval_out_dir: str, run_name: str = ""):
     """
-    Plot 3-panel heatmaps for each chromosome:
-      1. Ground Truth (log1p)
-      2. Predicted (log1p) [shared colorbar range with GT]
-      3. Residual / Difference Map (Pred_log1p - GT_log1p, symmetric 'bwr' colormap)
+    Plot 4-panel (Input | Ground Truth | Predicted | Residual) or 3-panel heatmaps
+    for each chromosome using log1p(raw) matrices.
     """
     os.makedirs(eval_out_dir, exist_ok=True)
     saved_paths = []
     for chrom, item in chrom_data_dict.items():
         gt_log = np.log1p(item["gt_raw"])
         pred_log = np.log1p(item["pred_raw"])
-        residual = pred_log - gt_log
-
-        vmax = float(max(np.max(gt_log), np.max(pred_log), 1e-6))
-        rmax = float(max(np.max(np.abs(residual)), 1e-6))
-
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5.4))
-
-        im0 = axes[0].imshow(gt_log, cmap="Reds", vmin=0.0, vmax=vmax)
-        axes[0].set_title(f"Gerçek (Ground Truth) chr{chrom} [log1p]")
-        axes[0].set_xlabel("Genomik Bin (j)")
-        axes[0].set_ylabel("Genomik Bin (i)")
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-
-        im1 = axes[1].imshow(pred_log, cmap="Reds", vmin=0.0, vmax=vmax)
-        axes[1].set_title(f"Tahmin Edilen (Predicted) chr{chrom} [log1p]")
-        axes[1].set_xlabel("Genomik Bin (j)")
-        axes[1].set_ylabel("Genomik Bin (i)")
-        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-
-        im2 = axes[2].imshow(residual, cmap="bwr", vmin=-rmax, vmax=rmax)
-        mae_l = float(np.mean(np.abs(residual)))
-        axes[2].set_title(f"Fark / Residual (Pred - GT) chr{chrom} [MAE={mae_l:.4f}]")
-        axes[2].set_xlabel("Genomik Bin (j)")
-        axes[2].set_ylabel("Genomik Bin (i)")
-        plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-
-        fig.suptitle(f"chr{chrom} — 3'lü Karşılaştırma ve Residual Haritası ({run_name})", fontsize=13, fontweight="bold")
-        plt.tight_layout()
+        mae_l = float(np.mean(np.abs(pred_log - gt_log)))
+        input_mat = item.get("input_mat")
+        has_input = input_mat is not None
+        suptitle = (
+            f"chr{chrom} — Girdi, Gerçek, Tahmin ve Fark Haritası ({run_name})"
+            if has_input
+            else f"chr{chrom} — 3'lü Karşılaştırma ve Residual Haritası ({run_name})"
+        )
         out_path = os.path.join(eval_out_dir, f"heatmap_triple_chr{chrom}.png")
-        fig.savefig(out_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
+        render_comparison_panels(
+            gt_mat=gt_log,
+            pred_mat=pred_log,
+            out_path=out_path,
+            input_mat=input_mat,
+            input_title=item.get("input_title", f"Girdi (Input) chr{chrom}"),
+            gt_title=f"Gerçek (Ground Truth) chr{chrom} [log1p]",
+            pred_title=f"Tahmin Edilen (Predicted) chr{chrom} [log1p]",
+            residual_title=f"Fark / Residual (Pred - GT) chr{chrom} [MAE={mae_l:.4f}]",
+            suptitle=suptitle,
+            input_xlabel=item.get("input_xlabel", "Genomik Bin (j)"),
+            input_ylabel=item.get("input_ylabel", "Genomik Bin (i)"),
+            dpi=300,
+        )
         saved_paths.append(out_path)
     return saved_paths
 
@@ -1087,6 +1151,9 @@ def evaluate_predictions_dir(
     bin_size: int = 250000,
     run_name: str = "rna-cgan-clean",
     make_plots: bool = True,
+    chromatin_dir: str = None,
+    feature_set: str = "representative",
+    use_pair_features: bool = True,
 ):
     """
     Unified Referee Evaluation for a directory of predicted chromosome `.npz` files (`pred_npz_dir`)
@@ -1096,11 +1163,13 @@ def evaluate_predictions_dir(
     in `eval_out_dir`, and optionally generates diagnostic plots.
     Returns `(df_scorecard, df_metrics_full)`.
     """
-    from . import utils
+    from . import utils, featurePack
 
     if eval_out_dir is None:
         eval_out_dir = os.path.join(os.path.dirname(os.path.normpath(pred_npz_dir)), "evaluation")
     os.makedirs(eval_out_dir, exist_ok=True)
+
+    has_feature_pack = bool(chromatin_dir and featurePack.is_feature_pack_source(chromatin_dir))
 
     npz_files = sorted(glob.glob(os.path.join(pred_npz_dir, "chr*.npz")))
     chrom_filter = {str(c).lstrip("chr") for c in chroms} if chroms else None
@@ -1118,11 +1187,40 @@ def evaluate_predictions_dir(
         if gt_dense.shape != pr_dense.shape:
             log.warning("Shape mismatch for chr%s: GT=%s vs Pred=%s", chrom, gt_dense.shape, pr_dense.shape)
             continue
+
+        input_mat = None
+        input_title = f"Girdi (Input) chr{chrom}"
+        input_xlabel = "Genomik Bin (j)"
+        input_ylabel = "Genomik Bin (i)"
+        if has_feature_pack:
+            try:
+                n_bins = int(gt_dense.shape[0])
+                pair_sp = None
+                if use_pair_features:
+                    pair_sp = featurePack.get_chrom_pair_matrix(chromatin_dir, chrom, pNumBins=n_bins)
+                if pair_sp is not None and pair_sp.nnz > 0:
+                    input_mat = np.asarray(pair_sp.toarray(), dtype=np.float64)
+                    input_title = f"Girdi (2D kmer7_revcomp_cosine) chr{chrom}"
+                else:
+                    feat_arr, _ = featurePack.get_chrom_bin_features(
+                        chromatin_dir, chrom, pFeatureSet=feature_set, pNumBins=n_bins
+                    )
+                    if feat_arr is not None and feat_arr.size > 0:
+                        input_mat = np.asarray(feat_arr, dtype=np.float64)
+                        input_title = f"Girdi (1D {feature_set}, {feat_arr.shape[1]} ch) chr{chrom}"
+                        input_xlabel = "Feature Kanalı"
+            except Exception as exc:
+                log.warning("Could not load input features for chr%s: %s", chrom, str(exc))
+
         row = evaluate_chromosome_pair(gt_dense, pr_dense, chrom=chrom, include_baseline=True)
         metric_rows.append(row)
         chrom_data_dict[chrom] = {
             "gt_raw": gt_dense,
             "pred_raw": pr_dense,
+            "input_mat": input_mat,
+            "input_title": input_title,
+            "input_xlabel": input_xlabel,
+            "input_ylabel": input_ylabel,
             "curves": compute_distance_curves(gt_dense, pr_dense),
         }
 
