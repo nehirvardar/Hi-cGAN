@@ -154,11 +154,15 @@ class HiCGAN():
                     restore_checkpoint: bool = False,
                     use_embedding: bool = True,
                     enforce_symmetry: bool = True,
-                    use_pair_features: bool = False):
+                    use_pair_features: bool = False,
+                    loss_mode: str = "current",
+                    raw_target_mode: bool = False):
         super().__init__()
         self.mixed_precision = mixed_precision
         self.use_embedding = bool(use_embedding)
         self.enforce_symmetry = bool(enforce_symmetry)
+        self.loss_mode = str(loss_mode or "current")
+        self.raw_target_mode = bool(raw_target_mode)
 
         self.OUTPUT_CHANNELS = 1
         self.INPUT_CHANNELS = 1
@@ -196,6 +200,7 @@ class HiCGAN():
             f"timesteps={self.timesteps}, sample_steps={self.sample_steps}, "
             f"use_embedding={self.use_embedding} ({'1D -> Pairwise 2D + Distance cnn_embedding' if self.use_embedding else 'Direct 2D Input'}), "
             f"use_pair_features={self.use_pair_features}, enforce_symmetry={self.enforce_symmetry}, "
+            f"loss_mode={self.loss_mode}, raw_target_mode={self.raw_target_mode}, "
             f"fg_weight={self.fg_weight}, peak_weight={self.peak_weight}, x0_loss_weight={self.x0_loss_weight}, "
             f"bg_l1_weight={self.bg_l1_weight}, leaky_clip_slope={self.leaky_clip_slope}, "
             f"dropout_rate={self.dropout_rate}, lr={eff_lr:.2e}, decay_steps={self.decay_steps}, mixed_precision={self.mixed_precision}"
@@ -430,7 +435,10 @@ class HiCGAN():
         sqrt_ab = tf.sqrt(tf.maximum(alpha_bar_t, 1e-8))
         sqrt_one_minus_ab = tf.sqrt(tf.maximum(1.0 - alpha_bar_t, 1e-8))
         x0_pred_raw = (noisy_target - sqrt_one_minus_ab * predicted_noise) / sqrt_ab
-        x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
+        if self.raw_target_mode:
+            x0_pred_clipped = tf.maximum(x0_pred_raw, 0.0)
+        else:
+            x0_pred_clipped = tf.clip_by_value(x0_pred_raw, 0.0, 1.0)
         x0_pred = x0_pred_clipped + self.leaky_clip_slope * (x0_pred_raw - tf.stop_gradient(x0_pred_clipped))
         x0_loss = tf.reduce_mean(alpha_bar_t * pixel_weights * tf.square(target - x0_pred))
 
@@ -545,14 +553,20 @@ class HiCGAN():
             sqrt_one_minus_ab_t = tf.sqrt(tf.maximum(1.0 - alpha_bar_t, 1e-8))
 
             x0_pred = (x_t - sqrt_one_minus_ab_t * predicted_noise) / sqrt_ab_t
-            x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
+            if self.raw_target_mode:
+                x0_pred = tf.maximum(x0_pred, 0.0)
+            else:
+                x0_pred = tf.clip_by_value(x0_pred, 0.0, 1.0)
             pred_eps = (x_t - sqrt_ab_t * x0_pred) / sqrt_one_minus_ab_t
             x_t = (
                 tf.sqrt(alpha_bar_prev) * x0_pred
                 + tf.sqrt(tf.maximum(1.0 - alpha_bar_prev, 0.0)) * pred_eps
             )
 
-        x_t = tf.clip_by_value(x_t, 0.0, 1.0)
+        if self.raw_target_mode:
+            x_t = tf.maximum(x_t, 0.0)
+        else:
+            x_t = tf.clip_by_value(x_t, 0.0, 1.0)
         if self.enforce_symmetry:
             x_t = 0.5 * (x_t + tf.transpose(x_t, perm=[0, 2, 1, 3]))
         return x_t
@@ -568,8 +582,12 @@ class HiCGAN():
         tar_raw = np.squeeze(np.asarray(tar_img, dtype=np.float64))
         pred_raw = np.squeeze(np.asarray(pred_img, dtype=np.float64))
         pred_mse = float(np.mean(np.square(tar_raw - pred_raw)))
-        gt_disp = np.clip(tar_raw, 0.0, 1.0)
-        pred_disp = np.clip(pred_raw, 0.0, 1.0)
+        if self.raw_target_mode:
+            gt_disp = np.maximum(tar_raw, 0.0)
+            pred_disp = np.maximum(pred_raw, 0.0)
+        else:
+            gt_disp = np.clip(tar_raw, 0.0, 1.0)
+            pred_disp = np.clip(pred_raw, 0.0, 1.0)
         mae_val = float(np.mean(np.abs(pred_disp - gt_disp)))
 
         inp_sample = np.asarray(inp_tensor[0], dtype=np.float64)

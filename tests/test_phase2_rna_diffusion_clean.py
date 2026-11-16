@@ -917,6 +917,104 @@ class TestPhase2RnaDiffusionClean(unittest.TestCase):
         self.assertIn("chromatin_dir=CHROMATIN_DIR", nb_src)
         self.assertIn("feature_set=FEATURE_SET", nb_src)
         self.assertIn("use_pair_features=USE_PAIR_FEATURES", nb_src)
+        self.assertIn("LOSS_MODE", nb_src)
+        self.assertIn("USE_LOGP_NORM", nb_src)
+        self.assertIn("--noLogpNorm", nb_src)
+
+    def test_11_loss_modes_and_no_logp_norm_toggle(self):
+        # 1) Verify all 3 --lossMode presets resolve exact weights
+        for mode_name, exp_fg, exp_pk, exp_x0, exp_bg in (
+            ("current", 15.0, 10.0, 1.0, 0.5),
+            ("paper", 0.0, 0.0, 0.0, 0.0),
+            ("balanced", 3.0, 2.0, 0.5, 1.0),
+        ):
+            parsed = hic_training.parse_arguments().parse_args([
+                "-o", os.path.join(self.tmp_root, f"lm_{mode_name}"),
+                "--lossMode", mode_name,
+            ])
+            cfg = hic_training.resolve_loss_mode_params(parsed)
+            self.assertEqual(cfg["lossMode"], mode_name)
+            self.assertAlmostEqual(cfg["foregroundLossWeight"], exp_fg)
+            self.assertAlmostEqual(cfg["peakLossWeight"], exp_pk)
+            self.assertAlmostEqual(cfg["x0LossWeight"], exp_x0)
+            self.assertAlmostEqual(cfg["bgL1Weight"], exp_bg)
+
+        # Verify paper preset numerically reduces total_loss to unweighted noise MSE
+        m_paper = hicGAN.HiCGAN(
+            log_dir=os.path.join(self.tmp_root, "m_paper"),
+            number_factors=92,
+            timesteps=20,
+            sample_steps=4,
+            input_size=64,
+            loss_mode="paper",
+            loss_weight_pixel=1.0,
+            foreground_loss_weight=0.0,
+            peak_loss_weight=0.0,
+            x0_loss_weight=0.0,
+            bg_l1_weight=0.0,
+            use_embedding=True,
+            use_pair_features=True,
+        )
+        t_tgt = tf.zeros((2, 64, 64, 1), dtype=tf.float32)
+        t_eps = tf.random.normal((2, 64, 64, 1))
+        t_hat = tf.random.normal((2, 64, 64, 1))
+        t_noisy = 0.5 * t_tgt + 0.5 * t_eps
+        t_ab = tf.fill((2, 1, 1, 1), 0.25)
+        tot_p, noise_p, _, _ = m_paper.diffusion_loss(t_tgt, t_eps, t_hat, t_noisy, t_ab)
+        self.assertAlmostEqual(float(tot_p), float(noise_p), places=5)
+
+        # 2) Verify --lossMode balanced + --noLogpNorm E2E train & predict (raw counts > 1.0 preserved)
+        raw_train = os.path.join(self.tmp_root, "raw_diff_train")
+        raw_pred = os.path.join(self.tmp_root, "raw_diff_pred")
+        hic_training.main([
+            "--dataDir", self.gt_dir,
+            "--trainingChromatinFolders", self.fp_dir,
+            "--validationChromatinFolders", self.fp_dir,
+            "--splitFile", self.split_path,
+            "--outputFolder", raw_train,
+            "--binSize", str(self.bin_size),
+            "--windowSize", "64",
+            "--windowMode", "grid",
+            "--gridStride", "16",
+            "--inputMode", "feature_pack",
+            "--featureSet", "representative",
+            "--lossMode", "balanced",
+            "--noLogpNorm",
+            "--epochs", "1",
+            "--batchSize", "4",
+            "--timesteps", "10",
+            "--sampleSteps", "2",
+            "--plotFrequency", "0",
+            "--seed", "42",
+        ])
+        with open(os.path.join(raw_train, "target_value_range.json"), "r", encoding="utf-8") as fh:
+            tvr = json.load(fh)
+        self.assertEqual(tvr["method"], "none")
+        with open(os.path.join(raw_train, "hicgan_metadata.pkl"), "rb") as fh:
+            meta = pickle.load(fh)
+        self.assertEqual(meta["targetNorm"], "none")
+        self.assertFalse(meta["logpNorm"])
+        self.assertTrue(meta["rawTargetMode"])
+        self.assertEqual(meta["lossMode"], "balanced")
+        self.assertAlmostEqual(meta["bgL1Weight"], 1.0)
+
+        hic_predict.main([
+            "--trainedModel", raw_train,
+            "--dataDir", self.gt_dir,
+            "--gtDir", self.gt_dir,
+            "--predictionChromosomesFolders", self.fp_dir,
+            "--splitFile", self.split_path,
+            "--split", "test",
+            "--outputFolder", raw_pred,
+            "--binSize", str(self.bin_size),
+            "--windowSize", "64",
+            "--windowMode", "grid",
+            "--gridStride", "16",
+            "--inputMode", "feature_pack",
+            "--featureSet", "representative",
+            "--batchSize", "4",
+        ])
+        self.assertTrue(os.path.exists(os.path.join(raw_pred, "npz_matrices", "chr21.npz")))
 
 
 if __name__ == "__main__":

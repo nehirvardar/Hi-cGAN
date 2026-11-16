@@ -27,6 +27,49 @@ import pickle
 log = logging.getLogger(__name__)
 
 
+DIFFUSION_LOSS_PRESETS = {
+    "current": {
+        "lossWeightPixel": 1.0,
+        "foregroundLossWeight": 15.0,
+        "peakLossWeight": 10.0,
+        "x0LossWeight": 1.0,
+        "bgL1Weight": 0.5,
+        "leakyClipSlope": 0.25,
+    },
+    "paper": {
+        "lossWeightPixel": 1.0,
+        "foregroundLossWeight": 0.0,
+        "peakLossWeight": 0.0,
+        "x0LossWeight": 0.0,
+        "bgL1Weight": 0.0,
+        "leakyClipSlope": 0.25,
+    },
+    "balanced": {
+        "lossWeightPixel": 1.0,
+        "foregroundLossWeight": 3.0,
+        "peakLossWeight": 2.0,
+        "x0LossWeight": 0.5,
+        "bgL1Weight": 1.0,
+        "leakyClipSlope": 0.25,
+    },
+}
+
+
+def resolve_loss_mode_params(args):
+    """Resolve effective Diffusion loss weights from --lossMode and any explicit CLI overrides."""
+    mode = getattr(args, "lossMode", None) or "current"
+    preset = DIFFUSION_LOSS_PRESETS[mode]
+    return {
+        "lossMode": mode,
+        "lossWeightPixel": float(preset["lossWeightPixel"] if args.lossWeightPixel is None else args.lossWeightPixel),
+        "foregroundLossWeight": float(preset["foregroundLossWeight"] if args.foregroundLossWeight is None else args.foregroundLossWeight),
+        "peakLossWeight": float(preset["peakLossWeight"] if args.peakLossWeight is None else args.peakLossWeight),
+        "x0LossWeight": float(preset["x0LossWeight"] if args.x0LossWeight is None else args.x0LossWeight),
+        "bgL1Weight": float(preset["bgL1Weight"] if args.bgL1Weight is None else args.bgL1Weight),
+        "leakyClipSlope": float(preset["leakyClipSlope"] if args.leakyClipSlope is None else args.leakyClipSlope),
+    }
+
+
 def parse_arguments(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataDir", "-d", required=False,
@@ -87,6 +130,12 @@ def parse_arguments(args=None):
                         default="p99_log10",
                         help="Target matrix normalization scheme: 'p99_log10' (default, global P99 clipped ln(1+10x) computed on training chromosomes only), "
                              "'minmax_log1p' (min-max of log1p(x)), 'unit_range' (min-max of raw x), or 'none'.")
+    parser.add_argument("--logpNorm", dest="logpNorm",
+                        action="store_true", default=None,
+                        help="Enable logp (p99_log10: ln(1+10x)/P99) target normalization (default: enabled).")
+    parser.add_argument("--noLogpNorm", "-nlpn", dest="logpNorm",
+                        action="store_false",
+                        help="Disable logp target normalization and keep target matrices as raw unnormalized counts (sets targetNorm='none').")
     parser.add_argument("--logTransformTarget", "-ltt", required=False,
                         action="store_true", default=False,
                         help="Apply log1p(x) transform to target matrices before [0, 1] scaling (inverted via expm1 in hicPredict).")
@@ -130,30 +179,36 @@ def parse_arguments(args=None):
     parser.add_argument("--batchSize", "-bs", required=False,
                         type=int, default=32,
                         help="Batch size for training.")
+    parser.add_argument("--lossMode", "-lm", required=False,
+                        type=str, choices=["current", "paper", "balanced"],
+                        default="current",
+                        help="Loss preset for Diffusion: 'current' (weighted eps + leaky x0 + 0.5 bg_l1), "
+                             "'paper' (standard unweighted DDPM epsilon MSE), or "
+                             "'balanced' (softened fg=3, peak=2, x0=0.5, stronger bg_l1=1.0).")
     parser.add_argument("--lossWeightPixel", "-lwp", required=False,
                         type=float,
-                        default=1.0,
-                        help="Loss weight for weighted epsilon/noise prediction MSE in Diffusion loss (default: 1.0).")
+                        default=None,
+                        help="Loss weight for weighted epsilon/noise prediction MSE in Diffusion loss (defaults to --lossMode preset).")
     parser.add_argument("--foregroundLossWeight", "-flw", required=False,
                         type=float,
-                        default=15.0,
-                        help="Extra epsilon-noise loss multiplier for non-zero foreground targets (x0 > 0) (default: 15.0).")
+                        default=None,
+                        help="Extra epsilon-noise loss multiplier for non-zero foreground targets (x0 > 0) (defaults to --lossMode preset).")
     parser.add_argument("--peakLossWeight", "-plw", required=False,
                         type=float,
-                        default=10.0,
-                        help="Additional intensity-proportional epsilon-noise loss multiplier scaled by x0 (default: 10.0).")
+                        default=None,
+                        help="Additional intensity-proportional epsilon-noise loss multiplier scaled by x0 (defaults to --lossMode preset).")
     parser.add_argument("--x0LossWeight", "-xlw", required=False,
                         type=float,
-                        default=1.0,
-                        help="Loss weight for alpha_bar_t-weighted leaky-clipped x0 reconstruction MSE loss (default: 1.0).")
+                        default=None,
+                        help="Loss weight for alpha_bar_t-weighted leaky-clipped x0 reconstruction MSE loss (defaults to --lossMode preset).")
     parser.add_argument("--bgL1Weight", "-bglw", required=False,
                         type=float,
-                        default=0.5,
-                        help="Loss weight for silent background L1 penalty on (x0 == 0) pixels (default: 0.5).")
+                        default=None,
+                        help="Loss weight for silent background L1 penalty on (x0 == 0) pixels (defaults to --lossMode preset).")
     parser.add_argument("--leakyClipSlope", "-lcs", required=False,
                         type=float,
-                        default=0.25,
-                        help="Leaky clip slope outside [0, 1] for x0 reconstruction stabilization (default: 0.25).")
+                        default=None,
+                        help="Leaky clip slope outside [0, 1] for x0 reconstruction stabilization (defaults to --lossMode preset).")
     parser.add_argument("--learningRate", "--learningRateGenerator", "-lr", "-lrg",
                         dest="learningRate",
                         required=False,
@@ -430,7 +485,13 @@ def create_data(pTrainingMatrices,
     targetValueRange = None
     useGlobalTargetRange = False
 
-    if pTargetNorm == "p99_log10" and not pScaleTargetToUnitRange and not pLogTransformTarget:
+    if pTargetNorm == "none":
+        import json
+        os.makedirs(pOutputFolder, exist_ok=True)
+        with open(rangePath, "w", encoding="utf-8") as fh:
+            json.dump({"method": "none", "scale_factor": 1.0, "hi": None}, fh, indent=2)
+        paramDict["targetValueRange"] = None
+    elif pTargetNorm == "p99_log10" and not pScaleTargetToUnitRange and not pLogTransformTarget:
         useGlobalTargetRange = True
         p99Cfg = utils.computeGlobalP99TargetRange(
             pTrainingMatrices,
@@ -476,7 +537,7 @@ def create_data(pTrainingMatrices,
     loadParams = {
         "scaleFeatures": True,
         "clampFeatures": False,
-        "scaleTargets": False if useGlobalTargetRange else noScaleNorm,
+        "scaleTargets": False if (useGlobalTargetRange or pTargetNorm == "none") else noScaleNorm,
         "windowSize": pWindowSize,
         "flankingSize": flankingSize,
         "maximumDistance": None,
@@ -602,7 +663,9 @@ def training(pTfRecordFilenames,
              pEarlyStoppingPatience=10,
              pUsePairFeatures=True,
              pTimesteps=1000,
-             pSampleSteps=25
+             pSampleSteps=25,
+             pLossMode="current",
+             pRawTargetMode=False
              ):
 
         traindataRecords = [item for sublist in pTfRecordFilenames[0:pLengthTrainDataContainerList] for item in sublist]
@@ -723,7 +786,9 @@ def training(pTfRecordFilenames,
                                     restore_checkpoint=pResume,
                                     use_embedding=use_embedding,
                                     enforce_symmetry=enforce_symmetry,
-                                    use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"))
+                                    use_pair_features=bool(pUsePairFeatures) and (pInputMode == "feature_pack"),
+                                    loss_mode=pLossMode,
+                                    raw_target_mode=pRawTargetMode)
         
         hicGanModel.plotModels(pOutputPath=pOutputFolder, pFigureFileFormat=pFigureFileFormat)
 
@@ -824,12 +889,23 @@ def main(args=None):
     usePairFeatures = bool(args.usePairFeatures) and (inputMode == "feature_pack")
     randomSeed = args.seed if args.seed is not None else (loaded_meta.get("seed", 42) if loaded_meta else 42)
 
+    if args.logpNorm is False:
+        args.targetNorm = "none"
+        args.logTransformTarget = False
+    elif args.logpNorm is True and args.targetNorm == "none":
+        args.targetNorm = "p99_log10"
+
+    lossCfg = resolve_loss_mode_params(args)
+
     log.info(
         "[MAIN] Starting hicTraining (Diffusion): inputMode=%s, windowMode=%s, gridStride=%s, windowSize=%d, "
-        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, timesteps=%d, sampleSteps=%d, dropout=%s, "
-        "earlyStoppingPatience=%s, binSize=%d, logTransformTarget=%s, seed=%s",
+        "featureSet=%s, usePairFeatures=%s, targetNorm=%s, logpNorm=%s, lossMode=%s (lwp=%s, flw=%s, plw=%s, xlw=%s, bglw=%s), "
+        "timesteps=%d, sampleSteps=%d, dropout=%s, earlyStoppingPatience=%s, binSize=%d, logTransformTarget=%s, seed=%s",
         inputMode, windowMode, str(args.gridStride), args.windowSize,
-        featureSet, str(usePairFeatures), str(args.targetNorm), args.timesteps, args.sampleSteps,
+        featureSet, str(usePairFeatures), str(args.targetNorm), str(args.targetNorm != "none"),
+        lossCfg["lossMode"], str(lossCfg["lossWeightPixel"]), str(lossCfg["foregroundLossWeight"]),
+        str(lossCfg["peakLossWeight"]), str(lossCfg["x0LossWeight"]), str(lossCfg["bgL1Weight"]),
+        args.timesteps, args.sampleSteps,
         str(args.dropout), str(args.earlyStoppingPatience),
         args.binSize, str(args.logTransformTarget), str(args.seed)
     )
@@ -1013,6 +1089,8 @@ def main(args=None):
                 "binSize": args.binSize,
                 "windowSize": args.windowSize,
                 "targetNorm": writeTargetNorm,
+                "logpNorm": (writeTargetNorm != "none"),
+                "rawTargetMode": (writeTargetNorm == "none" and resolvedTargetRange is None),
                 "targetsScaledAtWriteTime": targetsScaledAtWriteTime,
                 "logTransformTarget": args.logTransformTarget,
                 "flankPadChromosomes": args.flankPadChromosomes,
@@ -1022,6 +1100,13 @@ def main(args=None):
                 "featureSet": featureSet,
                 "usePairFeatures": usePairFeatures,
                 "modelType": "diffusion",
+                "lossMode": lossCfg["lossMode"],
+                "lossWeightPixel": lossCfg["lossWeightPixel"],
+                "foregroundLossWeight": lossCfg["foregroundLossWeight"],
+                "peakLossWeight": lossCfg["peakLossWeight"],
+                "x0LossWeight": lossCfg["x0LossWeight"],
+                "bgL1Weight": lossCfg["bgL1Weight"],
+                "leakyClipSlope": lossCfg["leakyClipSlope"],
                 "timesteps": int(args.timesteps),
                 "sampleSteps": int(args.sampleSteps),
                 "dropout": args.dropout,
@@ -1050,13 +1135,17 @@ def main(args=None):
                     args.windowSize = int(meta["windowSize"])
                 if not args.logTransformTarget and meta.get("logTransformTarget"):
                     args.logTransformTarget = bool(meta["logTransformTarget"])
+            eff_raw_target = bool(
+                meta.get("rawTargetMode", False)
+                or (meta.get("targetNorm") == "none" and not meta.get("targetsScaledAtWriteTime", False))
+            )
             training(
                 pTfRecordFilenames=tfRecordFilenames,
                 pLengthTrainDataContainerList=traindataContainerListLength,
                 pWindowSize=args.windowSize,
                 pOutputFolder=args.outputFolder,
                 pEpochs=args.epochs,
-                pLossWeightPixel=args.lossWeightPixel,
+                pLossWeightPixel=lossCfg["lossWeightPixel"],
                 pLearningRate=args.learningRate,
                 pBeta1=args.beta1,
                 pFigureFileFormat=args.figureFileFormat,
@@ -1075,16 +1164,18 @@ def main(args=None):
                 pInputMode=inputMode,
                 pWindowMode=windowMode,
                 pLogTransformTarget=args.logTransformTarget,
-                pForegroundLossWeight=args.foregroundLossWeight,
-                pPeakLossWeight=args.peakLossWeight,
-                pX0LossWeight=args.x0LossWeight,
-                pBgL1Weight=args.bgL1Weight,
-                pLeakyClipSlope=args.leakyClipSlope,
+                pForegroundLossWeight=lossCfg["foregroundLossWeight"],
+                pPeakLossWeight=lossCfg["peakLossWeight"],
+                pX0LossWeight=lossCfg["x0LossWeight"],
+                pBgL1Weight=lossCfg["bgL1Weight"],
+                pLeakyClipSlope=lossCfg["leakyClipSlope"],
                 pDropout=args.dropout,
                 pEarlyStoppingPatience=args.earlyStoppingPatience,
                 pUsePairFeatures=usePairFeatures,
                 pTimesteps=args.timesteps,
-                pSampleSteps=args.sampleSteps
+                pSampleSteps=args.sampleSteps,
+                pLossMode=lossCfg["lossMode"],
+                pRawTargetMode=eff_raw_target
             )
         if not args.keepTFRecords and ((args.trainOnly and not args.createDataOnly) or (not args.createDataOnly and not args.trainOnly)):
             delete_model_files(pTFRecordFiles=tfRecordFilenames)
