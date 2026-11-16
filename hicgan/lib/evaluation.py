@@ -953,8 +953,8 @@ def _diagnose_score_row(row: pd.Series) -> str:
 
 def build_core_scorecard_df(df_metrics_full: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a concise, high-signal 'Core 5 Metrics + P(d) Baseline & Composite Score (0-100)'
-    scorecard table from `df_metrics_full`.
+    Build a concise paper-metrics scorecard table from `df_metrics_full`:
+    Pearson, Spearman (overall & distance-stratified), MAE, MSE, RMSE, SSIM, and PSNR.
     """
     if df_metrics_full is None or df_metrics_full.empty:
         return pd.DataFrame()
@@ -963,20 +963,17 @@ def build_core_scorecard_df(df_metrics_full: pd.DataFrame) -> pd.DataFrame:
     for _, r in df_metrics_full.iterrows():
         rows.append({
             "Kromozom": r.get("chrom"),
-            "Bileşik Skor (0-100)": float(r.get("Composite_Score_100", np.nan)),
-            "Baz P(d) Skor (0-100)": float(r.get("Baseline_Composite_Score_100", np.nan)),
-            "Skor Farkı (Δ vs Baz)": float(r.get("Composite_Delta_vs_Base", np.nan)),
-            "1) AUPRC (GT>0)": float(r.get("AUPRC_GTpos", np.nan)),
-            "Baz AUPRC (GT>0)": float(r.get("Baseline_AUPRC_GTpos", np.nan)),
-            "AUPRC Katı (vs Rastgele)": float(r.get("AUPRC_Lift_vs_Random", np.nan)),
-            "1b) AUPRC (Top %10)": float(r.get("AUPRC_Top10pct", np.nan)),
-            "2) Katmanlı Spearman ρ(d)": float(r.get("DistStrat_Spearman_log1p", np.nan)),
-            "2b) Katmanlı Pearson r(d)": float(r.get("DistStrat_Pearson_log1p", np.nan)),
-            "3) Aktif Hücre r (GT>0)": float(r.get("Pearson_GTpos_log1p", np.nan)),
-            "4) 1B Marjinal Profil r": float(r.get("Marginal1D_Pearson_log1p", np.nan)),
-            "5) Yapısal SSIM (log1p)": float(r.get("SSIM_log1p", np.nan)),
-            "5b) Kosinüs Benzerliği": float(r.get("Cosine_log1p", np.nan)),
-            "Model Tanı / Yorum": _diagnose_score_row(r),
+            "Pearson r (raw)": float(r.get("Pearson_all_raw", np.nan)),
+            "Spearman ρ (raw)": float(r.get("Spearman_all_raw", np.nan)),
+            "Pearson r (log1p)": float(r.get("Pearson_all_log1p", np.nan)),
+            "Spearman ρ (log1p)": float(r.get("Spearman_all_log1p", np.nan)),
+            "Katmanlı Pearson r(d)": float(r.get("DistStrat_Pearson_log1p", np.nan)),
+            "Katmanlı Spearman ρ(d)": float(r.get("DistStrat_Spearman_log1p", np.nan)),
+            "MAE (raw)": float(r.get("MAE_raw", np.nan)),
+            "MSE (raw)": float(r.get("MSE_raw", np.nan)),
+            "RMSE (raw)": float(r.get("RMSE_raw", np.nan)),
+            "SSIM (log1p)": float(r.get("SSIM_log1p", np.nan)),
+            "PSNR (log1p)": float(r.get("PSNR_log1p", np.nan)),
         })
     return pd.DataFrame(rows)
 
@@ -1143,6 +1140,56 @@ def plot_model_vs_baseline_radar(df_metrics_full: pd.DataFrame, eval_out_dir: st
     return out_path
 
 
+def plot_stratified_corr(chrom_data_dict: dict, bin_size: int, eval_out_dir: str, run_name: str = ""):
+    """
+    Plot distance-stratified Pearson r and Spearman rho curves across genomic distance d = |i - j|.
+    """
+    os.makedirs(eval_out_dir, exist_ok=True)
+    n_chroms = len(chrom_data_dict)
+    if n_chroms == 0:
+        return None
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_chroms, 2)))
+    fig2, axes2 = plt.subplots(1, 2, figsize=(15, 5.2))
+    for idx, (chrom, item) in enumerate(chrom_data_dict.items()):
+        curves = item["curves"]
+        d_mb = curves["distances"] * (bin_size / 1e6)
+        c = colors[idx % len(colors)]
+
+        p_vals = curves["pearson_by_d"]
+        s_vals = curves["spearman_by_d"]
+        mask_p = ~np.isnan(p_vals)
+        mask_s = ~np.isnan(s_vals)
+
+        if np.any(mask_p):
+            axes2[0].plot(d_mb[mask_p], p_vals[mask_p], "o-", color=c, markersize=3, alpha=0.8, label=f"chr{chrom} (ort={np.nanmean(p_vals):.3f})")
+        if np.any(mask_s):
+            axes2[1].plot(d_mb[mask_s], s_vals[mask_s], "s-", color=c, markersize=3, alpha=0.8, label=f"chr{chrom} (ort={np.nanmean(s_vals):.3f})")
+
+    axes2[0].axhline(0.0, color="gray", ls="--", lw=1)
+    axes2[0].set_title("Mesafeye Göre Pearson Korelasyonu r(d)")
+    axes2[0].set_xlabel("Genomik Mesafe |i - j| (Mb)")
+    axes2[0].set_ylabel("Pearson r (log1p)")
+    axes2[0].set_ylim(-0.3, 1.05)
+    axes2[0].grid(True, alpha=0.3)
+    axes2[0].legend()
+
+    axes2[1].axhline(0.0, color="gray", ls="--", lw=1)
+    axes2[1].set_title("Mesafeye Göre Spearman Korelasyonu ρ(d)")
+    axes2[1].set_xlabel("Genomik Mesafe |i - j| (Mb)")
+    axes2[1].set_ylabel("Spearman ρ (log1p)")
+    axes2[1].set_ylim(-0.3, 1.05)
+    axes2[1].grid(True, alpha=0.3)
+    axes2[1].legend()
+
+    fig2.suptitle(f"Pearson & Spearman Korelasyonu — {run_name}", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    corr_path = os.path.join(eval_out_dir, "distance_stratified_correlation.png")
+    fig2.savefig(corr_path, dpi=300, bbox_inches="tight")
+    plt.close(fig2)
+    return corr_path
+
+
 def evaluate_predictions_dir(
     pred_npz_dir: str,
     gt_npz_dir: str,
@@ -1249,10 +1296,7 @@ def evaluate_predictions_dir(
     if make_plots:
         plot_calls = [
             ("triple_heatmaps", lambda: plot_triple_heatmaps(chrom_data_dict, eval_out_dir, run_name=run_name)),
-            ("model_vs_baseline_radar", lambda: plot_model_vs_baseline_radar(df_metrics_full, eval_out_dir, run_name=run_name)),
-            ("contact_decay_and_stratified_corr", lambda: plot_contact_decay_and_stratified_corr(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)),
-            ("marginal_1d_profiles", lambda: plot_marginal_1d_profiles(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)),
-            ("value_distribution_hexbin_and_hist", lambda: plot_value_distribution_hexbin_and_hist(chrom_data_dict, eval_out_dir, run_name=run_name)),
+            ("distance_stratified_correlation", lambda: plot_stratified_corr(chrom_data_dict, bin_size, eval_out_dir, run_name=run_name)),
         ]
         for plot_name, fn in plot_calls:
             try:
@@ -1391,22 +1435,24 @@ def compare_runs_leaderboard(
             "WS": ws,
             "Epoch": ep,
             "Kromozomlar": ",".join(chrom_names),
-            "Bileşik Skor (0-100)": float(dfc["Composite_Score_100"].mean()),
-            "Baz Skor (0-100)": float(dfc["Baseline_Composite_Score_100"].mean()),
-            "Skor Farkı (Δ vs Baz)": float(dfc["Composite_Delta_vs_Base"].mean()),
-            "AUPRC (GT>0)": float(dfc["AUPRC_GTpos"].mean()),
-            "AUPRC (Top %10)": float(dfc["AUPRC_Top10pct"].mean()),
+            "Pearson r (raw)": float(dfc["Pearson_all_raw"].mean()),
+            "Spearman ρ (raw)": float(dfc["Spearman_all_raw"].mean()),
+            "Pearson r (log1p)": float(dfc["Pearson_all_log1p"].mean()),
+            "Spearman ρ (log1p)": float(dfc["Spearman_all_log1p"].mean()),
+            "Katmanlı Pearson r(d)": float(dfc["DistStrat_Pearson_log1p"].mean()),
             "Katmanlı Spearman ρ(d)": float(dfc["DistStrat_Spearman_log1p"].mean()),
-            "Aktif Hücre r (GT>0)": float(dfc["Pearson_GTpos_log1p"].mean()),
-            "1B Marjinal Profil r": float(dfc["Marginal1D_Pearson_log1p"].mean()),
+            "MAE (raw)": float(dfc["MAE_raw"].mean()),
+            "MSE (raw)": float(dfc["MSE_raw"].mean()),
+            "RMSE (raw)": float(dfc["RMSE_raw"].mean()),
             "SSIM (log1p)": float(dfc["SSIM_log1p"].mean()),
+            "PSNR (log1p)": float(dfc["PSNR_log1p"].mean()),
             "Min Val Loss": best_val_loss,
         })
 
     if not leaderboard_rows:
         return pd.DataFrame()
 
-    df_lb = pd.DataFrame(leaderboard_rows).sort_values("Bileşik Skor (0-100)", ascending=False).reset_index(drop=True)
+    df_lb = pd.DataFrame(leaderboard_rows).sort_values("Pearson r (log1p)", ascending=False).reset_index(drop=True)
     df_lb.insert(0, "Sıra", np.arange(1, len(df_lb) + 1))
 
     if eval_out_dir:
@@ -1414,67 +1460,26 @@ def compare_runs_leaderboard(
         lb_csv = os.path.join(eval_out_dir, "multi_run_leaderboard.csv")
         df_lb.to_csv(lb_csv, index=False)
 
-        # Plot Multi-Run Radar & Leaderboard Bar Chart (top `max_runs` runs)
         df_plot = df_lb.head(max_runs)
-        labels = [
-            "AUPRC\n(GT>0)",
-            "AUPRC\n(Top %10)",
-            "Katmanlı\nρ(d)",
-            "Aktif Hücre\nr (GT>0)",
-            "1B Marjinal\nProfil r",
-            "SSIM\n(log1p)",
-        ]
-        angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
-        angles_closed = angles + [angles[0]]
-
-        fig = plt.figure(figsize=(16, 6.2))
-        ax_radar = fig.add_subplot(1, 2, 1, polar=True)
-        ax_bar = fig.add_subplot(1, 2, 2)
-        cmap = plt.cm.tab10(np.linspace(0, 1, max(len(df_plot), 2)))
-
-        for idx, (_, r) in enumerate(df_plot.iterrows()):
-            vals = [
-                float(np.clip(r["AUPRC (GT>0)"], 0.0, 1.0)),
-                float(np.clip(r["AUPRC (Top %10)"], 0.0, 1.0)),
-                float(np.clip(r["Katmanlı Spearman ρ(d)"], 0.0, 1.0)),
-                float(np.clip(r["Aktif Hücre r (GT>0)"], 0.0, 1.0)),
-                float(np.clip(r["1B Marjinal Profil r"], 0.0, 1.0)),
-                float(np.clip(r["SSIM (log1p)"], 0.0, 1.0)),
-            ]
-            vals_closed = vals + [vals[0]]
-            short_name = str(r["Run Adı"]).replace("run_", "")
-            c = cmap[idx % len(cmap)]
-            ax_radar.plot(angles_closed, vals_closed, "o-", lw=2, color=c, label=f"#{int(r['Sıra'])} {short_name}")
-            ax_radar.fill(angles_closed, vals_closed, color=c, alpha=0.08)
-
-        ax_radar.set_thetagrids(np.degrees(angles), labels, fontsize=9.5)
-        ax_radar.set_ylim(0.0, 1.0)
-        ax_radar.set_title("Çoklu Run Radar Karşılaştırması", pad=18, fontsize=12, fontweight="bold")
-        ax_radar.legend(loc="upper right", bbox_to_anchor=(1.32, 1.15), fontsize=8.5)
-
         y_pos = np.arange(len(df_plot))
         short_names = [f"#{int(r['Sıra'])} {str(r['Run Adı']).replace('run_', '')}" for _, r in df_plot.iterrows()]
-        scores = df_plot["Bileşik Skor (0-100)"].values
-        bases = df_plot["Baz Skor (0-100)"].values
-
-        ax_bar.barh(y_pos, scores, height=0.55, color=[cmap[i % len(cmap)] for i in range(len(df_plot))], alpha=0.85, label="Run Bileşik Skoru")
-        ax_bar.axvline(float(np.mean(bases)), color="#333333", ls="--", lw=1.5, label=f"P(d) Baz Skor Ort. ({np.mean(bases):.1f})")
-        for i, sc in enumerate(scores):
-            ax_bar.text(sc + 0.8, i, f"{sc:.2f}/100", va="center", ha="left", fontsize=9.5, fontweight="bold")
-
+        fig, ax_bar = plt.subplots(figsize=(10, max(3.5, 1.4 * len(df_plot))))
+        h = 0.25
+        ax_bar.barh(y_pos - h, df_plot["Pearson r (log1p)"].fillna(0.0), height=h, color="#1f77b4", label="Pearson r (log1p)")
+        ax_bar.barh(y_pos, df_plot["Spearman ρ (log1p)"].fillna(0.0), height=h, color="#ff7f0e", label="Spearman ρ (log1p)")
+        ax_bar.barh(y_pos + h, df_plot["SSIM (log1p)"].fillna(0.0), height=h, color="#2ca02c", label="SSIM (log1p)")
         ax_bar.set_yticks(y_pos)
-        ax_bar.set_yticklabels(short_names, fontsize=9)
+        ax_bar.set_yticklabels(short_names, fontsize=9.5)
         ax_bar.invert_yaxis()
-        ax_bar.set_xlim(0, max(max(scores), float(np.mean(bases)), 50.0) * 1.25)
-        ax_bar.set_xlabel("Bileşik Model Kalite Skoru (0 - 100)")
-        ax_bar.set_title("Run Liderlik Sıralaması (Composite Score)", fontsize=12, fontweight="bold")
+        ax_bar.set_xlim(-0.2, 1.05)
+        ax_bar.axvline(0.0, color="#666666", lw=0.8, ls="--")
+        ax_bar.set_xlabel("Skor")
+        ax_bar.set_title("Run Karşılaştırması (Pearson r, Spearman ρ, SSIM)", fontsize=12, fontweight="bold")
         ax_bar.grid(True, axis="x", alpha=0.3)
         ax_bar.legend(loc="lower right")
-
-        fig.suptitle("Çoklu Run (Deney) Performans Karşılaştırması ve Liderlik Tablosu", fontsize=13.5, fontweight="bold")
         plt.tight_layout()
-        radar_path = os.path.join(eval_out_dir, "multi_run_comparison_radar.png")
-        fig.savefig(radar_path, dpi=300, bbox_inches="tight")
+        bar_path = os.path.join(eval_out_dir, "multi_run_comparison.png")
+        fig.savefig(bar_path, dpi=250, bbox_inches="tight")
         plt.close(fig)
 
     return df_lb
